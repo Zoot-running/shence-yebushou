@@ -22,11 +22,22 @@
 - `concurrency`（默认 3，平台容器槽位上限 3）：求解并发。
 - `roundsPerChallenge` / `roundTimeoutMinutes`：每题最多轮次、单轮超时。
 - `maxHintsPerChallenge`（默认 1）：官方 hint 上限（每次扣该题 10%，向上取整）。
-- **模型调度**：`model`（easy/medium，默认 kimi-k2.6）、`modelHard`（hard/insane，默认 glm-4.6）、
-  `effort`（默认 high）、`effortHard`（默认 max）、`effortRetry`（第 2 轮起升级，默认 max）。
+- **模型调度**：`model`（easy，默认 kimi-k3）、`modelMedium`（medium，默认 deepseek-v4-flash）、
+  `modelHard`（hard/insane，默认 deepseek-v4-pro）、`effort`（默认 high）、`effortMedium`（默认 low）、
+  `effortHard`（默认 max）、`effortRetry`（第 2 轮起升级，默认 max）。
   flash/pro 之分由 model 承载；思考强度由 reasoningEffort 承载（模型未宣告的 effort 由集思自动丢弃）。
 - `knowledgeDir`：本地私知目录（clean-room 门禁扫描对象；出现该题号即弃权，宁可丢分不破红线）。
 - `runBearerToken` + `runId`：平台会话凭据——全题终态或预算耗尽后立即 `finish` 停表。
+
+## 运行位置（重要约定）
+
+- **必须从专用工作目录启动 headless CLI**（`cd /home/zrn/xiaochang-work` 后运行）：
+  求解器的 bash 工作区默认 = 进程 cwd。
+  - 靶场附件（钓鱼邮件、恶意样本、pcap）是**真实攻击样本**——若 cwd 在
+    /mnt/d（Windows 磁盘），Windows Defender 会报毒甚至隔离文件打断求解；
+    ext4 工作目录（/home/zrn/...）Defender 不扫描。
+  - 沙箱 workspace-write 以 cwd 为根，工作目录天然把求解器写入限制在园内。
+- 跑完战役后清理工作目录内容；DSH checkout 保持干净（git status 无求解器残留）。
 
 ## 平台规则要点（tsecbench）
 
