@@ -258,9 +258,16 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
       // 2. 处理终态工作项：交卷 / 推进下一轮 / 限流重试（轮次取自工作项 id，不取账本 seed）。
       let changed = false
       for (const view of campaign.ledger.views()) {
-        if (processed.has(view.item.id)) continue
         const terminal = view.state === 'done' || view.state === 'failed' || view.state === 'blocked'
         if (!terminal) continue
+        // 迟到的求解输出：即使该工作项已被处理（如超时判失败后真答复才到），
+        // 也把工作记录喂给下一轮续跑——轮次间不丢进度。
+        const lateDetail = (view.terminalDetail ?? '').trim()
+        if (lateDetail !== '' && !lateDetail.startsWith('[diagnostic]') && !lateDetail.includes('round timeout')) {
+          const lateCode = codeOf(view.item.id)
+          lastRoundDetail.set(lateCode, lateDetail)
+        }
+        if (processed.has(view.item.id)) continue
         processed.add(view.item.id)
         const code = codeOf(view.item.id)
         const round = roundOf(view.item.id)
@@ -268,9 +275,8 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
         audit({ type: 'terminal', id: view.item.id, state: view.state, round, detail: (view.terminalDetail ?? '').slice(0, 400) })
         if (p === undefined || p.state === 'complete' || p.state === 'failed' || p.state === 'skipped') continue
         // 记录本轮工作记录，供下一轮续跑（超时/未完成的轮次不丢侦察成果）。
-        const roundDetail = (view.terminalDetail ?? '').trim()
-        if (roundDetail !== '' && !roundDetail.startsWith('[diagnostic]')) {
-          lastRoundDetail.set(code, roundDetail)
+        if (lateDetail !== '') {
+          lastRoundDetail.set(code, lateDetail)
         }
         if (view.state === 'done') {
           const flags = extractFlags(view.terminalDetail ?? '')

@@ -461,18 +461,22 @@ async function run(ctx, args, agent) {
       }
       let changed = false;
       for (const view of campaign.ledger.views()) {
-        if (processed.has(view.item.id)) continue;
         const terminal = view.state === "done" || view.state === "failed" || view.state === "blocked";
         if (!terminal) continue;
+        const lateDetail = (view.terminalDetail ?? "").trim();
+        if (lateDetail !== "" && !lateDetail.startsWith("[diagnostic]") && !lateDetail.includes("round timeout")) {
+          const lateCode = codeOf(view.item.id);
+          lastRoundDetail.set(lateCode, lateDetail);
+        }
+        if (processed.has(view.item.id)) continue;
         processed.add(view.item.id);
         const code = codeOf(view.item.id);
         const round = roundOf(view.item.id);
         const p = progress.get(code);
         audit({ type: "terminal", id: view.item.id, state: view.state, round, detail: (view.terminalDetail ?? "").slice(0, 400) });
         if (p === void 0 || p.state === "complete" || p.state === "failed" || p.state === "skipped") continue;
-        const roundDetail = (view.terminalDetail ?? "").trim();
-        if (roundDetail !== "" && !roundDetail.startsWith("[diagnostic]")) {
-          lastRoundDetail.set(code, roundDetail);
+        if (lateDetail !== "") {
+          lastRoundDetail.set(code, lateDetail);
         }
         if (view.state === "done") {
           const flags = extractFlags(view.terminalDetail ?? "");
