@@ -329,7 +329,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
           ...(dispatchPolicy.reasoningEffort !== undefined ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {}),
           priority: { tier: tierOf(target.difficulty), score: target.total_score * (config.maxRounds - seed + 1) },
         })
-        progress.update(target.unique_code, { rounds: seed })
+        progress.update(target.unique_code, { difficulty: target.difficulty, rounds: seed })
         changed = true
       }
 

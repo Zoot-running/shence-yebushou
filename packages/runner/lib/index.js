@@ -529,7 +529,7 @@ async function run(ctx, args, agent) {
           ...dispatchPolicy.reasoningEffort !== void 0 ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {},
           priority: { tier: tierOf(target.difficulty), score: target.total_score * (config.maxRounds - seed + 1) }
         });
-        progress.update(target.unique_code, { rounds: seed });
+        progress.update(target.unique_code, { difficulty: target.difficulty, rounds: seed });
         changed = true;
       }
       while (campaign.freeSlots() > 0 && campaign.nextQueued().length > 0) {
