@@ -211,6 +211,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
       appendFileSync(auditPath, `${JSON.stringify(line)}\n`)
     } catch { /* 审计失败不影响主流程 */ }
   }
+  let lastHeartbeatAt = 0
 
   persist(snapshotPath, progress)
 
@@ -428,6 +429,20 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
       }
 
       if (changed) persist(snapshotPath, progress)
+      // 心跳：循环存活 + 关键计数落审计（无变化时段也不再"监控失明"）。
+      const lastHeartbeat = lastHeartbeatAt
+      const heartbeatNow = Date.now()
+      if (heartbeatNow - lastHeartbeat >= 120_000) {
+        lastHeartbeatAt = heartbeatNow
+        audit({
+          type: 'heartbeat',
+          budgetRemainingMs: budget.remainingMs(),
+          open: campaign.ledger.views().filter(v => v.state === 'dispatched' || v.state === 'help').length,
+          queued: campaign.ledger.views().filter(v => v.state === 'queued').length,
+          complete: progress.all().filter(p => p.state === 'complete').length,
+          failed: progress.all().filter(p => p.state === 'failed').length,
+        })
+      }
       if (campaign.isComplete() && campaign.ledger.views().length > 0 && targets.length === 0) break
       await sleep(5000)
     }

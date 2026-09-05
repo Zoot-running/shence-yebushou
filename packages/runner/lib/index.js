@@ -426,6 +426,7 @@ async function run(ctx, args, agent) {
     } catch {
     }
   };
+  let lastHeartbeatAt = 0;
   persist(snapshotPath, progress);
   const summaryLines = [];
   try {
@@ -627,6 +628,19 @@ async function run(ctx, args, agent) {
         }
       }
       if (changed) persist(snapshotPath, progress);
+      const lastHeartbeat = lastHeartbeatAt;
+      const heartbeatNow = Date.now();
+      if (heartbeatNow - lastHeartbeat >= 12e4) {
+        lastHeartbeatAt = heartbeatNow;
+        audit({
+          type: "heartbeat",
+          budgetRemainingMs: budget.remainingMs(),
+          open: campaign.ledger.views().filter((v) => v.state === "dispatched" || v.state === "help").length,
+          queued: campaign.ledger.views().filter((v) => v.state === "queued").length,
+          complete: progress.all().filter((p) => p.state === "complete").length,
+          failed: progress.all().filter((p) => p.state === "failed").length
+        });
+      }
       if (campaign.isComplete() && campaign.ledger.views().length > 0 && targets.length === 0) break;
       await sleep(5e3);
     }
