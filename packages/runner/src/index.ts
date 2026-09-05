@@ -246,15 +246,15 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
         continue
       }
 
-      // 1. 关闭终态题的容器。
+      // 1. 关闭终态题的容器：以平台状态为准（containerClosed 仅作提示，不阻止重试关闭）。
       for (const p of progress.all()) {
-        if ((p.state === 'complete' || p.state === 'failed' || p.state === 'skipped') && !p.containerClosed) {
-          const c = challenges.get(p.code)
-          if (c !== undefined && (c.container_status === 'available' || c.container_status === 'pending')) {
-            try { await adapter.close(p.code) } catch { /* 平台侧已关或异常 */ }
-          }
+        if (p.state !== 'complete' && p.state !== 'failed' && p.state !== 'skipped') continue
+        const c = challenges.get(p.code)
+        if (c === undefined || (c.container_status !== 'available' && c.container_status !== 'pending')) continue
+        try {
+          await adapter.close(p.code)
           progress.update(p.code, { containerClosed: true })
-        }
+        } catch { /* 关闭失败：下一轮循环按平台状态重试（不再因本地标志泄漏槽位） */ }
       }
 
       // 2. 处理终态工作项：交卷 / 推进下一轮 / 限流重试（轮次取自工作项 id，不取账本 seed）。
@@ -369,6 +369,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
           try {
             const started = await adapter.start(target.unique_code)
             addrs = started.container_addr
+            progress.update(target.unique_code, { containerClosed: false })
           } catch {
             continue // 平台限流/资源不足，下一轮再试
           }

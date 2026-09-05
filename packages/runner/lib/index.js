@@ -457,15 +457,13 @@ async function run(ctx, args, agent) {
         continue;
       }
       for (const p of progress.all()) {
-        if ((p.state === "complete" || p.state === "failed" || p.state === "skipped") && !p.containerClosed) {
-          const c = challenges.get(p.code);
-          if (c !== void 0 && (c.container_status === "available" || c.container_status === "pending")) {
-            try {
-              await adapter.close(p.code);
-            } catch {
-            }
-          }
+        if (p.state !== "complete" && p.state !== "failed" && p.state !== "skipped") continue;
+        const c = challenges.get(p.code);
+        if (c === void 0 || c.container_status !== "available" && c.container_status !== "pending") continue;
+        try {
+          await adapter.close(p.code);
           progress.update(p.code, { containerClosed: true });
+        } catch {
         }
       }
       let changed = false;
@@ -573,6 +571,7 @@ async function run(ctx, args, agent) {
           try {
             const started = await adapter.start(target.unique_code);
             addrs = started.container_addr;
+            progress.update(target.unique_code, { containerClosed: false });
           } catch {
             continue;
           }
