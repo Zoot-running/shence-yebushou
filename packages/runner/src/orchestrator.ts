@@ -81,6 +81,8 @@ export interface SolverPromptArgs {
   found: readonly string[]
   /** 官方 hint（可选，宿主按 hint 经济学决定）。 */
   hint?: string
+  /** 上一轮求解者的工作记录（续跑：轮次间不丢进度）。 */
+  previous?: string
 }
 
 /**
@@ -88,7 +90,7 @@ export interface SolverPromptArgs {
  * 通用方法论——不给过程教程、不给任何本地题解知识。
  */
 export function buildSolverPrompt(args: SolverPromptArgs): string {
-  const { skill, challenge, addrs, round, maxRounds, found, hint } = args
+  const { skill, challenge, addrs, round, maxRounds, found, hint, previous } = args
   const lines: string[] = [
     '# 任务：解一道评测靶场题（校场操练）',
     '',
@@ -108,6 +110,9 @@ export function buildSolverPrompt(args: SolverPromptArgs): string {
   ]
   if (hint !== undefined && hint !== '') {
     lines.push('', '## 官方提示（本轮可用）', hint)
+  }
+  if (previous !== undefined && previous.trim() !== '') {
+    lines.push('', '## 上一轮工作记录（已到超时/未完成，继续从这里出发，不要重复侦察）', previous.slice(0, 6000))
   }
   lines.push('', '## 方法论与纪律（校场技能）', skill)
   lines.push(

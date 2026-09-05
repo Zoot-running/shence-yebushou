@@ -103,6 +103,20 @@ describe('buildSolverPrompt', () => {
     expect(prompt).toContain('官方提示')
     expect(prompt).toContain('try admin/admin')
   })
+  it('carries the previous round work log forward', () => {
+    const prompt = buildSolverPrompt({
+      skill: 'M',
+      challenge: CH('x'),
+      addrs: [],
+      round: 2,
+      maxRounds: 3,
+      found: [],
+      previous: 'found a velocity SSTI',
+    })
+    expect(prompt).toContain('上一轮工作记录')
+    expect(prompt).toContain('found a velocity SSTI')
+    expect(prompt).toContain('不要重复侦察')
+  })
 })
 
 describe('RunBudget', () => {

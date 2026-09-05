@@ -185,6 +185,8 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
   const rateRetries = new Map<string, number>()
   // (code, round) → 该轮求解 prompt（限流重试用同一 prompt）。
   const roundLabels = new Map<string, string>()
+  // code → 最近一轮求解者的工作记录（下一轮续跑，轮次间不丢进度）。
+  const lastRoundDetail = new Map<string, string>()
 
   // 战役：工作项 = 每题的每轮求解；账本自动喂终态报告（宿主绑定）。
   const holder = (ctx as unknown as { hufu: { createCampaign(p: unknown, c: object, items: unknown[]): HufuLike } }).hufu
@@ -222,6 +224,19 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
 
       const targets = selectTargets([...challenges.values()], new Set([...progress.completedCodes(), ...progress.skippedCodes()]))
       if (targets.length === 0) break
+      // 复活：仅剩 failed 且预算余量充足 → 重置轮次再战（保完成率线）。
+      const openTargets = targets.filter(t => progress.get(t.unique_code)?.state !== 'failed')
+      if (openTargets.length === 0 && budget.remainingMs() > 30 * 60_000) {
+        for (const p of progress.all()) {
+          if (p.state === 'failed' && challenges.get(p.code)?.is_completed !== true) {
+            progress.update(p.code, { state: 'solving', rounds: 0, reason: 'revisit: fresh rounds' })
+            summaryLines.push(`${p.code}: revisit with fresh rounds`)
+          }
+        }
+        rateRetries.clear()
+        roundLabels.clear()
+        continue
+      }
 
       // 1. 关闭终态题的容器。
       for (const p of progress.all()) {
@@ -246,6 +261,11 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
         const p = progress.get(code)
         audit({ type: 'terminal', id: view.item.id, state: view.state, round, detail: (view.terminalDetail ?? '').slice(0, 400) })
         if (p === undefined || p.state === 'complete' || p.state === 'failed' || p.state === 'skipped') continue
+        // 记录本轮工作记录，供下一轮续跑（超时/未完成的轮次不丢侦察成果）。
+        const roundDetail = (view.terminalDetail ?? '').trim()
+        if (roundDetail !== '' && !roundDetail.startsWith('[diagnostic]')) {
+          lastRoundDetail.set(code, roundDetail)
+        }
         if (view.state === 'done') {
           const flags = extractFlags(view.terminalDetail ?? '')
           const accepted: string[] = []
@@ -272,12 +292,12 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
             summaryLines.push(`${code}: round ${round} done, ${merged.length}/${flagCount} flags`)
           }
         } else {
-          // 限流/瞬时错误：不消耗轮次，延迟后同轮重试（最多 5 次）。
+          // 限流/瞬时错误（含空诊断的静默失败）：不消耗轮次，同轮重试（最多 5 次）。
           const detail = view.terminalDetail ?? ''
-          const rateLimited = /429|rate.?limit|overload|too many|限流|频率|busy/i.test(detail)
+          const transient = /429|rate.?limit|overload|too many|限流|频率|busy/i.test(detail) || detail.trim() === ''
           const retryKey = `${code}#${round}`
           const retries = rateRetries.get(retryKey) ?? 0
-          if (rateLimited && retries < 5) {
+          if (transient && retries < 5) {
             rateRetries.set(retryKey, retries + 1)
             audit({ type: 'rate-retry', code, round, retries: retries + 1 })
             const cached = roundLabels.get(retryKey)
@@ -290,7 +310,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
               ...(dispatchPolicy.reasoningEffort !== undefined ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {}),
               priority: { tier: tierOf(challenge?.difficulty ?? 'hard'), score: 9999 },
             })
-            summaryLines.push(`${code}: round ${round} rate-limited (retry ${retries + 1}/5)`)
+            summaryLines.push(`${code}: round ${round} transient failure (retry ${retries + 1}/5)`)
           } else {
             progress.update(code, { rounds: round })
             if (round >= config.maxRounds) {
@@ -368,6 +388,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
           maxRounds: config.maxRounds,
           found,
           hint,
+          previous: lastRoundDetail.get(target.unique_code),
         })
         roundLabels.set(`${target.unique_code}#${seed}`, label)
         const dispatchPolicy = policyFor(config.policy, target.difficulty, seed)

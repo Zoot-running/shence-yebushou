@@ -153,7 +153,7 @@ function cleanRoomGate(code, localFiles) {
   return { contaminated: hits.length > 0, hits };
 }
 function buildSolverPrompt(args) {
-  const { skill, challenge, addrs, round, maxRounds, found, hint } = args;
+  const { skill, challenge, addrs, round, maxRounds, found, hint, previous } = args;
   const lines = [
     "# \u4EFB\u52A1\uFF1A\u89E3\u4E00\u9053\u8BC4\u6D4B\u9776\u573A\u9898\uFF08\u6821\u573A\u64CD\u7EC3\uFF09",
     "",
@@ -173,6 +173,9 @@ function buildSolverPrompt(args) {
   ];
   if (hint !== void 0 && hint !== "") {
     lines.push("", "## \u5B98\u65B9\u63D0\u793A\uFF08\u672C\u8F6E\u53EF\u7528\uFF09", hint);
+  }
+  if (previous !== void 0 && previous.trim() !== "") {
+    lines.push("", "## \u4E0A\u4E00\u8F6E\u5DE5\u4F5C\u8BB0\u5F55\uFF08\u5DF2\u5230\u8D85\u65F6/\u672A\u5B8C\u6210\uFF0C\u7EE7\u7EED\u4ECE\u8FD9\u91CC\u51FA\u53D1\uFF0C\u4E0D\u8981\u91CD\u590D\u4FA6\u5BDF\uFF09", previous.slice(0, 6e3));
   }
   lines.push("", "## \u65B9\u6CD5\u8BBA\u4E0E\u7EAA\u5F8B\uFF08\u6821\u573A\u6280\u80FD\uFF09", skill);
   lines.push(
@@ -392,6 +395,7 @@ async function run(ctx, args, agent) {
   const processed = /* @__PURE__ */ new Set();
   const rateRetries = /* @__PURE__ */ new Map();
   const roundLabels = /* @__PURE__ */ new Map();
+  const lastRoundDetail = /* @__PURE__ */ new Map();
   const holder = ctx.hufu;
   const campaign = holder.createCampaign(agent, {
     concurrency: config.concurrency,
@@ -425,6 +429,18 @@ async function run(ctx, args, agent) {
       for (const c of fresh) challenges.set(c.unique_code, c);
       const targets = selectTargets([...challenges.values()], /* @__PURE__ */ new Set([...progress.completedCodes(), ...progress.skippedCodes()]));
       if (targets.length === 0) break;
+      const openTargets = targets.filter((t) => progress.get(t.unique_code)?.state !== "failed");
+      if (openTargets.length === 0 && budget.remainingMs() > 30 * 6e4) {
+        for (const p of progress.all()) {
+          if (p.state === "failed" && challenges.get(p.code)?.is_completed !== true) {
+            progress.update(p.code, { state: "solving", rounds: 0, reason: "revisit: fresh rounds" });
+            summaryLines.push(`${p.code}: revisit with fresh rounds`);
+          }
+        }
+        rateRetries.clear();
+        roundLabels.clear();
+        continue;
+      }
       for (const p of progress.all()) {
         if ((p.state === "complete" || p.state === "failed" || p.state === "skipped") && !p.containerClosed) {
           const c = challenges.get(p.code);
@@ -448,6 +464,10 @@ async function run(ctx, args, agent) {
         const p = progress.get(code);
         audit({ type: "terminal", id: view.item.id, state: view.state, round, detail: (view.terminalDetail ?? "").slice(0, 400) });
         if (p === void 0 || p.state === "complete" || p.state === "failed" || p.state === "skipped") continue;
+        const roundDetail = (view.terminalDetail ?? "").trim();
+        if (roundDetail !== "" && !roundDetail.startsWith("[diagnostic]")) {
+          lastRoundDetail.set(code, roundDetail);
+        }
         if (view.state === "done") {
           const flags = extractFlags(view.terminalDetail ?? "");
           const accepted = [];
@@ -478,10 +498,10 @@ async function run(ctx, args, agent) {
           }
         } else {
           const detail = view.terminalDetail ?? "";
-          const rateLimited = /429|rate.?limit|overload|too many|限流|频率|busy/i.test(detail);
+          const transient = /429|rate.?limit|overload|too many|限流|频率|busy/i.test(detail) || detail.trim() === "";
           const retryKey = `${code}#${round}`;
           const retries = rateRetries.get(retryKey) ?? 0;
-          if (rateLimited && retries < 5) {
+          if (transient && retries < 5) {
             rateRetries.set(retryKey, retries + 1);
             audit({ type: "rate-retry", code, round, retries: retries + 1 });
             const cached = roundLabels.get(retryKey);
@@ -494,7 +514,7 @@ async function run(ctx, args, agent) {
               ...dispatchPolicy.reasoningEffort !== void 0 ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {},
               priority: { tier: tierOf(challenge?.difficulty ?? "hard"), score: 9999 }
             });
-            summaryLines.push(`${code}: round ${round} rate-limited (retry ${retries + 1}/5)`);
+            summaryLines.push(`${code}: round ${round} transient failure (retry ${retries + 1}/5)`);
           } else {
             progress.update(code, { rounds: round });
             if (round >= config.maxRounds) {
@@ -566,7 +586,8 @@ async function run(ctx, args, agent) {
           round: seed,
           maxRounds: config.maxRounds,
           found,
-          hint
+          hint,
+          previous: lastRoundDetail.get(target.unique_code)
         });
         roundLabels.set(`${target.unique_code}#${seed}`, label);
         const dispatchPolicy = policyFor(config.policy, target.difficulty, seed);
