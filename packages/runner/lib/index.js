@@ -206,9 +206,11 @@ var RunBudget = class {
   }
 };
 function policyFor(policy, difficulty, round) {
+  const medium = difficulty === "medium";
   const hard = difficulty === "hard" || difficulty === "insane";
-  const model = hard ? policy.modelHard : policy.model;
-  const effort = round >= 2 ? policy.effortRetry ?? policy.effortHard ?? policy.effort : hard ? policy.effortHard ?? policy.effort : policy.effort;
+  const model = hard ? policy.modelHard : medium ? policy.modelMedium ?? policy.model : policy.model;
+  const baseEffort = hard ? policy.effortHard ?? policy.effort : medium ? policy.effortMedium ?? policy.effort : policy.effort;
+  const effort = round >= 2 ? policy.effortRetry ?? baseEffort : baseEffort;
   return effort !== void 0 ? { model, reasoningEffort: effort } : { model };
 }
 var RunProgress = class _RunProgress {
@@ -300,10 +302,12 @@ function apply(ctx) {
     description: "Start (or resume) an autonomous benchmark run on tsecbench: clean-room gated solver rounds driven by the hufu campaign over the jisi channel, with container lifecycle management, flag submission, hint economics, and JSONL crash-recovery snapshots. Returns the final summary. Runs for up to budgetMinutes.",
     parameters: {
       concurrency: { type: "number", description: "Solver concurrency (container slots, max 3). Default 3." },
-      model: { type: "string", description: "Solver model for easy/medium challenges. Default kimi-k2.6." },
-      modelHard: { type: "string", description: "Solver model for hard/insane challenges. Default glm-4.6." },
-      effort: { type: "string", description: "Reasoning effort for default rounds (off/low/high/max). Default high." },
-      effortHard: { type: "string", description: "Reasoning effort for hard/insane challenges. Default max." },
+      model: { type: "string", description: "Solver model for easy challenges. Default kimi-k3." },
+      modelMedium: { type: "string", description: "Solver model for medium challenges. Default deepseek-v4-flash." },
+      modelHard: { type: "string", description: "Solver model for hard/insane challenges. Default glm-5.3." },
+      effort: { type: "string", description: "Reasoning effort for easy (off/low/high/max). Default high." },
+      effortMedium: { type: "string", description: "Reasoning effort for medium. Default low (flash fast path)." },
+      effortHard: { type: "string", description: "Reasoning effort for hard/insane. Default max." },
       effortRetry: { type: "string", description: "Reasoning effort from round 2 on (escalation). Default max." },
       budgetMinutes: { type: "number", description: "Total wall-clock budget. Default 320." },
       roundsPerChallenge: { type: "number", description: "Max solver rounds per challenge. Default 3." },
@@ -344,9 +348,11 @@ async function run(ctx, args, agent) {
     vpnGateway: args.vpnGateway ?? "http://10.0.100.58",
     knowledgeDir: args.knowledgeDir ?? join(env.DSH_HOME ?? ".", "storages", "xiaochang-knowledge"),
     policy: {
-      model: args.model ?? "kimi-k2.6",
-      modelHard: args.modelHard ?? "glm-4.6",
+      model: args.model ?? "kimi-k3",
+      modelMedium: args.modelMedium ?? "deepseek-v4-flash",
+      modelHard: args.modelHard ?? "glm-5.3",
       effort: args.effort ?? "high",
+      effortMedium: args.effortMedium ?? "low",
       effortHard: args.effortHard ?? "max",
       effortRetry: args.effortRetry ?? "max"
     }

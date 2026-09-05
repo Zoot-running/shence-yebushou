@@ -152,26 +152,35 @@ describe('RunProgress', () => {
 
 describe('policyFor', () => {
   const policy = {
-    model: 'kimi-k2.6',
-    modelHard: 'glm-4.6',
+    model: 'kimi-k3',
+    modelMedium: 'deepseek-v4-flash',
+    modelHard: 'glm-5.3',
     effort: 'high',
+    effortMedium: 'low',
     effortHard: 'max',
     effortRetry: 'max',
   }
 
-  it('easy/medium round 1 → default model and effort', () => {
-    expect(policyFor(policy, 'easy', 1)).toEqual({ model: 'kimi-k2.6', reasoningEffort: 'high' })
-    expect(policyFor(policy, 'medium', 1)).toEqual({ model: 'kimi-k2.6', reasoningEffort: 'high' })
+  it('easy round 1 → default model and effort', () => {
+    expect(policyFor(policy, 'easy', 1)).toEqual({ model: 'kimi-k3', reasoningEffort: 'high' })
+  })
+  it('medium round 1 → medium model and effort', () => {
+    expect(policyFor(policy, 'medium', 1)).toEqual({ model: 'deepseek-v4-flash', reasoningEffort: 'low' })
   })
   it('hard/insane round 1 → hard model and effort', () => {
-    expect(policyFor(policy, 'hard', 1)).toEqual({ model: 'glm-4.6', reasoningEffort: 'max' })
-    expect(policyFor(policy, 'insane', 1)).toEqual({ model: 'glm-4.6', reasoningEffort: 'max' })
+    expect(policyFor(policy, 'hard', 1)).toEqual({ model: 'glm-5.3', reasoningEffort: 'max' })
+    expect(policyFor(policy, 'insane', 1)).toEqual({ model: 'glm-5.3', reasoningEffort: 'max' })
   })
   it('round 2+ escalates effort (retry) on the same model', () => {
-    expect(policyFor(policy, 'easy', 2)).toEqual({ model: 'kimi-k2.6', reasoningEffort: 'max' })
-    expect(policyFor(policy, 'hard', 3)).toEqual({ model: 'glm-4.6', reasoningEffort: 'max' })
+    expect(policyFor(policy, 'easy', 2)).toEqual({ model: 'kimi-k3', reasoningEffort: 'max' })
+    expect(policyFor(policy, 'medium', 2)).toEqual({ model: 'deepseek-v4-flash', reasoningEffort: 'max' })
+    expect(policyFor(policy, 'hard', 3)).toEqual({ model: 'glm-5.3', reasoningEffort: 'max' })
+  })
+  it('medium falls back to the default model when modelMedium is absent', () => {
+    const simple = { model: 'kimi-k3', modelHard: 'glm-5.3', effort: 'high' }
+    expect(policyFor(simple, 'medium', 1)).toEqual({ model: 'kimi-k3', reasoningEffort: 'high' })
   })
   it('drops effort entirely when policy defines none', () => {
-    expect(policyFor({ model: 'kimi-k2.6', modelHard: 'glm-4.6' }, 'easy', 1)).toEqual({ model: 'kimi-k2.6' })
+    expect(policyFor({ model: 'kimi-k3', modelHard: 'glm-5.3' }, 'easy', 1)).toEqual({ model: 'kimi-k3' })
   })
 })

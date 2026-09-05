@@ -153,9 +153,12 @@ export class RunBudget {
 
 /** 模型调度策略：按难度与轮次决定（模型，思考强度）。 */
 export interface ModelPolicy {
-  /** easy/medium 题与默认轮次。 */
+  /** easy 题与默认轮次。 */
   model: string
   effort?: string
+  /** medium 题（缺省回落到 model/effort）。 */
+  modelMedium?: string
+  effortMedium?: string
   /** hard/insane 题。 */
   modelHard: string
   effortHard?: string
@@ -165,17 +168,19 @@ export interface ModelPolicy {
 
 /**
  * 按难度与轮次决策（模型，思考强度）：
- * easy/medium → model；hard/insane → modelHard；
- * 第 2 轮起思考强度升级（effortRetry > effortHard > effort）。
+ * easy → model；medium → modelMedium??model；hard/insane → modelHard；
+ * 第 2 轮起思考强度升级（effortRetry > 各难度 effort）。
  */
 export function policyFor(policy: ModelPolicy, difficulty: string, round: number): { model: string; reasoningEffort?: string } {
+  const medium = difficulty === 'medium'
   const hard = difficulty === 'hard' || difficulty === 'insane'
-  const model = hard ? policy.modelHard : policy.model
-  const effort = round >= 2
-    ? policy.effortRetry ?? policy.effortHard ?? policy.effort
-    : hard
-      ? policy.effortHard ?? policy.effort
+  const model = hard ? policy.modelHard : medium ? policy.modelMedium ?? policy.model : policy.model
+  const baseEffort = hard
+    ? policy.effortHard ?? policy.effort
+    : medium
+      ? policy.effortMedium ?? policy.effort
       : policy.effort
+  const effort = round >= 2 ? policy.effortRetry ?? baseEffort : baseEffort
   return effort !== undefined ? { model, reasoningEffort: effort } : { model }
 }
 
