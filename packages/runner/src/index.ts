@@ -18,8 +18,10 @@ import {
   RunProgress,
   buildSolverPrompt,
   cleanRoomGate,
+  codeOf,
   extractFlags,
   policyFor,
+  roundOf,
   selectTargets,
 } from './orchestrator.ts'
 import type { ModelPolicy } from './orchestrator.ts'
@@ -475,17 +477,6 @@ async function finishRun(baseURL: string, bearerToken: string | undefined, runId
     // 停表失败不致命：平台会在 run 时限到达时自动结束。
     console.error(`xiaochang: finishRun failed: ${String(error)}`)
   }
-}
-
-function codeOf(itemId: string): string {
-  return itemId.split('#s')[0] ?? itemId
-}
-
-/** 轮次取自工作项 id（`<code>#s<round>` / `<code>#s<round>-r<n>`），与账本 seed 无关。 */
-function roundOf(itemId: string): number {
-  const match = /#s(\d+)/.exec(itemId)
-  const parsed = match !== null ? Number(match[1]) : 1
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1
 }
 
 function persist(path: string, progress: RunProgress): void {

@@ -213,6 +213,15 @@ function policyFor(policy, difficulty, round) {
   const effort = round >= 2 ? policy.effortRetry ?? baseEffort : baseEffort;
   return effort !== void 0 ? { model, reasoningEffort: effort } : { model };
 }
+function codeOf(itemId) {
+  const match = /^(.+?)#s?\d+/.exec(itemId);
+  return match !== null ? match[1] : itemId;
+}
+function roundOf(itemId) {
+  const match = /#s?(\d+)/.exec(itemId);
+  const parsed = match !== null ? Number(match[1]) : 1;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
 var RunProgress = class _RunProgress {
   records = /* @__PURE__ */ new Map();
   static fromJSON(data) {
@@ -663,14 +672,6 @@ async function finishRun(baseURL, bearerToken, runId) {
   } catch (error) {
     console.error(`xiaochang: finishRun failed: ${String(error)}`);
   }
-}
-function codeOf(itemId) {
-  return itemId.split("#s")[0] ?? itemId;
-}
-function roundOf(itemId) {
-  const match = /#s(\d+)/.exec(itemId);
-  const parsed = match !== null ? Number(match[1]) : 1;
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
 }
 function persist(path, progress) {
   mkdirSync(join(path, ".."), { recursive: true });

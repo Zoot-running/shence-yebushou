@@ -184,6 +184,19 @@ export function policyFor(policy: ModelPolicy, difficulty: string, round: number
   return effort !== undefined ? { model, reasoningEffort: effort } : { model }
 }
 
+/** 工作项 id → 题目号（`<code>#s<round>` 或限流重试项 `<code>#<round>-r<n>`）。 */
+export function codeOf(itemId: string): string {
+  const match = /^(.+?)#s?\d+/.exec(itemId)
+  return match !== null ? match[1]! : itemId
+}
+
+/** 轮次取自工作项 id（`<code>#s<round>` / `<code>#<round>-r<n>`），与账本 seed 无关。 */
+export function roundOf(itemId: string): number {
+  const match = /#s?(\d+)/.exec(itemId)
+  const parsed = match !== null ? Number(match[1]) : 1
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1
+}
+
 export type ChallengeState = 'solving' | 'complete' | 'failed' | 'skipped'
 
 export interface ChallengeProgress {

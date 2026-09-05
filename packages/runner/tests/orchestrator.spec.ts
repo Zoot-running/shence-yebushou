@@ -9,8 +9,10 @@ import {
   RunProgress,
   buildSolverPrompt,
   cleanRoomGate,
+  codeOf,
   extractFlags,
   policyFor,
+  roundOf,
   selectTargets,
 } from '../src/orchestrator.ts'
 
@@ -116,6 +118,21 @@ describe('buildSolverPrompt', () => {
     expect(prompt).toContain('上一轮工作记录')
     expect(prompt).toContain('found a velocity SSTI')
     expect(prompt).toContain('不要重复侦察')
+  })
+})
+
+describe('codeOf / roundOf', () => {
+  it('parses round items and rate-retry items', () => {
+    expect(codeOf('g-39#s3')).toBe('g-39')
+    expect(roundOf('g-39#s3')).toBe(3)
+    expect(codeOf('g-39#3-r1')).toBe('g-39')
+    expect(roundOf('g-39#3-r1')).toBe(3)
+    expect(codeOf('g-12#s1')).toBe('g-12')
+    expect(roundOf('g-12#s1')).toBe(1)
+  })
+  it('falls back safely for malformed ids', () => {
+    expect(codeOf('odd-id')).toBe('odd-id')
+    expect(roundOf('odd-id')).toBe(1)
   })
 })
 
