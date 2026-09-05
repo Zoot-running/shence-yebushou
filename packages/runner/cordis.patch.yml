@@ -1,0 +1,4 @@
+# @shence/xiaochang-runner 插件入口
+- insert:
+    - id: shence-xiaochang-runner
+      name: '@shence/xiaochang-runner'

@@ -1,0 +1,27 @@
+{
+  "name": "@shence/xiaochang-runner",
+  "version": "0.1.0",
+  "description": "校场 L4 自主跑分编排器：夜不收适配器×虎符战役×集思通道，clean-room 门禁 + hint 经济学 + JSONL 崩溃恢复",
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "src",
+    "prompts",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "build": "esbuild src/index.ts --bundle --format=esm --platform=node --packages=external --outfile=lib/index.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
