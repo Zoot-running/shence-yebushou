@@ -1,0 +1,19 @@
+{
+  "name": "@shence/yebushou",
+  "version": "0.1.0",
+  "description": "夜不收 —— 神策 P4a：渗透 skill（目标+通用经验+组织画像自积累）；分支 ctf = 校场",
+  "type": "module",
+  "main": "src/index.ts",
+  "files": [
+    "src",
+    "skills"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
