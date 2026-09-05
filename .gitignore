@@ -1,0 +1,8 @@
+.DS_Store
+*.log
+node_modules/
+dist/
+.env
+# 本地私知与组织画像：运行产物，永不入库/入镜像
+local/
+credentials/
