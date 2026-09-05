@@ -309,7 +309,9 @@ function apply(ctx) {
       knowledgeDir: { type: "string", description: "Local private knowledge dir for the clean-room gate." },
       baseURL: { type: "string", description: "BENCHMARK_BASE_URL (defaults to env BENCHMARK_BASE_URL)." },
       benchmarkToken: { type: "string", description: "BENCHMARK_TOKEN (defaults to env BENCHMARK_TOKEN)." },
-      vpnGateway: { type: "string", description: "VPN gateway health URL. Default http://10.0.100.58." }
+      vpnGateway: { type: "string", description: "VPN gateway health URL. Default http://10.0.100.58." },
+      runBearerToken: { type: "string", description: "Optional platform session Bearer token to finish the run early (stop the ranking clock)." },
+      runId: { type: "number", description: "Optional platform run id for early finish." }
     },
     output: {
       schema: { type: "string" },
@@ -388,7 +390,8 @@ async function run(ctx, args, agent) {
   }
   const hintLedger = new HintLedger();
   const processed = /* @__PURE__ */ new Set();
-  const solverOutputs = /* @__PURE__ */ new Map();
+  const rateRetries = /* @__PURE__ */ new Map();
+  const roundLabels = /* @__PURE__ */ new Map();
   const holder = ctx.hufu;
   const campaign = holder.createCampaign(agent, {
     concurrency: config.concurrency,
@@ -396,9 +399,27 @@ async function run(ctx, args, agent) {
     heartbeatMs: 15 * 6e4,
     budgetMs: config.budgetMs
   }, []);
+  const auditPath = join(env.DSH_HOME ?? ".", "storages", "xiaochang-run-audit.jsonl");
+  const audit = (line) => {
+    try {
+      appendFileSync(auditPath, `${JSON.stringify(line)}
+`);
+    } catch {
+    }
+  };
   persist(snapshotPath, progress);
   const summaryLines = [];
   try {
+    const startup = await adapter.listChallenges();
+    for (const c of startup) challenges.set(c.unique_code, c);
+    for (const c of startup) {
+      if (c.container_status === "available" || c.container_status === "pending") {
+        try {
+          await adapter.close(c.unique_code);
+        } catch {
+        }
+      }
+    }
     while (!budget.exhausted()) {
       const fresh = await adapter.listChallenges();
       for (const c of fresh) challenges.set(c.unique_code, c);
@@ -423,8 +444,9 @@ async function run(ctx, args, agent) {
         if (!terminal) continue;
         processed.add(view.item.id);
         const code = codeOf(view.item.id);
-        const seed = view.seed;
+        const round = roundOf(view.item.id);
         const p = progress.get(code);
+        audit({ type: "terminal", id: view.item.id, state: view.state, round, detail: (view.terminalDetail ?? "").slice(0, 400) });
         if (p === void 0 || p.state === "complete" || p.state === "failed" || p.state === "skipped") continue;
         if (view.state === "done") {
           const flags = extractFlags(view.terminalDetail ?? "");
@@ -439,23 +461,48 @@ async function run(ctx, args, agent) {
           const merged = [.../* @__PURE__ */ new Set([...p.flags, ...accepted])];
           const challenge = challenges.get(code);
           const flagCount = challenge?.flag_count ?? Number.POSITIVE_INFINITY;
-          progress.update(code, { flags: merged, rounds: seed });
+          progress.update(code, { flags: merged, rounds: round });
           if (merged.length >= flagCount) {
             progress.update(code, { state: "complete" });
-            summaryLines.push(`${code}: complete (${merged.length}/${flagCount} flags, ${seed} round(s))`);
-          } else if (seed >= config.maxRounds) {
+            try {
+              await adapter.close(code);
+            } catch {
+            }
+            progress.update(code, { containerClosed: true });
+            summaryLines.push(`${code}: complete (${merged.length}/${flagCount} flags, ${round} round(s))`);
+          } else if (round >= config.maxRounds) {
             progress.update(code, { state: "failed", reason: `rounds exhausted with ${merged.length}/${flagCount} flags` });
-            summaryLines.push(`${code}: failed (${merged.length}/${flagCount} after ${seed} rounds)`);
+            summaryLines.push(`${code}: failed (${merged.length}/${flagCount} after ${round} rounds)`);
           } else {
-            summaryLines.push(`${code}: round ${seed} done, ${merged.length}/${flagCount} flags`);
+            summaryLines.push(`${code}: round ${round} done, ${merged.length}/${flagCount} flags`);
           }
         } else {
-          progress.update(code, { rounds: seed });
-          if (seed >= config.maxRounds) {
-            progress.update(code, { state: "failed", reason: `solver ${view.state} at round ${seed}` });
-            summaryLines.push(`${code}: failed (solver ${view.state} at round ${seed})`);
+          const detail = view.terminalDetail ?? "";
+          const rateLimited = /429|rate.?limit|overload|too many|限流|频率|busy/i.test(detail);
+          const retryKey = `${code}#${round}`;
+          const retries = rateRetries.get(retryKey) ?? 0;
+          if (rateLimited && retries < 5) {
+            rateRetries.set(retryKey, retries + 1);
+            audit({ type: "rate-retry", code, round, retries: retries + 1 });
+            const cached = roundLabels.get(retryKey);
+            const challenge = challenges.get(code);
+            const dispatchPolicy = policyFor(config.policy, challenge?.difficulty ?? "hard", round);
+            campaign.add({
+              id: `${retryKey}-r${retries + 1}`,
+              label: cached ?? `retry ${code} round ${round}`,
+              model: dispatchPolicy.model,
+              ...dispatchPolicy.reasoningEffort !== void 0 ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {},
+              priority: { tier: tierOf(challenge?.difficulty ?? "hard"), score: 9999 }
+            });
+            summaryLines.push(`${code}: round ${round} rate-limited (retry ${retries + 1}/5)`);
           } else {
-            summaryLines.push(`${code}: round ${seed} ${view.state}, retrying`);
+            progress.update(code, { rounds: round });
+            if (round >= config.maxRounds) {
+              progress.update(code, { state: "failed", reason: `solver ${view.state} at round ${round}: ${detail.slice(0, 120)}` });
+              summaryLines.push(`${code}: failed (solver ${view.state} at round ${round})`);
+            } else {
+              summaryLines.push(`${code}: round ${round} ${view.state}, advancing`);
+            }
           }
         }
         changed = true;
@@ -521,6 +568,7 @@ async function run(ctx, args, agent) {
           found,
           hint
         });
+        roundLabels.set(`${target.unique_code}#${seed}`, label);
         const dispatchPolicy = policyFor(config.policy, target.difficulty, seed);
         campaign.add({
           id: `${target.unique_code}#s${seed}`,
@@ -529,11 +577,15 @@ async function run(ctx, args, agent) {
           ...dispatchPolicy.reasoningEffort !== void 0 ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {},
           priority: { tier: tierOf(target.difficulty), score: target.total_score * (config.maxRounds - seed + 1) }
         });
+        audit({ type: "enqueue", code: target.unique_code, round: seed, model: dispatchPolicy.model, effort: dispatchPolicy.reasoningEffort, addrs });
         progress.update(target.unique_code, { difficulty: target.difficulty, rounds: seed });
         changed = true;
       }
       while (campaign.freeSlots() > 0 && campaign.nextQueued().length > 0) {
-        await campaign.dispatchNext();
+        const view = await campaign.dispatchNext();
+        if (view !== void 0 && view !== null && typeof view === "object" && "item" in view) {
+          audit({ type: "dispatch", id: view.item.id });
+        }
       }
       if (changed) persist(snapshotPath, progress);
       if (campaign.isComplete() && campaign.ledger.views().length > 0 && targets.length === 0) break;
@@ -554,6 +606,10 @@ async function run(ctx, args, agent) {
   const final = await adapter.listChallenges();
   const score = adapter.scoreOf(final);
   const hintTotal = hintLedger.totalDeducted();
+  const allTerminal = final.every((c) => c.is_completed || (progress.get(c.unique_code)?.state === "failed" || progress.get(c.unique_code)?.state === "skipped"));
+  if (allTerminal || budget.exhausted()) {
+    await finishRun(config.baseURL, args.runBearerToken, args.runId);
+  }
   const result = [
     `xiaochang run finished`,
     `score=${score.score}/${score.max} (${score.completed}/${final.length} challenges completed)`,
@@ -563,8 +619,27 @@ async function run(ctx, args, agent) {
   ].join("\n");
   return result;
 }
+async function finishRun(baseURL, bearerToken, runId) {
+  if (bearerToken === void 0 || runId === void 0 || bearerToken === "") return;
+  try {
+    const res = await fetch(`${baseURL}/api/v1/runs/${runId}/finish`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${bearerToken}` }
+    });
+    if (!res.ok) {
+      throw new Error(`finish ${res.status}`);
+    }
+  } catch (error) {
+    console.error(`xiaochang: finishRun failed: ${String(error)}`);
+  }
+}
 function codeOf(itemId) {
   return itemId.split("#s")[0] ?? itemId;
+}
+function roundOf(itemId) {
+  const match = /#s(\d+)/.exec(itemId);
+  const parsed = match !== null ? Number(match[1]) : 1;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
 }
 function persist(path, progress) {
   mkdirSync(join(path, ".."), { recursive: true });

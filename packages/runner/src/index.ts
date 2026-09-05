@@ -42,6 +42,9 @@ interface StartArgs {
   baseURL?: string
   benchmarkToken?: string
   vpnGateway?: string
+  /** 可选：平台会话 Bearer token + run id —— 全题终态/预算耗尽后立即 finish 停止计时。 */
+  runBearerToken?: string
+  runId?: number
 }
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
@@ -90,6 +93,8 @@ export function apply(ctx: Context): void {
       baseURL: { type: 'string', description: 'BENCHMARK_BASE_URL (defaults to env BENCHMARK_BASE_URL).' },
       benchmarkToken: { type: 'string', description: 'BENCHMARK_TOKEN (defaults to env BENCHMARK_TOKEN).' },
       vpnGateway: { type: 'string', description: 'VPN gateway health URL. Default http://10.0.100.58.' },
+      runBearerToken: { type: 'string', description: 'Optional platform session Bearer token to finish the run early (stop the ranking clock).' },
+      runId: { type: 'number', description: 'Optional platform run id for early finish.' },
     },
     output: {
       schema: { type: 'string' },
@@ -176,7 +181,10 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
 
   const hintLedger = new HintLedger()
   const processed = new Set<string>()
-  const solverOutputs = new Map<string, string>()
+  // (code, round) → 该轮已消耗的限流重试次数（round 不变、不消耗 maxRounds）。
+  const rateRetries = new Map<string, number>()
+  // (code, round) → 该轮求解 prompt（限流重试用同一 prompt）。
+  const roundLabels = new Map<string, string>()
 
   // 战役：工作项 = 每题的每轮求解；账本自动喂终态报告（宿主绑定）。
   const holder = (ctx as unknown as { hufu: { createCampaign(p: unknown, c: object, items: unknown[]): HufuLike } }).hufu
@@ -186,14 +194,29 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
     heartbeatMs: 15 * 60_000,
     budgetMs: config.budgetMs,
   }, [])
-  void solverOutputs
+
+  const auditPath = join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-run-audit.jsonl')
+  const audit = (line: object): void => {
+    try {
+      appendFileSync(auditPath, `${JSON.stringify(line)}\n`)
+    } catch { /* 审计失败不影响主流程 */ }
+  }
 
   persist(snapshotPath, progress)
 
   const summaryLines: string[] = []
   try {
+    // 0. 启动清理：崩溃/重启残留的容器全部关闭（campaign 从空重建，无在途轮次）。
+    const startup = await adapter.listChallenges()
+    for (const c of startup) challenges.set(c.unique_code, c)
+    for (const c of startup) {
+      if (c.container_status === 'available' || c.container_status === 'pending') {
+        try { await adapter.close(c.unique_code) } catch { /* 忽略 */ }
+      }
+    }
+
     while (!budget.exhausted()) {
-      // 0. 刷新平台视图（容器状态/完成度——崩溃恢复后以平台为准）。
+      // 0b. 刷新平台视图（容器状态/完成度——崩溃恢复后以平台为准）。
       const fresh = await adapter.listChallenges()
       for (const c of fresh) challenges.set(c.unique_code, c)
 
@@ -211,7 +234,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
         }
       }
 
-      // 2. 处理终态工作项：交卷 / 推进下一轮 / 判失败。
+      // 2. 处理终态工作项：交卷 / 推进下一轮 / 限流重试（轮次取自工作项 id，不取账本 seed）。
       let changed = false
       for (const view of campaign.ledger.views()) {
         if (processed.has(view.item.id)) continue
@@ -219,8 +242,9 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
         if (!terminal) continue
         processed.add(view.item.id)
         const code = codeOf(view.item.id)
-        const seed = view.seed
+        const round = roundOf(view.item.id)
         const p = progress.get(code)
+        audit({ type: 'terminal', id: view.item.id, state: view.state, round, detail: (view.terminalDetail ?? '').slice(0, 400) })
         if (p === undefined || p.state === 'complete' || p.state === 'failed' || p.state === 'skipped') continue
         if (view.state === 'done') {
           const flags = extractFlags(view.terminalDetail ?? '')
@@ -234,23 +258,47 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
           const merged = [...new Set([...p.flags, ...accepted])]
           const challenge = challenges.get(code)
           const flagCount = challenge?.flag_count ?? Number.POSITIVE_INFINITY
-          progress.update(code, { flags: merged, rounds: seed })
+          progress.update(code, { flags: merged, rounds: round })
           if (merged.length >= flagCount) {
             progress.update(code, { state: 'complete' })
-            summaryLines.push(`${code}: complete (${merged.length}/${flagCount} flags, ${seed} round(s))`)
-          } else if (seed >= config.maxRounds) {
+            // 拿完 flag 立即关容器（排名按 score_elapsed_seconds：越快越靠前）。
+            try { await adapter.close(code) } catch { /* 忽略 */ }
+            progress.update(code, { containerClosed: true })
+            summaryLines.push(`${code}: complete (${merged.length}/${flagCount} flags, ${round} round(s))`)
+          } else if (round >= config.maxRounds) {
             progress.update(code, { state: 'failed', reason: `rounds exhausted with ${merged.length}/${flagCount} flags` })
-            summaryLines.push(`${code}: failed (${merged.length}/${flagCount} after ${seed} rounds)`)
+            summaryLines.push(`${code}: failed (${merged.length}/${flagCount} after ${round} rounds)`)
           } else {
-            summaryLines.push(`${code}: round ${seed} done, ${merged.length}/${flagCount} flags`)
+            summaryLines.push(`${code}: round ${round} done, ${merged.length}/${flagCount} flags`)
           }
         } else {
-          progress.update(code, { rounds: seed })
-          if (seed >= config.maxRounds) {
-            progress.update(code, { state: 'failed', reason: `solver ${view.state} at round ${seed}` })
-            summaryLines.push(`${code}: failed (solver ${view.state} at round ${seed})`)
+          // 限流/瞬时错误：不消耗轮次，延迟后同轮重试（最多 5 次）。
+          const detail = view.terminalDetail ?? ''
+          const rateLimited = /429|rate.?limit|overload|too many|限流|频率|busy/i.test(detail)
+          const retryKey = `${code}#${round}`
+          const retries = rateRetries.get(retryKey) ?? 0
+          if (rateLimited && retries < 5) {
+            rateRetries.set(retryKey, retries + 1)
+            audit({ type: 'rate-retry', code, round, retries: retries + 1 })
+            const cached = roundLabels.get(retryKey)
+            const challenge = challenges.get(code)
+            const dispatchPolicy = policyFor(config.policy, challenge?.difficulty ?? 'hard', round)
+            campaign.add({
+              id: `${retryKey}-r${retries + 1}`,
+              label: cached ?? `retry ${code} round ${round}`,
+              model: dispatchPolicy.model,
+              ...(dispatchPolicy.reasoningEffort !== undefined ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {}),
+              priority: { tier: tierOf(challenge?.difficulty ?? 'hard'), score: 9999 },
+            })
+            summaryLines.push(`${code}: round ${round} rate-limited (retry ${retries + 1}/5)`)
           } else {
-            summaryLines.push(`${code}: round ${seed} ${view.state}, retrying`)
+            progress.update(code, { rounds: round })
+            if (round >= config.maxRounds) {
+              progress.update(code, { state: 'failed', reason: `solver ${view.state} at round ${round}: ${detail.slice(0, 120)}` })
+              summaryLines.push(`${code}: failed (solver ${view.state} at round ${round})`)
+            } else {
+              summaryLines.push(`${code}: round ${round} ${view.state}, advancing`)
+            }
           }
         }
         changed = true
@@ -321,6 +369,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
           found,
           hint,
         })
+        roundLabels.set(`${target.unique_code}#${seed}`, label)
         const dispatchPolicy = policyFor(config.policy, target.difficulty, seed)
         campaign.add({
           id: `${target.unique_code}#s${seed}`,
@@ -329,13 +378,17 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
           ...(dispatchPolicy.reasoningEffort !== undefined ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {}),
           priority: { tier: tierOf(target.difficulty), score: target.total_score * (config.maxRounds - seed + 1) },
         })
+        audit({ type: 'enqueue', code: target.unique_code, round: seed, model: dispatchPolicy.model, effort: dispatchPolicy.reasoningEffort, addrs })
         progress.update(target.unique_code, { difficulty: target.difficulty, rounds: seed })
         changed = true
       }
 
-      // 5. 派单（槽位空闲即派）。
+      // 5. 派单（槽位空闲即派；限流重试项优先，避免挤占新轮次）。
       while (campaign.freeSlots() > 0 && campaign.nextQueued().length > 0) {
-        await campaign.dispatchNext()
+        const view = await campaign.dispatchNext()
+        if (view !== undefined && view !== null && typeof view === 'object' && 'item' in view) {
+          audit({ type: 'dispatch', id: (view as { item: { id: string } }).item.id })
+        }
       }
 
       if (changed) persist(snapshotPath, progress)
@@ -357,6 +410,13 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
   const final = await adapter.listChallenges()
   const score = adapter.scoreOf(final)
   const hintTotal = hintLedger.totalDeducted()
+
+  // 全题终态或预算耗尽 → 立即 finish 停表（排名按 score_elapsed_seconds，先跑完先靠前）。
+  const allTerminal = final.every(c => c.is_completed || (progress.get(c.unique_code)?.state === 'failed' || progress.get(c.unique_code)?.state === 'skipped'))
+  if (allTerminal || budget.exhausted()) {
+    await finishRun(config.baseURL, args.runBearerToken, args.runId)
+  }
+
   const result = [
     `xiaochang run finished`,
     `score=${score.score}/${score.max} (${score.completed}/${final.length} challenges completed)`,
@@ -367,8 +427,32 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
   return result
 }
 
+/** 平台前端 API：结束 run 停止计时（需要会话 Bearer token 与 run id）。 */
+async function finishRun(baseURL: string, bearerToken: string | undefined, runId: number | undefined): Promise<void> {
+  if (bearerToken === undefined || runId === undefined || bearerToken === '') return
+  try {
+    const res = await fetch(`${baseURL}/api/v1/runs/${runId}/finish`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${bearerToken}` },
+    })
+    if (!res.ok) {
+      throw new Error(`finish ${res.status}`)
+    }
+  } catch (error) {
+    // 停表失败不致命：平台会在 run 时限到达时自动结束。
+    console.error(`xiaochang: finishRun failed: ${String(error)}`)
+  }
+}
+
 function codeOf(itemId: string): string {
   return itemId.split('#s')[0] ?? itemId
+}
+
+/** 轮次取自工作项 id（`<code>#s<round>` / `<code>#s<round>-r<n>`），与账本 seed 无关。 */
+function roundOf(itemId: string): number {
+  const match = /#s(\d+)/.exec(itemId)
+  const parsed = match !== null ? Number(match[1]) : 1
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1
 }
 
 function persist(path: string, progress: RunProgress): void {
