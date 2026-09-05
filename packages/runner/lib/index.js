@@ -313,7 +313,7 @@ function apply(ctx) {
       concurrency: { type: "number", description: "Solver concurrency (container slots, max 3). Default 3." },
       model: { type: "string", description: "Solver model for easy challenges. Default kimi-k3." },
       modelMedium: { type: "string", description: "Solver model for medium challenges. Default deepseek-v4-flash." },
-      modelHard: { type: "string", description: "Solver model for hard/insane challenges. Default glm-5.3." },
+      modelHard: { type: "string", description: "Solver model for hard/insane challenges. Default deepseek-v4-pro." },
       effort: { type: "string", description: "Reasoning effort for easy (off/low/high/max). Default high." },
       effortMedium: { type: "string", description: "Reasoning effort for medium. Default low (flash fast path)." },
       effortHard: { type: "string", description: "Reasoning effort for hard/insane. Default max." },
@@ -359,7 +359,7 @@ async function run(ctx, args, agent) {
     policy: {
       model: args.model ?? "kimi-k3",
       modelMedium: args.modelMedium ?? "deepseek-v4-flash",
-      modelHard: args.modelHard ?? "glm-5.3",
+      modelHard: args.modelHard ?? "deepseek-v4-pro",
       effort: args.effort ?? "high",
       effortMedium: args.effortMedium ?? "low",
       effortHard: args.effortHard ?? "max",
