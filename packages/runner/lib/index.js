@@ -467,7 +467,7 @@ function apply(ctx) {
         stallAfterMs: s.roundTimeoutMs + 10 * 6e4,
         heartbeatMs: 15 * 6e4,
         budgetMs: s.budgetMs
-      }, []);
+      }, []).campaign;
       if (!await s.adapter.gatewayHealthy()) {
         return "xiaochang_setup: VPN gateway not healthy \u2014 connect the run VPN first";
       }

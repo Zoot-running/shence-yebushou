@@ -171,7 +171,7 @@ function walk(dir: string): string[] {
 
 export function apply(ctx: Context): void {
   const jisi = (ctx as unknown as { get?: (name: string) => unknown }).get?.('jisi') as JisiLike | undefined
-  const holder = (ctx as unknown as { hufu: { createCampaign(p: unknown, c: object, items: unknown[]): HufuLike } }).hufu
+  const holder = (ctx as unknown as { hufu: { createCampaign(p: unknown, c: object, items: unknown[]): { campaign: HufuLike } } }).hufu
   let campaign: HufuLike | undefined
 
   const c = (): HufuLike => {
@@ -259,7 +259,7 @@ export function apply(ctx: Context): void {
         stallAfterMs: s.roundTimeoutMs + 10 * 60_000,
         heartbeatMs: 15 * 60_000,
         budgetMs: s.budgetMs,
-      }, [])
+      }, []).campaign
       if (!(await s.adapter.gatewayHealthy())) {
         return 'xiaochang_setup: VPN gateway not healthy — connect the run VPN first'
       }
