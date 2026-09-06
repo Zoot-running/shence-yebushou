@@ -10,6 +10,7 @@ import {
   cleanRoomGate,
   codeOf,
   parseObservations,
+  resolveExecutor,
   roundOf,
 } from '../src/orchestrator.ts'
 
@@ -67,5 +68,27 @@ describe('RunProgress', () => {
     progress.update('a', { state: 'complete' })
     const restored = RunProgress.restore([progress.line(), '{corrupt'])
     expect(restored.get('a')?.state).toBe('complete')
+  })
+})
+
+describe('resolveExecutor', () => {
+  const policy = { defaultModel: 'deepseek-v4-flash', defaultEffort: 'low', locked: false }
+
+  it('unlocked: per-item override wins, default fills the gap', () => {
+    expect(resolveExecutor({ model: 'kimi-k3', effort: 'max' }, policy)).toEqual({
+      model: 'kimi-k3', effort: 'max', overriddenByLock: false,
+    })
+    expect(resolveExecutor({}, policy)).toEqual({
+      model: 'deepseek-v4-flash', effort: 'low', overriddenByLock: false,
+    })
+  })
+  it('locked: everything is forced to the default and overrides are flagged', () => {
+    const locked = { ...policy, locked: true }
+    expect(resolveExecutor({ model: 'kimi-k3' }, locked)).toEqual({
+      model: 'deepseek-v4-flash', effort: 'low', overriddenByLock: true,
+    })
+    expect(resolveExecutor({}, locked)).toEqual({
+      model: 'deepseek-v4-flash', effort: 'low', overriddenByLock: false,
+    })
   })
 })

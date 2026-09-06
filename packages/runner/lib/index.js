@@ -237,6 +237,20 @@ function parseObservations(text, cap = 5) {
   }
   return out;
 }
+function resolveExecutor(requested, policy) {
+  if (policy.locked) {
+    return {
+      model: policy.defaultModel,
+      effort: policy.defaultEffort,
+      overriddenByLock: requested.model !== void 0 && requested.model !== policy.defaultModel || requested.effort !== void 0 && requested.effort !== policy.defaultEffort
+    };
+  }
+  return {
+    model: requested.model ?? policy.defaultModel,
+    effort: requested.effort ?? policy.defaultEffort,
+    overriddenByLock: false
+  };
+}
 var RunProgress = class _RunProgress {
   records = /* @__PURE__ */ new Map();
   static fromJSON(data) {
@@ -390,7 +404,10 @@ function apply(ctx) {
       maxHintsPerChallenge: { type: "number", description: "Official hints per challenge (10% score each). Default 1." },
       knowledgeDir: { type: "string", description: "Local private knowledge dir for the clean-room gate." },
       profilePath: { type: "string", description: "Org-profile file path." },
-      vpnGateway: { type: "string", description: "VPN gateway health URL. Default http://10.0.100.58." }
+      vpnGateway: { type: "string", description: "VPN gateway health URL. Default http://10.0.100.58." },
+      defaultModel: { type: "string", description: "Executor default model when an item omits one. Default deepseek-v4-flash (you may set a per-run default that fits this run)." },
+      defaultEffort: { type: "string", description: "Executor default reasoning effort. Default low." },
+      modelLock: { type: "boolean", description: "Lock: force ALL executors to defaultModel/defaultEffort, ignoring per-item overrides (user/parent-agent override). Default false (main agent may switch models per item)." }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
@@ -433,7 +450,12 @@ function apply(ctx) {
         profile: createProfile("tsecbench-set"),
         hintLedger: new HintLedger(),
         processed: /* @__PURE__ */ new Set(),
-        challenges: /* @__PURE__ */ new Map()
+        challenges: /* @__PURE__ */ new Map(),
+        executorPolicy: {
+          defaultModel: args.defaultModel ?? "deepseek-v4-flash",
+          defaultEffort: args.defaultEffort ?? "low",
+          locked: args.modelLock ?? false
+        }
       };
       try {
         if (existsSync(s.profilePath)) s.profile = parse(readFileSync(s.profilePath, "utf8"));
@@ -605,21 +627,20 @@ boardPath=${c().boardPath(args.code)}`;
       if (ch === void 0) return `xiaochang_enqueue: unknown challenge ${args.code}`;
       const seq = s.progress.get(args.code)?.rounds ?? 0;
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`;
-      const executorModel = args.model ?? "deepseek-v4-flash";
-      const executorEffort = args.effort ?? "low";
+      const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy);
       c().add({
         id: itemId,
         label: args.prompt,
-        model: executorModel,
-        reasoningEffort: executorEffort,
+        model: executor.model,
+        reasoningEffort: executor.effort,
         ...args.dependsOn !== void 0 && args.dependsOn.length > 0 ? { dependsOn: args.dependsOn } : {},
         board: args.code,
         priority: { tier: tierOf(ch.difficulty), score: args.priority ?? ch.total_score }
       });
       s.progress.update(args.code, { difficulty: ch.difficulty, rounds: Math.max(s.progress.get(args.code)?.rounds ?? 0, args.round) });
       persistProgress(s);
-      audit(s.auditPath, { type: "enqueue", id: itemId, code: args.code, round: args.round, model: executorModel, effort: executorEffort });
-      return `enqueued ${itemId} (executor=${executorModel}/${executorEffort})`;
+      audit(s.auditPath, { type: "enqueue", id: itemId, code: args.code, round: args.round, model: executor.model, effort: executor.effort });
+      return `enqueued ${itemId} (executor=${executor.model}/${executor.effort}${executor.overriddenByLock ? ", OVERRIDDEN BY MODEL LOCK" : ""})`;
     }
   }));
   register(defineTool({

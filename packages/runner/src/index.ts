@@ -20,6 +20,7 @@ import {
   cleanRoomGate,
   codeOf,
   parseObservations,
+  resolveExecutor,
   roundOf,
 } from './orchestrator.ts'
 
@@ -83,6 +84,12 @@ interface SetupArgs {
   knowledgeDir?: string
   profilePath?: string
   vpnGateway?: string
+  /** 执行者缺省模型（未指定时）。 */
+  defaultModel?: string
+  /** 执行者缺省思考强度（未指定时）。 */
+  defaultEffort?: string
+  /** 模型锁：true = 强制所有执行者使用缺省模型/强度（用户/父 agent 锁定选项）。 */
+  modelLock?: boolean
 }
 
 interface CampaignState {
@@ -106,6 +113,7 @@ interface CampaignState {
   hintLedger: HintLedger
   processed: Set<string>
   challenges: Map<string, ChallengeInfo>
+  executorPolicy: ExecutorPolicy
 }
 
 let state: CampaignState | undefined
@@ -189,6 +197,9 @@ export function apply(ctx: Context): void {
       knowledgeDir: { type: 'string', description: 'Local private knowledge dir for the clean-room gate.' },
       profilePath: { type: 'string', description: 'Org-profile file path.' },
       vpnGateway: { type: 'string', description: 'VPN gateway health URL. Default http://10.0.100.58.' },
+      defaultModel: { type: 'string', description: 'Executor default model when an item omits one. Default deepseek-v4-flash (you may set a per-run default that fits this run).' },
+      defaultEffort: { type: 'string', description: 'Executor default reasoning effort. Default low.' },
+      modelLock: { type: 'boolean', description: 'Lock: force ALL executors to defaultModel/defaultEffort, ignoring per-item overrides (user/parent-agent override). Default false (main agent may switch models per item).' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
@@ -233,6 +244,11 @@ export function apply(ctx: Context): void {
         hintLedger: new HintLedger(),
         processed: new Set(),
         challenges: new Map(),
+        executorPolicy: {
+          defaultModel: args.defaultModel ?? 'deepseek-v4-flash',
+          defaultEffort: args.defaultEffort ?? 'low',
+          locked: args.modelLock ?? false,
+        },
       }
       try {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
@@ -409,23 +425,21 @@ export function apply(ctx: Context): void {
       if (ch === undefined) return `xiaochang_enqueue: unknown challenge ${args.code}`
       const seq = s.progress.get(args.code)?.rounds ?? 0
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`
-      // 缺省执行者 = 便宜快路径（主 agent 可对难题显式覆盖）；缺省值也要显式落项，
-      // 让集思能力账本能看到每局的执行者是谁。
-      const executorModel = args.model ?? 'deepseek-v4-flash'
-      const executorEffort = args.effort ?? 'low'
+      // 执行者模型/强度：主 agent 逐项覆盖优先，缺省兜底；模型锁定时强制缺省。
+      const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy)
       c().add({
         id: itemId,
         label: args.prompt,
-        model: executorModel,
-        reasoningEffort: executorEffort,
+        model: executor.model,
+        reasoningEffort: executor.effort,
         ...(args.dependsOn !== undefined && args.dependsOn.length > 0 ? { dependsOn: args.dependsOn } : {}),
         board: args.code,
         priority: { tier: tierOf(ch.difficulty), score: args.priority ?? ch.total_score },
       })
       s.progress.update(args.code, { difficulty: ch.difficulty, rounds: Math.max(s.progress.get(args.code)?.rounds ?? 0, args.round) })
       persistProgress(s)
-      audit(s.auditPath, { type: 'enqueue', id: itemId, code: args.code, round: args.round, model: executorModel, effort: executorEffort })
-      return `enqueued ${itemId} (executor=${executorModel}/${executorEffort})`
+      audit(s.auditPath, { type: 'enqueue', id: itemId, code: args.code, round: args.round, model: executor.model, effort: executor.effort })
+      return `enqueued ${itemId} (executor=${executor.model}/${executor.effort}${executor.overriddenByLock ? ', OVERRIDDEN BY MODEL LOCK' : ''})`
     },
   }))
 

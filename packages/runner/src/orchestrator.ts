@@ -62,6 +62,44 @@ export function parseObservations(text: string, cap = 5): string[] {
 
 export type ChallengeState = 'solving' | 'complete' | 'failed' | 'skipped'
 
+/** 执行者模型策略：用户/父 agent 的缺省与锁定。 */
+export interface ExecutorPolicy {
+  /** 未指定时的缺省模型。 */
+  defaultModel: string
+  /** 未指定时的缺省思考强度。 */
+  defaultEffort: string
+  /** 锁定：true 时忽略逐项覆盖，强制所有执行者使用缺省模型/强度。 */
+  locked: boolean
+}
+
+export interface ExecutorResolution {
+  model: string
+  effort: string
+  /** 逐项覆盖被锁定策略强制替换。 */
+  overriddenByLock: boolean
+}
+
+/**
+ * 解析一次派单的执行者模型/强度：
+ * 锁定 → 缺省值强制生效（逐项覆盖被忽略并标注）；
+ * 未锁定 → 逐项覆盖优先，缺省兜底（主 agent 自主换模型）。
+ */
+export function resolveExecutor(requested: { model?: string; effort?: string }, policy: ExecutorPolicy): ExecutorResolution {
+  if (policy.locked) {
+    return {
+      model: policy.defaultModel,
+      effort: policy.defaultEffort,
+      overriddenByLock: (requested.model !== undefined && requested.model !== policy.defaultModel)
+        || (requested.effort !== undefined && requested.effort !== policy.defaultEffort),
+    }
+  }
+  return {
+    model: requested.model ?? policy.defaultModel,
+    effort: requested.effort ?? policy.defaultEffort,
+    overriddenByLock: false,
+  }
+}
+
 export interface ChallengeProgress {
   code: string
   difficulty: string
