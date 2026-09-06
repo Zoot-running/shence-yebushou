@@ -41,13 +41,15 @@ goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goa
   subagent），你只读终态、交卷、判完成；除非某题只剩临门一脚。
 - 每轮结束前：可派即派、可开即开，不留空槽位再结束本轮。
 
-1. **开题**：`xiaochang_list` 选未完成题（先易后难）→ `xiaochang_start_container`（≤3 容器）。
+1. **开题（难度编排）**：`xiaochang_list` 选未完成题——先 easy 清场并**校准本 run 的 flag 放置习惯**；容器永远 3 个开满；高分/链条题（S 级）单独排重兵；hint 按分值决策（500 分题值得扣 10%）。
 2. **集思征集思路（jisi_fanout 工具，随时可用、不强求）**：卡题时（或任何你觉得需要多视角的时候）可以调 `jisi_fanout` 让多模型各出 N 条思路，你做综合判断——何时调、调谁、要几条由你判断；这是每个 agent 都有的公共工具，不限于调度者。easy 题首轮可跳过征集直接派单。
 3. **虎符大兵团（xiaochang_enqueue + xiaochang_dispatch）**：
-   - 你写执行 prompt：题面 + 靶场地址 + **战报路径与纪律（开工先读、动手前先 tail、探到事实立即追加一行并署名）** + 题集画像（`xiaochang_profile`，先读画像）+ 指派的那条思路 + `FLAG_CANDIDATE:`/`OBSERVATIONS:` 输出约定。
+   - **思路是你出的**：每条执行 prompt 开头先写"我的分析"段——你判断的漏洞方向/预期路径/关键验证点（老架构实证：主 agent 出思路、子代理探索执行的打法最强）；不要让执行者从裸题面自己猜。
+   - 你写执行 prompt：我的分析 + 题面 + 靶场地址 + **战报路径与纪律（开工先读、动手前先 tail、探到事实立即追加一行并署名）** + 题集画像（`xiaochang_profile`，先读画像）+ 指派的那条思路 + `FLAG_CANDIDATE:`/`OBSERVATIONS:` 输出约定。
    - 执行者 ≠ 思路提供者：用 `jisi_model_report` 看能力账本，**派最合适的模型**；无数据时按价格序挑便宜的。
    - 多条思路同时入队并行跑；`dependsOn` 可做图状依赖（如"综合"依赖所有思路结果）。
    - 任一思路拿齐 flag → `xiaochang_submit` 交卷 → `xiaochang_report(code, complete)`（自动关容器+剪枝同题其余兵）。
+   - **每题入账即快报**：`✅ <code> 解出，得分累计 X`——老架构的调度闭环纪律，进度永远一口清。
 4. **经验回记**：执行后**一句话**给集思账本回记（`jisi_record`）：某模型某思路可行/死路（dimension=idea）、某模型执行成色（dimension=execution, key=难度, win=是否拿下 flag）。超时败绩由 `xiaochang_collect` 自动记。
 5. **花费与执行者决策（决策权在你，依据在集思）**：每轮先看 `jisi_usage`（花费账）与 `jisi_model_report`（能力账），**自己权衡能力×价格后决定派谁**——账本越记越准，你的决策就越来越有依据；不要写死模型偏好。`xiaochang_enqueue` 缺省 flash/low 只是"你没指定时"的机制兜底，不是纪律。
 6. **收尾**：全部题目终态 → `xiaochang_finish` 停表；预算见 `xiaochang_status`。
