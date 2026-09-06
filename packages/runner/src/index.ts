@@ -1,13 +1,13 @@
 /**
- * 校场 L4 自主跑分编排插件：xiaochang_start 工具。
- * 组成：夜不收适配器（平台六原语）＋虎符战役（求解工作项账本）＋集思通道（按次模型）。
- * 宿主循环负责容器生命周期（≤3 槽位）、flag 交卷、hint 经济学、clean-room 门禁、
- * JSONL 快照（崩溃恢复 = 重新调用工具即续跑）。
+ * 校场 v2：主 agent 工具集（调度权还给主 agent）。
+ * runner 只做四件事：平台六原语、虎符战役执行（入队/派单/收果/剪枝）、
+ * 状态与画像落盘、自动记账（超时败绩 + OBSERVATIONS 画像积累）。
+ * 判断全归主 agent：何时征集思路（jisi_fanout）、派谁（jisi_model_report）、
+ * 交不交卷、何时 finish——runner 提供工具与事实，不替主 agent 做决策。
  * @module @shence/xiaochang-runner
  */
 
-import { readFileSync } from 'node:fs'
-import { appendFileSync, existsSync, mkdirSync, readFileSync as readJsonlSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -15,61 +15,16 @@ import { HintLedger } from '../../../src/hint-ledger.ts'
 import { addFact, createProfile, parse as parseProfile, render as renderProfile } from '../../../src/profile.ts'
 import { TsecbenchAdapter, type ChallengeInfo, type FetchLike } from '../../../src/adapters/tsecbench.ts'
 import {
-  ExecutorScoreboard,
-  RunBudget,
   RunProgress,
   baseId,
-  buildIdeaPrompt,
-  buildSolverPrompt,
   cleanRoomGate,
   codeOf,
-  extractFlags,
-  parseIdeas,
   parseObservations,
-  policyFor,
   roundOf,
-  selectTargets,
 } from './orchestrator.ts'
-import type { ModelPolicy } from './orchestrator.ts'
 
 export const name = 'shence-xiaochang-runner'
 export const inject = ['tools', 'hufu', 'jisi']
-
-interface StartArgs {
-  concurrency?: number
-  model?: string
-  modelMedium?: string
-  modelHard?: string
-  effort?: string
-  effortMedium?: string
-  effortHard?: string
-  effortRetry?: string
-  /** 集思思路征集模型（hard/escalation 轮次 fanout）。 */
-  fanoutModels?: string[]
-  /** 每题每轮最多执行多少条思路（虎符并行上限；平台容器上限另算，只约束题数）。 */
-  maxIdeasPerChallenge?: number
-  /** 每个模型最多出几条思路。 */
-  maxIdeasPerModel?: number
-  /** 执行者候选池（战绩账本从中选最合适者；同分按价格序）。 */
-  executorModels?: string[]
-  /** 模型价格序（便宜→贵，同分经济性 tiebreak）。 */
-  priceOrder?: string[]
-  /** 题集画像文件路径（跨题可泛化观察自积累；缺省 $DSH_HOME/storages/xiaochang-profile.md）。 */
-  profilePath?: string
-  budgetMinutes?: number
-  roundsPerChallenge?: number
-  roundTimeoutMinutes?: number
-  maxHintsPerChallenge?: number
-  knowledgeDir?: string
-  baseURL?: string
-  benchmarkToken?: string
-  vpnGateway?: string
-  /** 可选：平台会话 Bearer token + run id —— 全题终态/预算耗尽后立即 finish 停止计时。 */
-  runBearerToken?: string
-  runId?: number
-}
-
-const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
 /** 难度 → 虎符优先级 tier。 */
 function tierOf(difficulty: string): number {
@@ -79,7 +34,6 @@ function tierOf(difficulty: string): number {
   return 3
 }
 
-/** 平台六原语在 Node fetch 上的适配。 */
 function nodeFetch(): FetchLike {
   return async (url, init = {}) => {
     const res = await fetch(url, {
@@ -95,596 +49,545 @@ function nodeFetch(): FetchLike {
   }
 }
 
-export function apply(ctx: Context): void {
-  ctx.tools.register(defineTool({
-    name: 'xiaochang_start',
-    description:
-      'Start (or resume) an autonomous benchmark run on tsecbench: clean-room gated solver rounds driven by the hufu campaign over the jisi channel, with container lifecycle management, flag submission, hint economics, and JSONL crash-recovery snapshots. Returns the final summary. Runs for up to budgetMinutes.',
-    parameters: {
-      concurrency: { type: 'number', description: 'Solver concurrency — total parallel executor slots (campaign-wide). Platform caps CONTAINERS at 3, not solvers: many ideas may hammer the same container. Default 9.' },
-      model: { type: 'string', description: 'Solver model for easy challenges. Default kimi-k3.' },
-      modelMedium: { type: 'string', description: 'Solver model for medium challenges. Default deepseek-v4-flash.' },
-      modelHard: { type: 'string', description: 'Solver model for hard/insane challenges. Default deepseek-v4-pro.' },
-      effort: { type: 'string', description: 'Reasoning effort for easy (off/low/high/max). Default high.' },
-      effortMedium: { type: 'string', description: 'Reasoning effort for medium. Default low (flash fast path).' },
-      effortHard: { type: 'string', description: 'Reasoning effort for hard/insane. Default max.' },
-      effortRetry: { type: 'string', description: 'Reasoning effort from round 2 on (escalation). Default max.' },
-      fanoutModels: { type: 'array', description: 'Idea-gathering models (jisi fanout) for hard/escalation rounds. Default [deepseek-v4-pro, kimi-k3, glm-5.3].' },
-      maxIdeasPerChallenge: { type: 'number', description: 'Max approaches executed in parallel per challenge round. Default 9.' },
-      maxIdeasPerModel: { type: 'number', description: 'Max approaches each idea model may propose. Default 5.' },
-      executorModels: { type: 'array', description: 'Executor candidate pool — the scoreboard assigns the most suitable per task (learned success rates, price tiebreak). Default [kimi-k3, deepseek-v4-flash, deepseek-v4-pro, glm-5.3].' },
-      priceOrder: { type: 'array', description: 'Model price order cheap→expensive for tiebreaks. Default [deepseek-v4-flash, glm-5.3-flash, kimi-k3, glm-5.3, deepseek-v4-pro].' },
-      profilePath: { type: 'string', description: 'Org-profile file for cross-challenge observations (local only). Default $DSH_HOME/storages/xiaochang-profile.md.' },
-      budgetMinutes: { type: 'number', description: 'Total wall-clock budget. Default 320.' },
-      roundsPerChallenge: { type: 'number', description: 'Max solver rounds per challenge. Default 3.' },
-      roundTimeoutMinutes: { type: 'number', description: 'Per-round solver timeout. Default 20.' },
-      maxHintsPerChallenge: { type: 'number', description: 'Official hints per challenge (10% score each). Default 1.' },
-      knowledgeDir: { type: 'string', description: 'Local private knowledge dir for the clean-room gate.' },
-      baseURL: { type: 'string', description: 'BENCHMARK_BASE_URL (defaults to env BENCHMARK_BASE_URL).' },
-      benchmarkToken: { type: 'string', description: 'BENCHMARK_TOKEN (defaults to env BENCHMARK_TOKEN).' },
-      vpnGateway: { type: 'string', description: 'VPN gateway health URL. Default http://10.0.100.58.' },
-      runBearerToken: { type: 'string', description: 'Optional platform session Bearer token to finish the run early (stop the ranking clock).' },
-      runId: { type: 'number', description: 'Optional platform run id for early finish.' },
-    },
-    output: {
-      schema: { type: 'string' },
-      render: (_args, value) => [{ type: 'text', text: value }],
-    },
-    isConcurrencySafe: () => false,
-    async execute(args: StartArgs, exec) {
-      const agent = exec.agent
-      if (agent === undefined) throw new Error('xiaochang_start requires a calling agent')
-      return await run(ctx, args, agent)
-    },
-  }))
-}
-
-async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<string> {
-  const env = process.env
-  const baseURL = args.baseURL ?? env.BENCHMARK_BASE_URL
-  const benchmarkToken = args.benchmarkToken ?? env.BENCHMARK_TOKEN
-  if (baseURL === undefined || benchmarkToken === undefined) {
-    return 'xiaochang: BENCHMARK_BASE_URL and BENCHMARK_TOKEN are required (args or env)'
-  }
-  const jisi = (ctx as unknown as { get?: (name: string) => unknown }).get?.('jisi') as JisiLike | undefined
-  const config = {
-    concurrency: args.concurrency ?? 9,
-    budgetMs: (args.budgetMinutes ?? 320) * 60_000,
-    maxRounds: args.roundsPerChallenge ?? 3,
-    roundTimeoutMs: (args.roundTimeoutMinutes ?? 20) * 60_000,
-    maxHints: args.maxHintsPerChallenge ?? 1,
-    vpnGateway: args.vpnGateway ?? 'http://10.0.100.58',
-    knowledgeDir: args.knowledgeDir ?? join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-knowledge'),
-    policy: {
-      model: args.model ?? 'kimi-k3',
-      modelMedium: args.modelMedium ?? 'deepseek-v4-flash',
-      modelHard: args.modelHard ?? 'deepseek-v4-pro',
-      effort: args.effort ?? 'high',
-      effortMedium: args.effortMedium ?? 'low',
-      effortHard: args.effortHard ?? 'max',
-      effortRetry: args.effortRetry ?? 'max',
-    } satisfies ModelPolicy,
-    fanoutModels: args.fanoutModels ?? ['deepseek-v4-pro', 'kimi-k3', 'glm-5.3'],
-    maxIdeasPerChallenge: args.maxIdeasPerChallenge ?? 9,
-    maxIdeasPerModel: args.maxIdeasPerModel ?? 5,
-    executorModels: args.executorModels ?? ['kimi-k3', 'deepseek-v4-flash', 'deepseek-v4-pro', 'glm-5.3'],
-    priceOrder: args.priceOrder ?? ['deepseek-v4-flash', 'glm-5.3-flash', 'kimi-k3', 'glm-5.3', 'deepseek-v4-pro'],
-    scoreboardPath: join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-scoreboard.json'),
-    profilePath: args.profilePath ?? join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-profile.md'),
-    workRoot: process.cwd(),
-  }
-  const snapshotPath = join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-run.jsonl')
-
-  const adapter = new TsecbenchAdapter({ baseURL, benchmarkToken, vpnGateway: config.vpnGateway }, nodeFetch())
-  if (!(await adapter.gatewayHealthy())) {
-    return 'xiaochang: VPN gateway is not healthy — connect the run VPN first (see jintuo/l4 notes)'
-  }
-
-  const skill = readFileSync(new URL('../prompts/solver.md', import.meta.url), 'utf8')
-
-  // 题集画像（夜不收组织画像机制）：跨题可泛化观察，本地文件自积累；画像只产出、不内置。
-  let profile = createProfile('tsecbench-set')
-  try {
-    if (existsSync(config.profilePath)) {
-      profile = parseProfile(readFileSync(config.profilePath, 'utf8'))
-    }
-  } catch { /* 画像损坏：空画像起跑 */ }
-  const profileText = (): string => renderProfile(profile)
-  const persistProfile = (): void => {
-    try {
-      mkdirSync(join(config.profilePath, '..'), { recursive: true })
-      writeFileSync(config.profilePath, renderProfile(profile))
-    } catch { /* 画像落盘失败不致命 */ }
-  }
-  // 执行者战绩账本：跨题/跨 run 经验积累（本地私知），派单选最合适者。
-  let scoreboard = new ExecutorScoreboard()
-  try {
-    if (existsSync(config.scoreboardPath)) {
-      scoreboard = ExecutorScoreboard.fromJSON(JSON.parse(readFileSync(config.scoreboardPath, 'utf8')))
-    }
-  } catch { /* 账本损坏：空账本起跑 */ }
-  const persistScoreboard = (): void => {
-    try {
-      mkdirSync(join(config.scoreboardPath, '..'), { recursive: true })
-      writeFileSync(config.scoreboardPath, JSON.stringify(scoreboard.toJSON()))
-    } catch { /* 落盘失败不致命 */ }
-  }
-  // 同题共享战报：并行思路相互联系的唯一信道（工作根/每题/FINDINGS.md）。
-  const boardPathFor = (code: string): string => join(config.workRoot, code, 'FINDINGS.md')
-  const seedBoard = (code: string, addrs: readonly string[]): string => {
-    const path = boardPathFor(code)
-    try {
-      mkdirSync(join(path, '..'), { recursive: true })
-      if (!existsSync(path)) {
-        writeFileSync(path, `# 战报：${code}\n\n- 靶场入口：${addrs.join('、')}\n- 规则：只写事实与排除项，每行一条；flag 候选不写这里。\n`)
-      }
-    } catch { /* 战报不可写：求解者仍可单打（boardPath 提示降级） */ }
-    return path
-  }
-
-  // 恢复：读快照（崩溃后重新调用本工具即续跑）。
-  let progress: RunProgress
-  let budget: RunBudget
-  if (existsSync(snapshotPath)) {
-    const lines = readJsonlSync(snapshotPath, 'utf8').split('\n').filter(line => line.trim() !== '')
-    progress = RunProgress.restore(lines)
-    const startedAt = lines.length > 0 ? (JSON.parse(lines[0]!) as { at: number }).at : undefined
-    budget = new RunBudget(config.budgetMs, Date.now, startedAt)
-  } else {
-    progress = new RunProgress()
-    budget = new RunBudget(config.budgetMs)
-  }
-
-  const initial = await adapter.listChallenges()
-  const challenges = new Map(initial.map(c => [c.unique_code, c]))
-
-  // clean-room 门禁：本地私知里出现过该题号 → 本题放弃求解（宁可丢分不破红线）。
-  const localFiles: Array<{ file: string; text: string }> = []
-  if (existsSync(config.knowledgeDir)) {
-    for (const entry of readdirRecursive(config.knowledgeDir)) {
-      try {
-        localFiles.push({ file: entry, text: readJsonlSync(entry, 'utf8') })
-      } catch { /* 非文本文件跳过 */ }
-    }
-  }
-  for (const challenge of initial) {
-    if (progress.get(challenge.unique_code) !== undefined) continue
-    const verdict = cleanRoomGate(challenge.unique_code, localFiles)
-    if (verdict.contaminated) {
-      progress.update(challenge.unique_code, {
-        difficulty: challenge.difficulty,
-        state: 'skipped',
-        reason: `clean-room: local knowledge mentions ${challenge.unique_code}`,
-        containerClosed: true,
-      })
-    }
-  }
-
-  const hintLedger = new HintLedger()
-  const processed = new Set<string>()
-  // (code, round) → 该轮已消耗的限流重试次数（round 不变、不消耗 maxRounds）。
-  const rateRetries = new Map<string, number>()
-  // (code, round) → 该轮求解 prompt（限流重试用同一 prompt）。
-  const roundLabels = new Map<string, string>()
-  // code → 最近一轮求解者的工作记录（下一轮续跑，轮次间不丢进度）。
-  const lastRoundDetail = new Map<string, string>()
-
-  // 战役：工作项 = 每题的每轮求解；账本自动喂终态报告（宿主绑定）。
-  const holder = (ctx as unknown as { hufu: { createCampaign(p: unknown, c: object, items: unknown[]): HufuLike } }).hufu
-  const campaign = holder.createCampaign(agent, {
-    concurrency: config.concurrency,
-    stallAfterMs: config.roundTimeoutMs + 10 * 60_000,
-    heartbeatMs: 15 * 60_000,
-    budgetMs: config.budgetMs,
-  }, [])
-
-  const auditPath = join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-run-audit.jsonl')
-  const audit = (line: object): void => {
-    try {
-      appendFileSync(auditPath, `${JSON.stringify(line)}\n`)
-    } catch { /* 审计失败不影响主流程 */ }
-  }
-  let lastHeartbeatAt = 0
-
-  persist(snapshotPath, progress)
-
-  const summaryLines: string[] = []
-  try {
-    // 0. 启动清理：崩溃/重启残留的容器全部关闭（campaign 从空重建，无在途轮次）。
-    const startup = await adapter.listChallenges()
-    for (const c of startup) challenges.set(c.unique_code, c)
-    for (const c of startup) {
-      if (c.container_status === 'available' || c.container_status === 'pending') {
-        try { await adapter.close(c.unique_code) } catch { /* 忽略 */ }
-      }
-    }
-
-    while (!budget.exhausted()) {
-      // 0b. 刷新平台视图（容器状态/完成度——崩溃恢复后以平台为准）。
-      const fresh = await adapter.listChallenges()
-      for (const c of fresh) challenges.set(c.unique_code, c)
-
-      const targets = selectTargets([...challenges.values()], new Set([...progress.completedCodes(), ...progress.skippedCodes()]))
-      if (targets.length === 0) break
-      // 复活：仅剩 failed 且预算余量充足 → 重置轮次再战（保完成率线）。
-      const openTargets = targets.filter(t => progress.get(t.unique_code)?.state !== 'failed')
-      if (openTargets.length === 0 && budget.remainingMs() > 30 * 60_000) {
-        for (const p of progress.all()) {
-          if (p.state === 'failed' && challenges.get(p.code)?.is_completed !== true) {
-            progress.update(p.code, { state: 'solving', rounds: 0, reason: 'revisit: fresh rounds' })
-            summaryLines.push(`${p.code}: revisit with fresh rounds`)
-          }
-        }
-        rateRetries.clear()
-        roundLabels.clear()
-        continue
-      }
-
-      // 1. 关闭终态题的容器：以平台状态为准（containerClosed 仅作提示，不阻止重试关闭）。
-      for (const p of progress.all()) {
-        if (p.state !== 'complete' && p.state !== 'failed' && p.state !== 'skipped') continue
-        const c = challenges.get(p.code)
-        if (c === undefined || (c.container_status !== 'available' && c.container_status !== 'pending')) continue
-        try {
-          await adapter.close(p.code)
-          progress.update(p.code, { containerClosed: true })
-        } catch { /* 关闭失败：下一轮循环按平台状态重试（不再因本地标志泄漏槽位） */ }
-      }
-
-      // 2. 处理终态工作项：交卷 / 推进下一轮 / 限流重试（轮次取自工作项 id，不取账本 seed）。
-      let changed = false
-      for (const view of campaign.ledger.views()) {
-        const terminal = view.state === 'done' || view.state === 'failed' || view.state === 'blocked'
-        if (!terminal) continue
-        // 迟到的求解输出：即使该工作项已被处理（如超时判失败后真答复才到），
-        // 也把工作记录喂给下一轮续跑——轮次间不丢进度。
-        const lateDetail = (view.terminalDetail ?? '').trim()
-        if (lateDetail !== '' && !lateDetail.startsWith('[diagnostic]') && !lateDetail.includes('round timeout')) {
-          const lateCode = codeOf(view.item.id)
-          lastRoundDetail.set(lateCode, lateDetail)
-        }
-        if (processed.has(view.item.id)) continue
-        processed.add(view.item.id)
-        const code = codeOf(view.item.id)
-        const round = roundOf(view.item.id)
-        const p = progress.get(code)
-        audit({ type: 'terminal', id: view.item.id, state: view.state, round, detail: (view.terminalDetail ?? '').slice(0, 400) })
-        if (p === undefined || p.state === 'complete' || p.state === 'failed' || p.state === 'skipped') continue
-        // 剪枝项（cancel → blocked）不再处理：不得重试、不得推进轮次。
-        if (view.state === 'blocked') {
-          audit({ type: 'canceled', id: view.item.id, round })
-          continue
-        }
-        // 记录本轮工作记录，供下一轮续跑（超时/未完成的轮次不丢侦察成果）。
-        if (lateDetail !== '') {
-          lastRoundDetail.set(code, lateDetail)
-        }
-        if (view.state === 'done') {
-          const flags = extractFlags(view.terminalDetail ?? '')
-          const accepted: string[] = []
-          for (const flag of flags) {
-            try {
-              const res = await adapter.submit(code, flag)
-              if (res.correct && !accepted.includes(flag)) accepted.push(flag)
-            } catch { /* duplicate/校验错误忽略 */ }
-          }
-          // 战绩记账：真实求解结局（拿到 flag 与否）才计入执行者能力。
-          const itemModel = view.item.model
-          if (itemModel !== undefined) {
-            scoreboard.record(itemModel, challenges.get(code)?.difficulty ?? 'unknown', accepted.length > 0)
-            persistScoreboard()
-            audit({ type: 'scoreboard', model: itemModel, code, round, solved: accepted.length > 0 })
-          }
-          // 画像积累：把求解者自报的可泛化观察并入题集画像（去重、本地落盘）。
-          for (const note of parseObservations(view.terminalDetail ?? '')) {
-            addFact(profile, { kind: 'other', note })
-          }
-          persistProfile()
-          const merged = [...new Set([...p.flags, ...accepted])]
-          const challenge = challenges.get(code)
-          const flagCount = challenge?.flag_count ?? Number.POSITIVE_INFINITY
-          progress.update(code, { flags: merged, rounds: round })
-          if (merged.length >= flagCount) {
-            progress.update(code, { state: 'complete' })
-            // 拿完 flag 立即关容器（排名按 score_elapsed_seconds：越快越靠前）。
-            try { await adapter.close(code) } catch { /* 忽略 */ }
-            progress.update(code, { containerClosed: true })
-            // 剪枝：同题其余排队/在途思路项全部取消，槽位与队列立即释放。
-            for (const sibling of campaign.ledger.views()) {
-              if (sibling.item.id !== view.item.id && codeOf(sibling.item.id) === code
-                && (sibling.state === 'queued' || sibling.state === 'dispatched' || sibling.state === 'help' || sibling.state === 'stalled')) {
-                try { campaign.cancel(sibling.item.id, 'challenge complete (sibling idea)') } catch { /* 终态竞争：忽略 */ }
-              }
-            }
-            summaryLines.push(`${code}: complete (${merged.length}/${flagCount} flags, ${round} round(s))`)
-          } else if (round >= config.maxRounds) {
-            progress.update(code, { state: 'failed', reason: `rounds exhausted with ${merged.length}/${flagCount} flags` })
-            summaryLines.push(`${code}: failed (${merged.length}/${flagCount} after ${round} rounds)`)
-          } else {
-            summaryLines.push(`${code}: round ${round} done, ${merged.length}/${flagCount} flags`)
-          }
-        } else {
-          // 限流/瞬时错误（含空诊断的静默失败）：不消耗轮次，同项重试（最多 5 次）。
-          // retry 以"基础项 id"为键（含思路编号），重试同一思路、不串思路。
-          const detail = view.terminalDetail ?? ''
-          const transient = /429|rate.?limit|overload|too many|限流|频率|busy/i.test(detail) || detail.trim() === ''
-          const base = baseId(view.item.id)
-          const retries = rateRetries.get(base) ?? 0
-          if (transient && retries < 5) {
-            rateRetries.set(base, retries + 1)
-            audit({ type: 'rate-retry', id: view.item.id, round, retries: retries + 1 })
-            const cached = roundLabels.get(base)
-            const challenge = challenges.get(code)
-            campaign.add({
-              id: `${base}-r${retries + 1}`,
-              label: cached ?? `retry ${code} round ${round}`,
-              model: scoreboard.pickFor(challenge?.difficulty ?? 'hard', config.executorModels, config.priceOrder),
-              reasoningEffort: config.policy.effortHard ?? config.policy.effortRetry ?? 'max',
-              priority: { tier: tierOf(challenge?.difficulty ?? 'hard'), score: 9999 },
-            })
-            summaryLines.push(`${code}: round ${round} transient failure (retry ${retries + 1}/5)`)
-          } else {
-            // 轮次超时 = 真实能力结局（打了但没破）；瞬时/限流失败不计入战绩。
-            const detail = view.terminalDetail ?? ''
-            if (detail.includes('round timeout')) {
-              const itemModel = view.item.model
-              if (itemModel !== undefined) {
-                scoreboard.record(itemModel, challenges.get(code)?.difficulty ?? 'unknown', false)
-                persistScoreboard()
-                audit({ type: 'scoreboard', model: itemModel, code, round, solved: false, reason: 'timeout' })
-              }
-            }
-            progress.update(code, { rounds: round })
-            if (round >= config.maxRounds) {
-              progress.update(code, { state: 'failed', reason: `solver ${view.state} at round ${round}: ${detail.slice(0, 120)}` })
-              summaryLines.push(`${code}: failed (solver ${view.state} at round ${round})`)
-            } else {
-              summaryLines.push(`${code}: round ${round} ${view.state}, advancing`)
-            }
-          }
-        }
-        changed = true
-      }
-
-      // 3. 轮次超时：挂起的求解按失败处理，由下一轮接管。
-      const now = Date.now()
-      for (const view of campaign.ledger.views()) {
-        if (view.state !== 'dispatched' && view.state !== 'help') continue
-        const last = view.lastProgressAt ?? view.dispatchedAt
-        if (last === undefined || now - last < config.roundTimeoutMs) continue
-        campaign.report(view.item.id, 'failed', 'round timeout')
-        processed.add(view.item.id)
-      }
-
-      // 4. 为需要继续/新开的题派下一轮（容器 ≤ 3）。
-      const openContainers = new Set<string>()
-      for (const c of challenges.values()) {
-        if (c.container_status === 'available' || c.container_status === 'pending') openContainers.add(c.unique_code)
-      }
-      for (const target of targets) {
-        const p = progress.get(target.unique_code)
-        const rounds = p?.rounds ?? 0
-        const terminal = p?.state === 'complete' || p?.state === 'failed' || p?.state === 'skipped'
-        if (terminal) continue
-        const activeRound = [...campaign.ledger.views()].some(v => codeOf(v.item.id) === target.unique_code && (v.state === 'dispatched' || v.state === 'help' || v.state === 'queued'))
-        if (activeRound) continue
-        // 容器准备：available 直接用；stopped 启动；pending 等待。
-        let addrs: string[]
-        if (target.container_status === 'available' && target.container_addr.length > 0) {
-          addrs = target.container_addr
-        } else if (target.container_status === 'stopped' || target.container_status === '') {
-          if (openContainers.size >= 3) continue // 平台槽位上限
-          try {
-            const started = await adapter.start(target.unique_code)
-            addrs = started.container_addr
-            progress.update(target.unique_code, { containerClosed: false })
-          } catch {
-            continue // 平台限流/资源不足，下一轮再试
-          }
-        } else {
-          continue // pending：等待平台就绪
-        }
-        const seed = rounds + 1
-        if (seed > config.maxRounds) {
-          progress.update(target.unique_code, { state: 'failed', reason: 'rounds exhausted' })
-          summaryLines.push(`${target.unique_code}: failed (rounds exhausted)`)
-          continue
-        }
-        // hint 经济学：新轮次且本轮之后仍无 flag 时才考虑官方 hint。
-        let hint: string | undefined
-        const used = hintLedger.get(target.unique_code)?.hints ?? 0
-        const found = p?.flags ?? []
-        if (seed >= 2 && used < config.maxHints && found.length === 0) {
-          try {
-            const raw = await adapter.hint(target.unique_code) as { hint?: string | null }
-            if (raw.hint !== null && raw.hint !== undefined && raw.hint !== '') {
-              hint = raw.hint
-              hintLedger.record(target.unique_code, target.total_score, `round ${seed} stuck`)
-            }
-          } catch { /* 已通关题无 hint；忽略 */ }
-        }
-        const dispatchPolicy = policyFor(config.policy, target.difficulty, seed)
-        const boardPath = seedBoard(target.unique_code, addrs)
-
-        // 集思开路：hard/insane 从第 1 轮、其余难度从第 2 轮起，先 fanout 征集思路；
-        // 思路到手模型即释放；思路拆成虎符工作项并行执行（执行者 ≠ 思路提供者）。
-        const fanoutDue = (target.difficulty === 'hard' || target.difficulty === 'insane') || seed >= 2
-        let ideas: string[] = []
-        if (fanoutDue && jisi !== undefined && config.fanoutModels.length > 0) {
-          try {
-            const ideaWork = {
-              prompt: buildIdeaPrompt({
-                challenge: target,
-                addrs,
-                round: seed,
-                found,
-                hint,
-                previous: lastRoundDetail.get(target.unique_code),
-                maxIdeas: config.maxIdeasPerModel,
-                profile: profileText(),
-              }),
-            }
-            const ideaReports = await jisi.fanout(agent, ideaWork, config.fanoutModels, {
-              reasoningEffort: dispatchPolicy.reasoningEffort ?? 'high',
-              background: false,
-            })
-            ideas = parseIdeas(ideaReports.map(r => r.text), config.maxIdeasPerChallenge)
-            audit({ type: 'fanout', code: target.unique_code, round: seed, models: config.fanoutModels, ideas: ideas.length })
-          } catch (error) {
-            audit({ type: 'fanout-error', code: target.unique_code, round: seed, detail: String(error).slice(0, 200) })
-            ideas = [] // 集思失败不致命：回落单执行者路径
-          }
-        }
-        if (ideas.length === 0) ideas = ['']
-        for (const [index, approach] of ideas.entries()) {
-          const label = buildSolverPrompt({
-            skill,
-            challenge: target,
-            addrs,
-            round: seed,
-            maxRounds: config.maxRounds,
-            found,
-            hint,
-            previous: lastRoundDetail.get(target.unique_code),
-            boardPath,
-            profile: profileText(),
-            ...(approach !== '' ? { approach } : {}),
-          })
-          const itemId = ideas.length === 1 && approach === ''
-            ? `${target.unique_code}#s${seed}`
-            : `${target.unique_code}#s${seed}-i${index + 1}`
-          // 执行者 ≠ 思路提供者；派单由战绩账本选最合适者（胜率优先，同分按价格序）。
-          const executorModel = scoreboard.pickFor(target.difficulty, config.executorModels, config.priceOrder)
-          const executorEffort = config.policy.effortHard ?? config.policy.effortRetry ?? 'max'
-          roundLabels.set(itemId, label)
-          campaign.add({
-            id: itemId,
-            label,
-            model: executorModel,
-            reasoningEffort: executorEffort,
-            priority: { tier: tierOf(target.difficulty), score: target.total_score * (config.maxRounds - seed + 1) },
-          })
-          audit({ type: 'enqueue', code: target.unique_code, round: seed, model: executorModel, effort: executorEffort, addrs, approach: approach === '' ? undefined : approach.slice(0, 80) })
-        }
-        progress.update(target.unique_code, { difficulty: target.difficulty, rounds: seed })
-        changed = true
-      }
-
-      // 5. 派单（槽位空闲即派；限流重试项优先，避免挤占新轮次）。
-      while (campaign.freeSlots() > 0 && campaign.nextQueued().length > 0) {
-        const view = await campaign.dispatchNext()
-        if (view !== undefined && view !== null && typeof view === 'object' && 'item' in view) {
-          audit({ type: 'dispatch', id: (view as { item: { id: string } }).item.id })
-        }
-      }
-
-      if (changed) persist(snapshotPath, progress)
-      // 心跳：循环存活 + 关键计数落审计（无变化时段也不再"监控失明"）。
-      const lastHeartbeat = lastHeartbeatAt
-      const heartbeatNow = Date.now()
-      if (heartbeatNow - lastHeartbeat >= 120_000) {
-        lastHeartbeatAt = heartbeatNow
-        audit({
-          type: 'heartbeat',
-          budgetRemainingMs: budget.remainingMs(),
-          open: campaign.ledger.views().filter(v => v.state === 'dispatched' || v.state === 'help').length,
-          queued: campaign.ledger.views().filter(v => v.state === 'queued').length,
-          complete: progress.all().filter(p => p.state === 'complete').length,
-          failed: progress.all().filter(p => p.state === 'failed').length,
-        })
-      }
-      if (campaign.isComplete() && campaign.ledger.views().length > 0 && targets.length === 0) break
-      await sleep(5000)
-    }
-  } finally {
-    // 收敛：关闭所有仍开着的容器（尽力）。
-    for (const p of progress.all()) {
-      if (!p.containerClosed) {
-        try { await adapter.close(p.code) } catch { /* 忽略 */ }
-        progress.update(p.code, { containerClosed: true })
-      }
-    }
-    persist(snapshotPath, progress)
-  }
-
-  // 最终成绩（平台口径）。
-  const final = await adapter.listChallenges()
-  const score = adapter.scoreOf(final)
-  const hintTotal = hintLedger.totalDeducted()
-
-  // 全题终态或预算耗尽 → 立即 finish 停表（排名按 score_elapsed_seconds，先跑完先靠前）。
-  const allTerminal = final.every(c => c.is_completed || (progress.get(c.unique_code)?.state === 'failed' || progress.get(c.unique_code)?.state === 'skipped'))
-  if (allTerminal || budget.exhausted()) {
-    await finishRun(baseURL, args.runBearerToken, args.runId)
-  }
-
-  const result = [
-    `xiaochang run finished`,
-    `score=${score.score}/${score.max} (${score.completed}/${final.length} challenges completed)`,
-    `hints=${hintLedger.totalHints()} (deducted ${hintTotal})`,
-    `budgetUsedMs=${budget.elapsedMs()}`,
-    `challenges=${progress.all().map(p => `${p.code}:${p.state}`).join(', ')}`,
-  ].join('\n')
-  return result
-}
-
-/** 平台前端 API：结束 run 停止计时（需要会话 Bearer token 与 run id）。 */
-async function finishRun(baseURL: string, bearerToken: string | undefined, runId: number | undefined): Promise<void> {
-  if (bearerToken === undefined || runId === undefined || bearerToken === '') return
-  try {
-    const res = await fetch(`${baseURL}/api/v1/runs/${runId}/finish`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${bearerToken}` },
-    })
-    if (!res.ok) {
-      throw new Error(`finish ${res.status}`)
-    }
-  } catch (error) {
-    // 停表失败不致命：平台会在 run 时限到达时自动结束。
-    console.error(`xiaochang: finishRun failed: ${String(error)}`)
-  }
-}
-
-function persist(path: string, progress: RunProgress): void {
-  mkdirSync(join(path, '..'), { recursive: true })
-  const line = `${progress.line()}\n`
-  if (existsSync(path)) {
-    appendFileSync(path, line)
-  } else {
-    writeFileSync(path, line)
-  }
-}
-
-function readdirRecursive(dir: string): string[] {
-  const { readdirSync, statSync } = require('node:fs') as typeof import('node:fs')
-  const out: string[] = []
-  for (const name of readdirSync(dir)) {
-    const full = join(dir, name)
-    const stat = statSync(full)
-    if (stat.isDirectory()) out.push(...readdirRecursive(full))
-    else out.push(full)
-  }
-  return out
-}
-
-/** 虎符服务面（最小类型面，运行时经 ctx.hufu 注入）。 */
+/** 虎符服务面（最小类型面）。 */
 interface HufuLike {
-  add(item: { id: string; label: string; model?: string; reasoningEffort?: string; priority?: { tier: number; score: number } }): void
+  add(item: { id: string; label: string; model?: string; reasoningEffort?: string; priority?: { tier: number; score: number }; dependsOn?: string[]; board?: string }): void
   freeSlots(): number
   nextQueued(): unknown[]
   dispatchNext(): Promise<unknown>
   report(itemId: string, kind: 'done' | 'failed' | 'blocked', detail?: string): void
   cancel(itemId: string, reason: string): void
+  boardPath(group: string): string
   isComplete(): boolean
   ledger: {
-    views(): Array<{ item: { id: string }; state: string; seed: number; terminalDetail?: string; dispatchedAt?: number; lastProgressAt?: number }>
+    views(): Array<{ item: { id: string; model?: string }; state: string; seed: number; terminalDetail?: string; dispatchedAt?: number; lastProgressAt?: number }>
   }
 }
 
-/** 集思服务面（思路 fanout；报告原样返回，不做综合）。 */
+/** 集思服务面（能力账本；fanout 由主 agent 经 jisi_fanout 工具调用）。 */
 interface JisiLike {
-  fanout(parent: unknown, work: { prompt: string }, models: readonly string[], opts?: {
-    reasoningEffort?: string
-    background?: boolean
-  }): Promise<Array<{ status: string; text: string }>>
+  ledger: {
+    record(model: string, dimension: 'execution' | 'idea', key: string, win: boolean): void
+  }
+}
+
+interface SetupArgs {
+  baseURL?: string
+  benchmarkToken?: string
+  runBearerToken?: string
+  runId?: number
+  concurrency?: number
+  budgetMinutes?: number
+  roundTimeoutMinutes?: number
+  maxHintsPerChallenge?: number
+  knowledgeDir?: string
+  profilePath?: string
+  vpnGateway?: string
+}
+
+interface CampaignState {
+  baseURL: string
+  benchmarkToken: string
+  runBearerToken?: string
+  runId?: number
+  concurrency: number
+  budgetMs: number
+  roundTimeoutMs: number
+  maxHints: number
+  vpnGateway: string
+  knowledgeDir: string
+  profilePath: string
+  snapshotPath: string
+  auditPath: string
+  startedAt: number
+  adapter: TsecbenchAdapter
+  progress: RunProgress
+  profile: import('../../../src/profile.ts').OrgProfile
+  hintLedger: HintLedger
+  processed: Set<string>
+  challenges: Map<string, ChallengeInfo>
+}
+
+let state: CampaignState | undefined
+
+function requireState(): CampaignState {
+  if (state === undefined) throw new Error('xiaochang: not set up — call xiaochang_setup first')
+  return state
+}
+
+function audit(path: string, line: object): void {
+  try {
+    appendFileSync(path, `${JSON.stringify(line)}\n`)
+  } catch { /* 审计失败不影响主流程 */ }
+}
+
+function persistProgress(s: CampaignState): void {
+  try {
+    mkdirSync(join(s.snapshotPath, '..'), { recursive: true })
+    appendFileSync(s.snapshotPath, `${s.progress.line()}\n`)
+  } catch { /* 落盘失败不致命 */ }
+}
+
+function persistProfile(s: CampaignState): void {
+  try {
+    mkdirSync(join(s.profilePath, '..'), { recursive: true })
+    writeFileSync(s.profilePath, renderProfile(s.profile))
+  } catch { /* 落盘失败不致命 */ }
+}
+
+/** 平台容器槽位：最多 3 个可用/启动中的容器。 */
+function openContainers(s: CampaignState): Set<string> {
+  const open = new Set<string>()
+  for (const c of s.challenges.values()) {
+    if (c.container_status === 'available' || c.container_status === 'pending') open.add(c.unique_code)
+  }
+  return open
+}
+
+/** 战役活跃项计数。 */
+function openCount(campaign: HufuLike): number {
+  return campaign.ledger.views().filter(v => v.state === 'dispatched' || v.state === 'help' || v.state === 'stalled').length
+}
+
+function walk(dir: string): string[] {
+  const { readdirSync, statSync } = require('node:fs') as typeof import('node:fs')
+  const out: string[] = []
+  for (const name of readdirSync(dir)) {
+    const full = join(dir, name)
+    const stat = statSync(full)
+    if (stat.isDirectory()) out.push(...walk(full))
+    else out.push(full)
+  }
+  return out
+}
+
+export function apply(ctx: Context): void {
+  const jisi = (ctx as unknown as { get?: (name: string) => unknown }).get?.('jisi') as JisiLike | undefined
+  const holder = (ctx as unknown as { hufu: { createCampaign(p: unknown, c: object, items: unknown[]): HufuLike } }).hufu
+  let campaign: HufuLike | undefined
+
+  const c = (): HufuLike => {
+    if (campaign === undefined) throw new Error('xiaochang: not set up — call xiaochang_setup first')
+    return campaign
+  }
+  const register = (tool: object): void => ctx.tools.register(tool as never)
+
+  // ── setup：建/续战役 ──────────────────────────────────────────────
+  register(defineTool({
+    name: 'xiaochang_setup',
+    description:
+      'Set up (or resume) the tsecbench campaign state: platform adapter, hufu campaign (large slots, no artificial threshold), progress/profile restore. Idempotent — calling again resumes from the snapshot.',
+    parameters: {
+      baseURL: { type: 'string', description: 'BENCHMARK_BASE_URL (defaults to env).' },
+      benchmarkToken: { type: 'string', description: 'BENCHMARK_TOKEN (defaults to env).' },
+      runBearerToken: { type: 'string', description: 'Platform session Bearer token for early finish (stop the ranking clock).' },
+      runId: { type: 'number', description: 'Platform run id.' },
+      concurrency: { type: 'number', description: 'Campaign slots. Default 999 (no artificial threshold; backpressure = CPU/RAM/provider limits only).' },
+      budgetMinutes: { type: 'number', description: 'Wall-clock budget. Default 330.' },
+      roundTimeoutMinutes: { type: 'number', description: 'Auto-report a dispatched item as failed after this long. Default 30.' },
+      maxHintsPerChallenge: { type: 'number', description: 'Official hints per challenge (10% score each). Default 1.' },
+      knowledgeDir: { type: 'string', description: 'Local private knowledge dir for the clean-room gate.' },
+      profilePath: { type: 'string', description: 'Org-profile file path.' },
+      vpnGateway: { type: 'string', description: 'VPN gateway health URL. Default http://10.0.100.58.' },
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args: SetupArgs, exec) {
+      const agent = exec.agent
+      if (agent === undefined) throw new Error('xiaochang_setup requires a calling agent')
+      const env = process.env
+      const baseURL = args.baseURL ?? env.BENCHMARK_BASE_URL
+      const benchmarkToken = args.benchmarkToken ?? env.BENCHMARK_TOKEN
+      if (baseURL === undefined || benchmarkToken === undefined) {
+        return 'xiaochang_setup: BENCHMARK_BASE_URL and BENCHMARK_TOKEN required (args or env)'
+      }
+      const home = env.DSH_HOME ?? '.'
+      const snapshotPath = join(home, 'storages', 'xiaochang-run.jsonl')
+      // 恢复：快照存在则续跑（预算起点沿用首条快照时间）。
+      let progress = new RunProgress()
+      let startedAt = Date.now()
+      if (existsSync(snapshotPath)) {
+        const lines = readFileSync(snapshotPath, 'utf8').split('\n').filter(l => l.trim() !== '')
+        progress = RunProgress.restore(lines)
+        const first = lines.length > 0 ? (JSON.parse(lines[0]!) as { at: number }).at : undefined
+        if (first !== undefined) startedAt = first
+      }
+      const s: CampaignState = {
+        baseURL,
+        benchmarkToken,
+        runBearerToken: args.runBearerToken,
+        runId: args.runId,
+        concurrency: args.concurrency ?? 999,
+        budgetMs: (args.budgetMinutes ?? 330) * 60_000,
+        roundTimeoutMs: (args.roundTimeoutMinutes ?? 30) * 60_000,
+        maxHints: args.maxHintsPerChallenge ?? 1,
+        vpnGateway: args.vpnGateway ?? 'http://10.0.100.58',
+        knowledgeDir: args.knowledgeDir ?? join(home, 'storages', 'xiaochang-knowledge'),
+        profilePath: args.profilePath ?? join(home, 'storages', 'xiaochang-profile.md'),
+        snapshotPath,
+        auditPath: join(home, 'storages', 'xiaochang-run-audit.jsonl'),
+        startedAt,
+        adapter: new TsecbenchAdapter({ baseURL, benchmarkToken, vpnGateway: args.vpnGateway ?? 'http://10.0.100.58' }, nodeFetch()),
+        progress,
+        profile: createProfile('tsecbench-set'),
+        hintLedger: new HintLedger(),
+        processed: new Set(),
+        challenges: new Map(),
+      }
+      try {
+        if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
+      } catch { /* 画像损坏：空画像 */ }
+      state = s
+      campaign = holder.createCampaign(agent, {
+        concurrency: s.concurrency,
+        stallAfterMs: s.roundTimeoutMs + 10 * 60_000,
+        heartbeatMs: 15 * 60_000,
+        budgetMs: s.budgetMs,
+      }, [])
+      if (!(await s.adapter.gatewayHealthy())) {
+        return 'xiaochang_setup: VPN gateway not healthy — connect the run VPN first'
+      }
+      const fresh = await s.adapter.listChallenges()
+      for (const ch of fresh) s.challenges.set(ch.unique_code, ch)
+      persistProgress(s)
+      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}`
+    },
+  }))
+
+  // ── list：题目 + 进度 + clean-room ─────────────────────────────────
+  register(defineTool({
+    name: 'xiaochang_list',
+    description:
+      'List platform challenges with progress and clean-room verdicts. Auto-marks challenges skipped when the local knowledge dir mentions their code (hosted-rules gate). Returns per-challenge: code, difficulty, score, flag_count, completed, container_status, addrs, description, and progress state.',
+    parameters: {},
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute() {
+      const s = requireState()
+      const fresh = await s.adapter.listChallenges()
+      for (const ch of fresh) s.challenges.set(ch.unique_code, ch)
+      // clean-room 门禁：本地私知里出现该题号 → 弃权。
+      const localFiles: Array<{ file: string; text: string }> = []
+      if (existsSync(s.knowledgeDir)) {
+        for (const file of walk(s.knowledgeDir)) {
+          try { localFiles.push({ file, text: readFileSync(file, 'utf8') }) } catch { /* 非文本 */ }
+        }
+      }
+      for (const ch of fresh) {
+        if (s.progress.get(ch.unique_code) !== undefined) continue
+        const verdict = cleanRoomGate(ch.unique_code, localFiles)
+        if (verdict.contaminated) {
+          s.progress.update(ch.unique_code, { difficulty: ch.difficulty, state: 'skipped', reason: `clean-room: local knowledge mentions ${ch.unique_code}`, containerClosed: true })
+        }
+      }
+      persistProgress(s)
+      const score = s.adapter.scoreOf(fresh)
+      const rows = fresh.map(ch => {
+        const p = s.progress.get(ch.unique_code)
+        return `${ch.unique_code} [${ch.difficulty}] ${ch.total_score}pts flags=${ch.correct_flag_count}/${ch.flag_count} completed=${ch.is_completed} container=${ch.container_status} addrs=${ch.container_addr.join(',') || '-'} progress=${p?.state ?? 'fresh'} | ${ch.description ?? ''}`
+      })
+      return `score=${score.score}/${score.max} (${score.completed}/${fresh.length})\n\n${rows.join('\n')}`
+    },
+  }))
+
+  // ── 平台六原语 ────────────────────────────────────────────────────
+  register(defineTool({
+    name: 'xiaochang_start_container',
+    description: 'Start a challenge container (platform cap: 3 containers at once). Seeds the shared findings board and returns its path — include the board path + read/append discipline in every executor prompt you build.',
+    parameters: {
+      code: { type: 'string', required: true, description: 'Challenge unique_code.' },
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args: { code: string }) {
+      const s = requireState()
+      const ch = s.challenges.get(args.code)
+      if (ch === undefined) return `xiaochang_start_container: unknown challenge ${args.code}`
+      if (ch.container_status === 'available' && ch.container_addr.length > 0) {
+        return `already available: addrs=${ch.container_addr.join(',')}\nboardPath=${c().boardPath(args.code)}`
+      }
+      if (openContainers(s).size >= 3) {
+        return 'xiaochang_start_container: platform cap reached (3 containers open) — close a finished challenge first'
+      }
+      const started = await s.adapter.start(args.code)
+      const fresh = await s.adapter.listChallenges()
+      for (const x of fresh) s.challenges.set(x.unique_code, x)
+      s.progress.update(args.code, { difficulty: ch.difficulty, containerClosed: false })
+      persistProgress(s)
+      audit(s.auditPath, { type: 'container-start', code: args.code })
+      return `started: addrs=${started.container_addr.join(',')}\nboardPath=${c().boardPath(args.code)}`
+    },
+  }))
+
+  register(defineTool({
+    name: 'xiaochang_close',
+    description: 'Close a challenge container (release a platform slot).',
+    parameters: { code: { type: 'string', required: true } },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args: { code: string }) {
+      const s = requireState()
+      await s.adapter.close(args.code)
+      s.progress.update(args.code, { containerClosed: true })
+      persistProgress(s)
+      return `closed ${args.code}`
+    },
+  }))
+
+  register(defineTool({
+    name: 'xiaochang_submit',
+    description: 'Submit a flag candidate. Returns the platform verdict (correct/awarded/cumulative/flag counts).',
+    parameters: {
+      code: { type: 'string', required: true },
+      flag: { type: 'string', required: true, description: 'Flag text (platform-annotated format, verbatim).' },
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args: { code: string; flag: string }) {
+      const s = requireState()
+      try {
+        const res = await s.adapter.submit(args.code, args.flag)
+        if (res.correct) {
+          const p = s.progress.get(args.code)
+          s.progress.update(args.code, { flags: [...new Set([...(p?.flags ?? []), args.flag])] })
+          persistProgress(s)
+        }
+        return JSON.stringify(res)
+      } catch (error) {
+        return `submit error: ${String(error)}`
+      }
+    },
+  }))
+
+  register(defineTool({
+    name: 'xiaochang_hint',
+    description: 'Fetch the official hint (deducts ~10% of the challenge score per hint; capped per challenge). Returns the hint text.',
+    parameters: { code: { type: 'string', required: true } },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args: { code: string }) {
+      const s = requireState()
+      const used = s.hintLedger.get(args.code)?.hints ?? 0
+      if (used >= s.maxHints) return 'xiaochang_hint: hint cap reached'
+      const ch = s.challenges.get(args.code)
+      const raw = await s.adapter.hint(args.code) as { hint?: string | null }
+      const hint = raw.hint
+      if (hint === null || hint === undefined || hint === '') return 'xiaochang_hint: no hint available'
+      s.hintLedger.record(args.code, ch?.total_score ?? 100, 'main-agent requested')
+      return `hint (${used + 1}/${s.maxHints} used): ${hint}`
+    },
+  }))
+
+  // ── 虎符执行 ──────────────────────────────────────────────────────
+  register(defineTool({
+    name: 'xiaochang_enqueue',
+    description:
+      'Enqueue one executor work item into the hufu campaign. You (the main agent) compose the prompt — include: challenge description, container addrs, the shared board path with read/append discipline, the org profile, the assigned approach (idea), and the FLAG_CANDIDATE output convention. Optional dependsOn makes it a DAG node (runs after dependencies reach a terminal state).',
+    parameters: {
+      code: { type: 'string', required: true },
+      round: { type: 'number', required: true, description: 'Round number (your own accounting).' },
+      prompt: { type: 'string', required: true, description: 'The full executor prompt.' },
+      model: { type: 'string', description: 'Executor model (leave empty to let the platform default run).' },
+      effort: { type: 'string', description: 'Reasoning effort (unsupported efforts are dropped per model).' },
+      dependsOn: { type: 'array', description: 'Item ids this item waits for (DAG).' },
+      priority: { type: 'number', description: 'Priority score (higher first within difficulty tier).' },
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args: { code: string; round: number; prompt: string; model?: string; effort?: string; dependsOn?: string[]; priority?: number }) {
+      const s = requireState()
+      const ch = s.challenges.get(args.code)
+      if (ch === undefined) return `xiaochang_enqueue: unknown challenge ${args.code}`
+      const seq = s.progress.get(args.code)?.rounds ?? 0
+      const itemId = `${args.code}#s${args.round}-w${seq + 1}`
+      c().add({
+        id: itemId,
+        label: args.prompt,
+        ...(args.model !== undefined ? { model: args.model } : {}),
+        ...(args.effort !== undefined ? { reasoningEffort: args.effort } : {}),
+        ...(args.dependsOn !== undefined && args.dependsOn.length > 0 ? { dependsOn: args.dependsOn } : {}),
+        board: args.code,
+        priority: { tier: tierOf(ch.difficulty), score: args.priority ?? ch.total_score },
+      })
+      s.progress.update(args.code, { difficulty: ch.difficulty, rounds: Math.max(s.progress.get(args.code)?.rounds ?? 0, args.round) })
+      persistProgress(s)
+      audit(s.auditPath, { type: 'enqueue', id: itemId, code: args.code, round: args.round, model: args.model })
+      return `enqueued ${itemId}`
+    },
+  }))
+
+  register(defineTool({
+    name: 'xiaochang_dispatch',
+    description:
+      'Dispatch every READY queued item (DAG dependencies satisfied) while slots are free. Call this after enqueues and again each round — a finished item frees a slot immediately; no barrier ever waits for the slowest.',
+    parameters: {},
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute() {
+      const s = requireState()
+      let count = 0
+      while (c().freeSlots() > 0 && c().nextQueued().length > 0) {
+        await c().dispatchNext()
+        count += 1
+      }
+      audit(s.auditPath, { type: 'dispatch-round', count, open: openCount(c()) })
+      return `dispatched ${count} item(s); open=${openCount(c())}`
+    },
+  }))
+
+  register(defineTool({
+    name: 'xiaochang_collect',
+    description:
+      'Collect settled work items (terminal states) since the last collect, and auto-handle mechanics: round timeouts are reported as failed (with the detail), timeout losses are recorded to the jisi model ledger, and OBSERVATIONS sections flow into the org profile. Returns each item: id, code, round, state, and the executor output text.',
+    parameters: {},
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute() {
+      const s = requireState()
+      const now = Date.now()
+      const rows: string[] = []
+      // 轮次超时自动判负（机制；判不判题由你随后 xiaochang_report 决定）。
+      for (const v of c().ledger.views()) {
+        if (v.state !== 'dispatched' && v.state !== 'help') continue
+        const last = v.lastProgressAt ?? v.dispatchedAt
+        if (last === undefined || now - last < s.roundTimeoutMs) continue
+        c().report(v.item.id, 'failed', 'round timeout')
+        s.processed.add(baseId(v.item.id))
+      }
+      for (const v of c().ledger.views()) {
+        if (v.state !== 'done' && v.state !== 'failed' && v.state !== 'blocked') continue
+        const base = baseId(v.item.id)
+        if (s.processed.has(base)) continue
+        s.processed.add(base)
+        const code = codeOf(v.item.id)
+        const round = roundOf(v.item.id)
+        const detail = v.terminalDetail ?? ''
+        // 自动记账：超时败绩 → 集思能力账本（胜绩与思路对错由主 agent 经 jisi_record 记）。
+        if (v.state === 'failed' && detail.includes('round timeout') && v.item.model !== undefined) {
+          jisi?.ledger.record(v.item.model, 'execution', s.challenges.get(code)?.difficulty ?? 'unknown', false)
+        }
+        // 画像积累：OBSERVATIONS 小节自动并入题集画像。
+        for (const note of parseObservations(detail)) addFact(s.profile, { kind: 'other', note })
+        audit(s.auditPath, { type: 'terminal', id: v.item.id, state: v.state, round, detail: detail.slice(0, 300) })
+        rows.push(`--- ${v.item.id} [${v.state}] round=${round} code=${code}\n${detail.slice(0, 6000)}`)
+      }
+      persistProgress(s)
+      persistProfile(s)
+      return rows.length === 0 ? 'xiaochang_collect: nothing settled yet' : rows.join('\n\n')
+    },
+  }))
+
+  register(defineTool({
+    name: 'xiaochang_report',
+    description:
+      'Report your judgment for a challenge: complete (flags captured) / failed (give up or rounds exhausted) / skipped. Closes the container and prunes the challenge\'s queued/in-flight sibling items (hufu cancel).',
+    parameters: {
+      code: { type: 'string', required: true },
+      verdict: { type: 'string', required: true, description: 'complete | failed | skipped' },
+      reason: { type: 'string', description: 'Short reason (logged).' },
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args: { code: string; verdict: string; reason?: string }) {
+      const s = requireState()
+      const verdict = args.verdict === 'complete' ? 'complete' as const : args.verdict === 'failed' ? 'failed' as const : 'skipped' as const
+      try { await s.adapter.close(args.code) } catch { /* 平台侧已关 */ }
+      s.progress.update(args.code, { state: verdict, reason: args.reason, containerClosed: true })
+      for (const v of c().ledger.views()) {
+        if (codeOf(v.item.id) === args.code
+          && (v.state === 'queued' || v.state === 'dispatched' || v.state === 'help' || v.state === 'stalled')) {
+          try { c().cancel(v.item.id, `challenge ${verdict}: ${args.reason ?? ''}`) } catch { /* 终态竞争 */ }
+        }
+      }
+      persistProgress(s)
+      audit(s.auditPath, { type: 'verdict', code: args.code, state: verdict, reason: args.reason })
+      return `${args.code} → ${verdict}${args.reason !== undefined ? ` (${args.reason})` : ''}`
+    },
+  }))
+
+  // ── 状态与收尾 ────────────────────────────────────────────────────
+  register(defineTool({
+    name: 'xiaochang_board',
+    description: 'Read the shared findings board of a challenge (parallel workers\' coordination channel).',
+    parameters: { code: { type: 'string', required: true } },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => true,
+    async execute(args: { code: string }) {
+      const path = c().boardPath(args.code)
+      try {
+        const text = existsSync(path) ? readFileSync(path, 'utf8') : '(board not created yet)'
+        return `path=${path}\n\n${text}`
+      } catch (error) {
+        return `xiaochang_board error: ${String(error)}`
+      }
+    },
+  }))
+
+  register(defineTool({
+    name: 'xiaochang_profile',
+    description: 'Read the current org profile (cross-challenge generic observations). Include it in your prompts ("read the profile first").',
+    parameters: {},
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => true,
+    async execute() {
+      const s = requireState()
+      return renderProfile(s.profile)
+    },
+  }))
+
+  register(defineTool({
+    name: 'xiaochang_status',
+    description: 'Campaign status: ledger summary, per-challenge progress, budget remaining, open containers.',
+    parameters: {},
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => true,
+    async execute() {
+      const s = requireState()
+      const views = c().ledger.views()
+      const count = (fn: (v: { state: string }) => boolean): number => views.filter(fn).length
+      const remaining = Math.max(0, s.startedAt + s.budgetMs - Date.now())
+      const progress = s.progress.all().map(p => `${p.code}:${p.state}${p.state === 'complete' ? `(${p.flags.length} flags)` : ''}`).join(', ')
+      return [
+        `campaign: open=${count(v => v.state === 'dispatched' || v.state === 'help')} queued=${count(v => v.state === 'queued')} done=${count(v => v.state === 'done')} failed=${count(v => v.state === 'failed')} blocked=${count(v => v.state === 'blocked')}`,
+        `budgetRemainingMin=${Math.round(remaining / 60000)}`,
+        `openContainers=${[...openContainers(s)].join(',') || 'none'}`,
+        `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
+        `progress: ${progress}`,
+      ].join('\n')
+    },
+  }))
+
+  register(defineTool({
+    name: 'xiaochang_finish',
+    description:
+      'Close all open containers, stop the ranking clock via the platform finish endpoint (when all challenges are terminal or you decide to end), and return the final platform score.',
+    parameters: {},
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute() {
+      const s = requireState()
+      for (const ch of s.challenges.values()) {
+        if (ch.container_status === 'available' || ch.container_status === 'pending') {
+          try { await s.adapter.close(ch.unique_code) } catch { /* 忽略 */ }
+        }
+        s.progress.update(ch.unique_code, { containerClosed: true })
+      }
+      persistProgress(s)
+      const final = await s.adapter.listChallenges()
+      const score = s.adapter.scoreOf(final)
+      const allTerminal = final.every(ch => ch.is_completed || ['failed', 'skipped'].includes(s.progress.get(ch.unique_code)?.state ?? ''))
+      if (allTerminal && s.runBearerToken !== undefined && s.runId !== undefined) {
+        try {
+          const res = await fetch(`${s.baseURL}/api/v1/runs/${s.runId}/finish`, {
+            method: 'POST',
+            headers: { authorization: `Bearer ${s.runBearerToken}` },
+          })
+          if (!res.ok) throw new Error(`finish ${res.status}`)
+        } catch (error) {
+          console.error(`xiaochang: finishRun failed: ${String(error)}`)
+        }
+      }
+      return `xiaochang_finish: score=${score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ', ALL TERMINAL' : ''})`
+    },
+  }))
 }
