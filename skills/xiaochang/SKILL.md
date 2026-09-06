@@ -25,7 +25,13 @@ user-invocable: true
 
 ## 三、v2 作战方式（你是调度者，工具是兵）
 
-**节奏（goal 轮驱动）**：每轮 = `xiaochang_collect`（收终态）→ 读战报/画像/能力账本 → 判断 → 派单 → `xiaochang_dispatch`。**一个终态空出槽位，下一轮立即补新兵，永不等最慢的**。
+**节奏（goal 轮驱动，必须执行）**：**第一个动作必须调用 `create_goal` 工具**（目标：
+"完成本 run 全部题目：每轮 xiaochang_collect 收终态→读战报/画像/能力账本→判断→
+jisi_fanout 征集思路（难/卡题）→xiaochang_enqueue 派最合适的执行者→xiaochang_dispatch；
+任一题拿齐 flag 即 xiaochang_submit+xiaochang_report(complete)；全部终态后 xiaochang_finish 停表"）。
+goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goal，你这一轮结束战役就停了**。
+之后每轮：`xiaochang_collect`（收终态）→ 读战报/画像/能力账本 → 判断 → 派单 →
+`xiaochang_dispatch`。**一个终态空出槽位，下一轮立即补新兵，永不等最慢的**。
 
 1. **开题**：`xiaochang_list` 选未完成题（先易后难）→ `xiaochang_start_container`（≤3 容器）。
 2. **集思征集思路（jisi_fanout 工具）**：难题/卡题时召多模型各出 N 条思路（N 由你定，写在 prompt 里）；拿到报告你做综合判断，出思路的模型即释放。easy 题可跳过征集直接派单。
