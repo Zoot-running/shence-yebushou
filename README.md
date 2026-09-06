@@ -1,4 +1,4 @@
-# 校场（shence-yebushou@ctf）—— CTF 分支
+# 校场（shence-yebushou@xiaochang）—— CTF 分支
 
 继承夜不收（main 分支）的渗透能力，追加 CTF 特化：
 
