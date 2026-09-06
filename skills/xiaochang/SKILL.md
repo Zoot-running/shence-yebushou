@@ -33,6 +33,13 @@ goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goa
 之后每轮：`xiaochang_collect`（收终态）→ 读战报/画像/能力账本 → 判断 → 派单 →
 `xiaochang_dispatch`。**一个终态空出槽位，下一轮立即补新兵，永不等最慢的**。
 
+**大兵团纪律（性能跑满，违背就是浪费 run 时钟）**：
+- 容器永远开满 3 个（`xiaochang_start_container` 一次开满，终态立刻关+换新题）；
+- 难题每道并行多条思路（5+ 执行者同打一题），easy/medium 至少 2 路并行；
+- **你的时间是调度与判断，不是亲手解题**：把攻击工作全部交给执行者（enqueue 的
+  subagent），你只读终态、交卷、判完成；除非某题只剩临门一脚。
+- 每轮结束前：可派即派、可开即开，不留空槽位再结束本轮。
+
 1. **开题**：`xiaochang_list` 选未完成题（先易后难）→ `xiaochang_start_container`（≤3 容器）。
 2. **集思征集思路（jisi_fanout 工具）**：难题/卡题时召多模型各出 N 条思路（N 由你定，写在 prompt 里）；拿到报告你做综合判断，出思路的模型即释放。easy 题可跳过征集直接派单。
 3. **虎符大兵团（xiaochang_enqueue + xiaochang_dispatch）**：

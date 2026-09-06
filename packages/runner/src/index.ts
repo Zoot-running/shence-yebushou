@@ -387,7 +387,7 @@ export function apply(ctx: Context): void {
       code: { type: 'string', required: true },
       round: { type: 'number', required: true, description: 'Round number (your own accounting).' },
       prompt: { type: 'string', required: true, description: 'The full executor prompt.' },
-      model: { type: 'string', description: 'Executor model (leave empty to let the platform default run).' },
+      model: { type: 'string', description: 'Executor model. Default deepseek-v4-flash (cheap fast path; override for hard challenges).' },
       effort: { type: 'string', description: 'Reasoning effort (unsupported efforts are dropped per model).' },
       dependsOn: { type: 'array', description: 'Item ids this item waits for (DAG).' },
       priority: { type: 'number', description: 'Priority score (higher first within difficulty tier).' },
@@ -400,19 +400,23 @@ export function apply(ctx: Context): void {
       if (ch === undefined) return `xiaochang_enqueue: unknown challenge ${args.code}`
       const seq = s.progress.get(args.code)?.rounds ?? 0
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`
+      // 缺省执行者 = 便宜快路径（主 agent 可对难题显式覆盖）；缺省值也要显式落项，
+      // 让集思能力账本能看到每局的执行者是谁。
+      const executorModel = args.model ?? 'deepseek-v4-flash'
+      const executorEffort = args.effort ?? 'low'
       c().add({
         id: itemId,
         label: args.prompt,
-        ...(args.model !== undefined ? { model: args.model } : {}),
-        ...(args.effort !== undefined ? { reasoningEffort: args.effort } : {}),
+        model: executorModel,
+        reasoningEffort: executorEffort,
         ...(args.dependsOn !== undefined && args.dependsOn.length > 0 ? { dependsOn: args.dependsOn } : {}),
         board: args.code,
         priority: { tier: tierOf(ch.difficulty), score: args.priority ?? ch.total_score },
       })
       s.progress.update(args.code, { difficulty: ch.difficulty, rounds: Math.max(s.progress.get(args.code)?.rounds ?? 0, args.round) })
       persistProgress(s)
-      audit(s.auditPath, { type: 'enqueue', id: itemId, code: args.code, round: args.round, model: args.model })
-      return `enqueued ${itemId}`
+      audit(s.auditPath, { type: 'enqueue', id: itemId, code: args.code, round: args.round, model: executorModel, effort: executorEffort })
+      return `enqueued ${itemId} (executor=${executorModel}/${executorEffort})`
     },
   }))
 

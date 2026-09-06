@@ -584,7 +584,7 @@ boardPath=${c().boardPath(args.code)}`;
       code: { type: "string", required: true },
       round: { type: "number", required: true, description: "Round number (your own accounting)." },
       prompt: { type: "string", required: true, description: "The full executor prompt." },
-      model: { type: "string", description: "Executor model (leave empty to let the platform default run)." },
+      model: { type: "string", description: "Executor model. Default deepseek-v4-flash (cheap fast path; override for hard challenges)." },
       effort: { type: "string", description: "Reasoning effort (unsupported efforts are dropped per model)." },
       dependsOn: { type: "array", description: "Item ids this item waits for (DAG)." },
       priority: { type: "number", description: "Priority score (higher first within difficulty tier)." }
@@ -597,19 +597,21 @@ boardPath=${c().boardPath(args.code)}`;
       if (ch === void 0) return `xiaochang_enqueue: unknown challenge ${args.code}`;
       const seq = s.progress.get(args.code)?.rounds ?? 0;
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`;
+      const executorModel = args.model ?? "deepseek-v4-flash";
+      const executorEffort = args.effort ?? "low";
       c().add({
         id: itemId,
         label: args.prompt,
-        ...args.model !== void 0 ? { model: args.model } : {},
-        ...args.effort !== void 0 ? { reasoningEffort: args.effort } : {},
+        model: executorModel,
+        reasoningEffort: executorEffort,
         ...args.dependsOn !== void 0 && args.dependsOn.length > 0 ? { dependsOn: args.dependsOn } : {},
         board: args.code,
         priority: { tier: tierOf(ch.difficulty), score: args.priority ?? ch.total_score }
       });
       s.progress.update(args.code, { difficulty: ch.difficulty, rounds: Math.max(s.progress.get(args.code)?.rounds ?? 0, args.round) });
       persistProgress(s);
-      audit(s.auditPath, { type: "enqueue", id: itemId, code: args.code, round: args.round, model: args.model });
-      return `enqueued ${itemId}`;
+      audit(s.auditPath, { type: "enqueue", id: itemId, code: args.code, round: args.round, model: executorModel, effort: executorEffort });
+      return `enqueued ${itemId} (executor=${executorModel}/${executorEffort})`;
     }
   }));
   register(defineTool({
