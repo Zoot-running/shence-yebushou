@@ -83,6 +83,8 @@ export interface SolverPromptArgs {
   hint?: string
   /** 上一轮求解者的工作记录（续跑：轮次间不丢进度）。 */
   previous?: string
+  /** 本条要执行的思路（集思 fanout 产出；执行者 ≠ 思路提供者）。 */
+  approach?: string
 }
 
 /**
@@ -90,7 +92,7 @@ export interface SolverPromptArgs {
  * 通用方法论——不给过程教程、不给任何本地题解知识。
  */
 export function buildSolverPrompt(args: SolverPromptArgs): string {
-  const { skill, challenge, addrs, round, maxRounds, found, hint, previous } = args
+  const { skill, challenge, addrs, round, maxRounds, found, hint, previous, approach } = args
   const lines: string[] = [
     '# 任务：解一道评测靶场题（校场操练）',
     '',
@@ -111,6 +113,13 @@ export function buildSolverPrompt(args: SolverPromptArgs): string {
   if (hint !== undefined && hint !== '') {
     lines.push('', '## 官方提示（本轮可用）', hint)
   }
+  if (approach !== undefined && approach.trim() !== '') {
+    lines.push(
+      '',
+      '## 本条要执行的思路（调度者指派；思路与线索可能不完整，按现场验证为准）',
+      approach.slice(0, 4000),
+    )
+  }
   if (previous !== undefined && previous.trim() !== '') {
     lines.push('', '## 上一轮工作记录（已到超时/未完成，继续从这里出发，不要重复侦察）', previous.slice(0, 6000))
   }
@@ -124,6 +133,83 @@ export function buildSolverPrompt(args: SolverPromptArgs): string {
     '4. 不要提交占位 flag（源码/容器初始化文件里的假值）；真 flag 必须来自线上目标二次确认。',
   )
   return lines.join('\n')
+}
+
+export interface IdeaPromptArgs {
+  challenge: ChallengeInfo
+  addrs: readonly string[]
+  round: number
+  /** 已确认正确的 flag。 */
+  found: readonly string[]
+  /** 官方 hint（可选）。 */
+  hint?: string
+  /** 上一轮工作记录。 */
+  previous?: string
+  /** 每个模型最多给出的思路条数。 */
+  maxIdeas: number
+}
+
+/**
+ * 集思思路征集 prompt：只求"可执行思路"（方向+关键步骤+预期拿 flag 路径），
+ * 不求完整解题；格式约定 IDEA n: 供调度者解析成虎符工作项。
+ */
+export function buildIdeaPrompt(args: IdeaPromptArgs): string {
+  const { challenge, addrs, round, found, hint, previous, maxIdeas } = args
+  const lines: string[] = [
+    '# 任务：为一道评测靶场题征集解题思路（只出思路，不动手）',
+    '',
+    `- 题目编号：${challenge.unique_code}`,
+    `- 难度：${challenge.difficulty}`,
+    `- 分值：${challenge.total_score}（共 ${challenge.flag_count} 个 flag）`,
+    `- 当前第 ${round} 轮`,
+    '',
+    '## 题面',
+    challenge.description || '（平台未提供题面）',
+    '',
+    '## 靶场入口（VPN 内网直连）',
+    ...addrs.map(addr => `- ${addr}`),
+    '',
+    '## 已确认正确的 flag',
+    found.length > 0 ? found.map(f => `- ${f}`).join('\n') : '（暂无）',
+  ]
+  if (hint !== undefined && hint !== '') {
+    lines.push('', '## 官方提示', hint)
+  }
+  if (previous !== undefined && previous.trim() !== '') {
+    lines.push('', '## 此前尝试记录（哪些路走通过/没走通）', previous.slice(0, 6000))
+  }
+  lines.push(
+    '',
+    '## 输出约定',
+    `1. 给出最多 ${maxIdeas} 条**互相独立**的可执行思路，按把握从高到低排列。`,
+    '2. 每条思路一行开始：`IDEA n: <方向> —— <关键步骤与验证点> —— <预期拿到 flag 的路径>`。',
+    '3. 思路基于题面与公开方法论即可；细节留给执行阶段现场验证，不要写完整攻击脚本。',
+    '4. 没想法就输出 `IDEA 0: none`。',
+  )
+  return lines.join('\n')
+}
+
+/**
+ * 从集思 fanout 的原始报告里解析思路块（IDEA n: ...）。
+ * 不做综合、不排序、不合并——调度者只做结构化收集；去重后原样入虎符账本。
+ */
+export function parseIdeas(reports: readonly string[], cap: number): string[] {
+  const ideas: string[] = []
+  const seen = new Set<string>()
+  for (const text of reports) {
+    const pattern = /IDEA\s*\d+\s*[:：]([\s\S]*?)(?=\nIDEA\s*\d+\s*[:：]|$)/gi
+    pattern.lastIndex = 0
+    for (const match of text.matchAll(pattern)) {
+      const body = (match[1] ?? '').trim()
+      if (body === '' || body.toLowerCase() === 'none') continue
+      const key = body.slice(0, 80).toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      ideas.push(body)
+      if (ideas.length >= cap) return ideas
+    }
+  }
+  return ideas
 }
 
 /** 战役预算（墙钟）。 */

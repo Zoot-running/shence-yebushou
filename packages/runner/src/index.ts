@@ -16,10 +16,12 @@ import { TsecbenchAdapter, type ChallengeInfo, type FetchLike } from '../../../s
 import {
   RunBudget,
   RunProgress,
+  buildIdeaPrompt,
   buildSolverPrompt,
   cleanRoomGate,
   codeOf,
   extractFlags,
+  parseIdeas,
   policyFor,
   roundOf,
   selectTargets,
@@ -27,7 +29,7 @@ import {
 import type { ModelPolicy } from './orchestrator.ts'
 
 export const name = 'shence-xiaochang-runner'
-export const inject = ['tools', 'hufu']
+export const inject = ['tools', 'hufu', 'jisi']
 
 interface StartArgs {
   concurrency?: number
@@ -38,6 +40,12 @@ interface StartArgs {
   effortMedium?: string
   effortHard?: string
   effortRetry?: string
+  /** 集思思路征集模型（hard/escalation 轮次 fanout）。 */
+  fanoutModels?: string[]
+  /** 每题每轮最多执行多少条思路（虎符并行上限）。 */
+  maxIdeasPerChallenge?: number
+  /** 每个模型最多出几条思路。 */
+  maxIdeasPerModel?: number
   budgetMinutes?: number
   roundsPerChallenge?: number
   roundTimeoutMinutes?: number
@@ -91,6 +99,9 @@ export function apply(ctx: Context): void {
       effortMedium: { type: 'string', description: 'Reasoning effort for medium. Default low (flash fast path).' },
       effortHard: { type: 'string', description: 'Reasoning effort for hard/insane. Default max.' },
       effortRetry: { type: 'string', description: 'Reasoning effort from round 2 on (escalation). Default max.' },
+      fanoutModels: { type: 'array', description: 'Idea-gathering models (jisi fanout) for hard/escalation rounds. Default [deepseek-v4-pro, kimi-k3, glm-5.3].' },
+      maxIdeasPerChallenge: { type: 'number', description: 'Max approaches executed in parallel per challenge round. Default 6.' },
+      maxIdeasPerModel: { type: 'number', description: 'Max approaches each idea model may propose. Default 3.' },
       budgetMinutes: { type: 'number', description: 'Total wall-clock budget. Default 320.' },
       roundsPerChallenge: { type: 'number', description: 'Max solver rounds per challenge. Default 3.' },
       roundTimeoutMinutes: { type: 'number', description: 'Per-round solver timeout. Default 20.' },
@@ -122,6 +133,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
   if (baseURL === undefined || benchmarkToken === undefined) {
     return 'xiaochang: BENCHMARK_BASE_URL and BENCHMARK_TOKEN are required (args or env)'
   }
+  const jisi = (ctx as unknown as { get?: (name: string) => unknown }).get?.('jisi') as JisiLike | undefined
   const config = {
     concurrency: Math.min(3, args.concurrency ?? 3),
     budgetMs: (args.budgetMinutes ?? 320) * 60_000,
@@ -139,6 +151,9 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
       effortHard: args.effortHard ?? 'max',
       effortRetry: args.effortRetry ?? 'max',
     } satisfies ModelPolicy,
+    fanoutModels: args.fanoutModels ?? ['deepseek-v4-pro', 'kimi-k3', 'glm-5.3'],
+    maxIdeasPerChallenge: args.maxIdeasPerChallenge ?? 6,
+    maxIdeasPerModel: args.maxIdeasPerModel ?? 3,
   }
   const snapshotPath = join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-run.jsonl')
 
@@ -277,6 +292,11 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
         const p = progress.get(code)
         audit({ type: 'terminal', id: view.item.id, state: view.state, round, detail: (view.terminalDetail ?? '').slice(0, 400) })
         if (p === undefined || p.state === 'complete' || p.state === 'failed' || p.state === 'skipped') continue
+        // 剪枝项（cancel → blocked）不再处理：不得重试、不得推进轮次。
+        if (view.state === 'blocked') {
+          audit({ type: 'canceled', id: view.item.id, round })
+          continue
+        }
         // 记录本轮工作记录，供下一轮续跑（超时/未完成的轮次不丢侦察成果）。
         if (lateDetail !== '') {
           lastRoundDetail.set(code, lateDetail)
@@ -299,6 +319,13 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
             // 拿完 flag 立即关容器（排名按 score_elapsed_seconds：越快越靠前）。
             try { await adapter.close(code) } catch { /* 忽略 */ }
             progress.update(code, { containerClosed: true })
+            // 剪枝：同题其余排队/在途思路项全部取消，槽位与队列立即释放。
+            for (const sibling of campaign.ledger.views()) {
+              if (sibling.item.id !== view.item.id && codeOf(sibling.item.id) === code
+                && (sibling.state === 'queued' || sibling.state === 'dispatched' || sibling.state === 'help' || sibling.state === 'stalled')) {
+                try { campaign.cancel(sibling.item.id, 'challenge complete (sibling idea)') } catch { /* 终态竞争：忽略 */ }
+              }
+            }
             summaryLines.push(`${code}: complete (${merged.length}/${flagCount} flags, ${round} round(s))`)
           } else if (round >= config.maxRounds) {
             progress.update(code, { state: 'failed', reason: `rounds exhausted with ${merged.length}/${flagCount} flags` })
@@ -396,26 +423,62 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
             }
           } catch { /* 已通关题无 hint；忽略 */ }
         }
-        const label = buildSolverPrompt({
-          skill,
-          challenge: target,
-          addrs,
-          round: seed,
-          maxRounds: config.maxRounds,
-          found,
-          hint,
-          previous: lastRoundDetail.get(target.unique_code),
-        })
-        roundLabels.set(`${target.unique_code}#${seed}`, label)
         const dispatchPolicy = policyFor(config.policy, target.difficulty, seed)
-        campaign.add({
-          id: `${target.unique_code}#s${seed}`,
-          label,
-          model: dispatchPolicy.model,
-          ...(dispatchPolicy.reasoningEffort !== undefined ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {}),
-          priority: { tier: tierOf(target.difficulty), score: target.total_score * (config.maxRounds - seed + 1) },
-        })
-        audit({ type: 'enqueue', code: target.unique_code, round: seed, model: dispatchPolicy.model, effort: dispatchPolicy.reasoningEffort, addrs })
+
+        // 集思开路：hard/insane 从第 1 轮、其余难度从第 2 轮起，先 fanout 征集思路；
+        // 思路到手模型即释放；思路拆成虎符工作项并行执行（执行者 ≠ 思路提供者）。
+        const fanoutDue = (target.difficulty === 'hard' || target.difficulty === 'insane') || seed >= 2
+        let ideas: string[] = []
+        if (fanoutDue && jisi !== undefined && config.fanoutModels.length > 0) {
+          try {
+            const ideaWork = {
+              prompt: buildIdeaPrompt({
+                challenge: target,
+                addrs,
+                round: seed,
+                found,
+                hint,
+                previous: lastRoundDetail.get(target.unique_code),
+                maxIdeas: config.maxIdeasPerModel,
+              }),
+            }
+            const ideaReports = await jisi.fanout(agent, ideaWork, config.fanoutModels, {
+              reasoningEffort: dispatchPolicy.reasoningEffort ?? 'high',
+              background: false,
+            })
+            ideas = parseIdeas(ideaReports.map(r => r.text), config.maxIdeasPerChallenge)
+            audit({ type: 'fanout', code: target.unique_code, round: seed, models: config.fanoutModels, ideas: ideas.length })
+          } catch (error) {
+            audit({ type: 'fanout-error', code: target.unique_code, round: seed, detail: String(error).slice(0, 200) })
+            ideas = [] // 集思失败不致命：回落单执行者路径
+          }
+        }
+        if (ideas.length === 0) ideas = ['']
+        for (const [index, approach] of ideas.entries()) {
+          const label = buildSolverPrompt({
+            skill,
+            challenge: target,
+            addrs,
+            round: seed,
+            maxRounds: config.maxRounds,
+            found,
+            hint,
+            previous: lastRoundDetail.get(target.unique_code),
+            ...(approach !== '' ? { approach } : {}),
+          })
+          const itemId = ideas.length === 1 && approach === ''
+            ? `${target.unique_code}#s${seed}`
+            : `${target.unique_code}#s${seed}-i${index + 1}`
+          roundLabels.set(`${target.unique_code}#${seed}`, label)
+          campaign.add({
+            id: itemId,
+            label,
+            model: dispatchPolicy.model,
+            ...(dispatchPolicy.reasoningEffort !== undefined ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {}),
+            priority: { tier: tierOf(target.difficulty), score: target.total_score * (config.maxRounds - seed + 1) },
+          })
+          audit({ type: 'enqueue', code: target.unique_code, round: seed, model: dispatchPolicy.model, effort: dispatchPolicy.reasoningEffort, addrs, approach: approach === '' ? undefined : approach.slice(0, 80) })
+        }
         progress.update(target.unique_code, { difficulty: target.difficulty, rounds: seed })
         changed = true
       }
@@ -524,8 +587,17 @@ interface HufuLike {
   nextQueued(): unknown[]
   dispatchNext(): Promise<unknown>
   report(itemId: string, kind: 'done' | 'failed' | 'blocked', detail?: string): void
+  cancel(itemId: string, reason: string): void
   isComplete(): boolean
   ledger: {
     views(): Array<{ item: { id: string }; state: string; seed: number; terminalDetail?: string; dispatchedAt?: number; lastProgressAt?: number }>
   }
+}
+
+/** 集思服务面（思路 fanout；报告原样返回，不做综合）。 */
+interface JisiLike {
+  fanout(parent: unknown, work: { prompt: string }, models: readonly string[], opts?: {
+    reasoningEffort?: string
+    background?: boolean
+  }): Promise<Array<{ status: string; text: string }>>
 }

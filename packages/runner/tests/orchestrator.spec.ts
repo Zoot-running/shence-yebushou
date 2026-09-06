@@ -7,10 +7,12 @@ import type { ChallengeInfo } from '../../src/adapters/tsecbench.ts'
 import {
   RunBudget,
   RunProgress,
+  buildIdeaPrompt,
   buildSolverPrompt,
   cleanRoomGate,
   codeOf,
   extractFlags,
+  parseIdeas,
   policyFor,
   roundOf,
   selectTargets,
@@ -133,6 +135,54 @@ describe('codeOf / roundOf', () => {
   it('falls back safely for malformed ids', () => {
     expect(codeOf('odd-id')).toBe('odd-id')
     expect(roundOf('odd-id')).toBe(1)
+  })
+})
+
+describe('buildIdeaPrompt / parseIdeas', () => {
+  it('asks only for ideas with the IDEA n format convention', () => {
+    const prompt = buildIdeaPrompt({
+      challenge: CH('x', { description: 'break me' }),
+      addrs: ['10.0.0.1:80'],
+      round: 1,
+      found: [],
+      maxIdeas: 3,
+    })
+    expect(prompt).toContain('只出思路')
+    expect(prompt).toContain('IDEA n:')
+    expect(prompt).toContain('break me')
+    expect(prompt).toContain('最多 3 条')
+  })
+  it('parses multiple ideas from raw fanout reports, dedupes and caps', () => {
+    const ideas = parseIdeas([
+      'IDEA 1: 先扫端口 — 看 banner — 按 CVE 打\nIDEA 2: 试默认凭据\nIDEA 3: 看源码附件',
+      'IDEA 1: 先扫端口 — 看 banner — 按 CVE 打\nIDEA 2: 从加密附件入手',
+    ], 4)
+    expect(ideas).toHaveLength(4)
+    expect(ideas[0]).toContain('先扫端口')
+    expect(ideas[1]).toContain('默认凭据')
+    expect(ideas[2]).toContain('源码附件')
+    expect(ideas[3]).toContain('加密附件')
+    // cap 生效：只取前 3 条
+    const capped = parseIdeas([
+      'IDEA 1: a\nIDEA 2: b\nIDEA 3: c\nIDEA 4: d',
+    ], 3)
+    expect(capped).toHaveLength(3)
+  })
+  it('ignores empty/none ideas', () => {
+    expect(parseIdeas(['IDEA 0: none', 'IDEA 1:   '], 5)).toEqual([])
+  })
+  it('executor prompt carries the assigned approach section', () => {
+    const prompt = buildSolverPrompt({
+      skill: 'M',
+      challenge: CH('x'),
+      addrs: [],
+      round: 1,
+      maxRounds: 3,
+      found: [],
+      approach: '先试 SQL 注入',
+    })
+    expect(prompt).toContain('本条要执行的思路')
+    expect(prompt).toContain('先试 SQL 注入')
   })
 })
 
