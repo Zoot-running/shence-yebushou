@@ -351,6 +351,15 @@ export function apply(ctx: Context): void {
           const p = s.progress.get(args.code)
           s.progress.update(args.code, { flags: [...new Set([...(p?.flags ?? []), args.flag])] })
           persistProgress(s)
+          // 自动回记胜绩：终态输出里含该 flag 的执行者 → 集思能力账本记 execution win。
+          const difficulty = s.challenges.get(args.code)?.difficulty ?? 'unknown'
+          for (const v of c().ledger.views()) {
+            if (v.state !== 'done' || codeOf(v.item.id) !== args.code) continue
+            if (v.item.model === undefined) continue
+            if ((v.terminalDetail ?? '').includes(args.flag)) {
+              jisi?.ledger.record(v.item.model, 'execution', difficulty, true)
+            }
+          }
         }
         return JSON.stringify(res)
       } catch (error) {

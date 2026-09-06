@@ -552,6 +552,14 @@ boardPath=${c().boardPath(args.code)}`;
           const p = s.progress.get(args.code);
           s.progress.update(args.code, { flags: [.../* @__PURE__ */ new Set([...p?.flags ?? [], args.flag])] });
           persistProgress(s);
+          const difficulty = s.challenges.get(args.code)?.difficulty ?? "unknown";
+          for (const v of c().ledger.views()) {
+            if (v.state !== "done" || codeOf(v.item.id) !== args.code) continue;
+            if (v.item.model === void 0) continue;
+            if ((v.terminalDetail ?? "").includes(args.flag)) {
+              jisi?.ledger.record(v.item.model, "execution", difficulty, true);
+            }
+          }
         }
         return JSON.stringify(res);
       } catch (error) {
