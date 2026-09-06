@@ -8,11 +8,16 @@
 | 层 | 职责 | 出处 |
 |---|---|---|
 | 平台六原语 | 列题/启动/提交/关闭/hint/网关健康 | `src/adapters/tsecbench.ts`（夜不收 ctf 分支） |
-| 求解调度 | 工作项 + 账本 + 优先级 + 槽位 + 序列化恢复 | 虎符 `ctx.hufu` |
+| **思路征集（集思）** | hard/escalation 轮次 fanout 多模型各出 ≤N 条可执行思路；思路到手模型即释放 | `ctx.jisi.fanout` + `buildIdeaPrompt` |
+| **并行执行（虎符）** | 每条思路 = 一个工作项，槽位并行执行；执行者按策略指派（**思路提供者 ≠ 执行者**）；同题已破即剪枝其余思路 | 虎符 `campaign` + `cancel` |
 | 派单 | 按次模型 + 思考强度 | 集思 `ctx.jisi`（经虎符绑定） |
-| 编排核心 | 选题/flag 提取/clean-room/prompt/预算/进度账/模型策略 | `src/orchestrator.ts`（纯逻辑） |
+| 编排核心 | 选题/思路解析/flag 提取/clean-room/prompt/预算/进度账/模型策略 | `src/orchestrator.ts`（纯逻辑） |
 | 知识红线 | hint 经济学（10%/次，上限可配） | `src/hint-ledger.ts` |
 | 方法论 | 求解 prompt 内嵌黑盒通用知识 | `prompts/solver.md`（与 xiaochang 技能同源） |
+
+**解题流程**：easy/medium 首轮直接单执行者（验证足够）；hard/insane 或第 2 轮起 →
+集思 fanout 征集思路 → 思路拆成虎符工作项并行跑 → 任一思路拿到全部 flag 即完成并
+剪枝；全部思路失败 → 下一轮（思路征集会带上此前尝试记录）。
 
 ## 工具
 
