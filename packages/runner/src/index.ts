@@ -474,10 +474,15 @@ export function apply(ctx: Context): void {
       const now = Date.now()
       const rows: string[] = []
       // 轮次超时自动判负（机制；判不判题由你随后 xiaochang_report 决定）。
+      // 按难度差异化：easy 0.67× / medium 1.33× / hard 2×（老架构实证：难题要磨，
+      // 一刀切 30 分钟会切碎攻坚连续性）。
       for (const v of c().ledger.views()) {
         if (v.state !== 'dispatched' && v.state !== 'help') continue
+        const difficulty = s.challenges.get(codeOf(v.item.id))?.difficulty ?? 'medium'
+        const factor = difficulty === 'easy' ? 0.67 : difficulty === 'hard' ? 2 : 1.33
+        const timeout = Math.round(s.roundTimeoutMs * factor)
         const last = v.lastProgressAt ?? v.dispatchedAt
-        if (last === undefined || now - last < s.roundTimeoutMs) continue
+        if (last === undefined || now - last < timeout) continue
         c().report(v.item.id, 'failed', 'round timeout')
         s.processed.add(baseId(v.item.id))
       }

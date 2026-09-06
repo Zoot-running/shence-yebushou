@@ -672,8 +672,11 @@ boardPath=${c().boardPath(args.code)}`;
       const rows = [];
       for (const v of c().ledger.views()) {
         if (v.state !== "dispatched" && v.state !== "help") continue;
+        const difficulty = s.challenges.get(codeOf(v.item.id))?.difficulty ?? "medium";
+        const factor = difficulty === "easy" ? 0.67 : difficulty === "hard" ? 2 : 1.33;
+        const timeout = Math.round(s.roundTimeoutMs * factor);
         const last = v.lastProgressAt ?? v.dispatchedAt;
-        if (last === void 0 || now - last < s.roundTimeoutMs) continue;
+        if (last === void 0 || now - last < timeout) continue;
         c().report(v.item.id, "failed", "round timeout");
         s.processed.add(baseId(v.item.id));
       }
