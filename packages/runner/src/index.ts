@@ -465,7 +465,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
   // 全题终态或预算耗尽 → 立即 finish 停表（排名按 score_elapsed_seconds，先跑完先靠前）。
   const allTerminal = final.every(c => c.is_completed || (progress.get(c.unique_code)?.state === 'failed' || progress.get(c.unique_code)?.state === 'skipped'))
   if (allTerminal || budget.exhausted()) {
-    await finishRun(config.baseURL, args.runBearerToken, args.runId)
+    await finishRun(baseURL, args.runBearerToken, args.runId)
   }
 
   const result = [

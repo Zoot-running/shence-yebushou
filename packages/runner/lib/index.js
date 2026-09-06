@@ -661,7 +661,7 @@ async function run(ctx, args, agent) {
   const hintTotal = hintLedger.totalDeducted();
   const allTerminal = final.every((c) => c.is_completed || (progress.get(c.unique_code)?.state === "failed" || progress.get(c.unique_code)?.state === "skipped"));
   if (allTerminal || budget.exhausted()) {
-    await finishRun(config.baseURL, args.runBearerToken, args.runId);
+    await finishRun(baseURL, args.runBearerToken, args.runId);
   }
   const result = [
     `xiaochang run finished`,
