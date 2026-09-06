@@ -373,9 +373,71 @@ function parseObservations(text, cap = 5) {
   }
   return out;
 }
-function rotateModel(models, index) {
-  return models[index % models.length] ?? models[0] ?? "deepseek-v4-pro";
-}
+var ExecutorScoreboard = class _ExecutorScoreboard {
+  models = /* @__PURE__ */ new Map();
+  static fromJSON(data) {
+    const board = new _ExecutorScoreboard();
+    const models = data?.models ?? {};
+    for (const [model, record] of Object.entries(models)) {
+      if (record === void 0 || typeof record.attempts !== "number") continue;
+      board.models.set(model, {
+        attempts: record.attempts,
+        solves: record.solves,
+        byDifficulty: { ...record.byDifficulty ?? {} }
+      });
+    }
+    return board;
+  }
+  toJSON() {
+    const models = {};
+    for (const [model, record] of this.models) models[model] = record;
+    return { models };
+  }
+  recordOf(model) {
+    const existing = this.models.get(model);
+    if (existing !== void 0) return existing;
+    const created = { attempts: 0, solves: 0, byDifficulty: {} };
+    this.models.set(model, created);
+    return created;
+  }
+  /** 记一局：某执行者打某难度的题，是否拿到 flag。 */
+  record(model, difficulty, solved) {
+    const record = this.recordOf(model);
+    record.attempts += 1;
+    if (solved) record.solves += 1;
+    const by = record.byDifficulty[difficulty] ?? (record.byDifficulty[difficulty] = { attempts: 0, solves: 0 });
+    by.attempts += 1;
+    if (solved) by.solves += 1;
+  }
+  /** 平滑胜率（Laplace：难度细分优先；无细分样本回落全局；无记录 = 先验 0.5）。 */
+  rate(model, difficulty) {
+    const record = this.models.get(model);
+    if (record === void 0) return 0.5;
+    const by = record.byDifficulty[difficulty];
+    if (by !== void 0 && by.attempts > 0) {
+      return (by.solves + 1) / (by.attempts + 2);
+    }
+    return (record.solves + 1) / (record.attempts + 2);
+  }
+  /**
+   * 选执行者：候选池内平滑胜率最高者；同分（差距 < 1%）按 priceOrder 靠前者。
+   */
+  pickFor(difficulty, candidates, priceOrder = []) {
+    let best;
+    let bestRate = -1;
+    let bestPrice = Number.POSITIVE_INFINITY;
+    for (const model of candidates) {
+      const rate = this.rate(model, difficulty);
+      const price = priceOrder.includes(model) ? priceOrder.indexOf(model) : priceOrder.length;
+      if (best === void 0 || rate > bestRate + 0.01 || Math.abs(rate - bestRate) <= 0.01 && price < bestPrice) {
+        best = model;
+        bestRate = rate;
+        bestPrice = price;
+      }
+    }
+    return best ?? candidates[0] ?? "deepseek-v4-pro";
+  }
+};
 var RunBudget = class {
   constructor(limitMs, now = Date.now, startedAt) {
     this.limitMs = limitMs;
@@ -512,7 +574,8 @@ function apply(ctx) {
       fanoutModels: { type: "array", description: "Idea-gathering models (jisi fanout) for hard/escalation rounds. Default [deepseek-v4-pro, kimi-k3, glm-5.3]." },
       maxIdeasPerChallenge: { type: "number", description: "Max approaches executed in parallel per challenge round. Default 9." },
       maxIdeasPerModel: { type: "number", description: "Max approaches each idea model may propose. Default 5." },
-      executorModels: { type: "array", description: "Executor model rotation for idea items. Default [kimi-k3, deepseek-v4-flash, deepseek-v4-pro, glm-5.3]." },
+      executorModels: { type: "array", description: "Executor candidate pool \u2014 the scoreboard assigns the most suitable per task (learned success rates, price tiebreak). Default [kimi-k3, deepseek-v4-flash, deepseek-v4-pro, glm-5.3]." },
+      priceOrder: { type: "array", description: "Model price order cheap\u2192expensive for tiebreaks. Default [deepseek-v4-flash, glm-5.3-flash, kimi-k3, glm-5.3, deepseek-v4-pro]." },
       profilePath: { type: "string", description: "Org-profile file for cross-challenge observations (local only). Default $DSH_HOME/storages/xiaochang-profile.md." },
       budgetMinutes: { type: "number", description: "Total wall-clock budget. Default 320." },
       roundsPerChallenge: { type: "number", description: "Max solver rounds per challenge. Default 3." },
@@ -566,6 +629,8 @@ async function run(ctx, args, agent) {
     maxIdeasPerChallenge: args.maxIdeasPerChallenge ?? 9,
     maxIdeasPerModel: args.maxIdeasPerModel ?? 5,
     executorModels: args.executorModels ?? ["kimi-k3", "deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3"],
+    priceOrder: args.priceOrder ?? ["deepseek-v4-flash", "glm-5.3-flash", "kimi-k3", "glm-5.3", "deepseek-v4-pro"],
+    scoreboardPath: join(env.DSH_HOME ?? ".", "storages", "xiaochang-scoreboard.json"),
     profilePath: args.profilePath ?? join(env.DSH_HOME ?? ".", "storages", "xiaochang-profile.md"),
     workRoot: process.cwd()
   };
@@ -587,6 +652,20 @@ async function run(ctx, args, agent) {
     try {
       mkdirSync(join(config.profilePath, ".."), { recursive: true });
       writeFileSync(config.profilePath, render(profile));
+    } catch {
+    }
+  };
+  let scoreboard = new ExecutorScoreboard();
+  try {
+    if (existsSync(config.scoreboardPath)) {
+      scoreboard = ExecutorScoreboard.fromJSON(JSON.parse(readFileSync(config.scoreboardPath, "utf8")));
+    }
+  } catch {
+  }
+  const persistScoreboard = () => {
+    try {
+      mkdirSync(join(config.scoreboardPath, ".."), { recursive: true });
+      writeFileSync(config.scoreboardPath, JSON.stringify(scoreboard.toJSON()));
     } catch {
     }
   };
@@ -734,6 +813,12 @@ async function run(ctx, args, agent) {
             } catch {
             }
           }
+          const itemModel = view.item.model;
+          if (itemModel !== void 0) {
+            scoreboard.record(itemModel, challenges.get(code)?.difficulty ?? "unknown", accepted.length > 0);
+            persistScoreboard();
+            audit({ type: "scoreboard", model: itemModel, code, round, solved: accepted.length > 0 });
+          }
           for (const note of parseObservations(view.terminalDetail ?? "")) {
             addFact(profile, { kind: "other", note });
           }
@@ -777,15 +862,24 @@ async function run(ctx, args, agent) {
             campaign.add({
               id: `${base}-r${retries + 1}`,
               label: cached ?? `retry ${code} round ${round}`,
-              model: rotateModel(config.executorModels, retries + 1),
+              model: scoreboard.pickFor(challenge?.difficulty ?? "hard", config.executorModels, config.priceOrder),
               reasoningEffort: config.policy.effortHard ?? config.policy.effortRetry ?? "max",
               priority: { tier: tierOf(challenge?.difficulty ?? "hard"), score: 9999 }
             });
             summaryLines.push(`${code}: round ${round} transient failure (retry ${retries + 1}/5)`);
           } else {
+            const detail2 = view.terminalDetail ?? "";
+            if (detail2.includes("round timeout")) {
+              const itemModel = view.item.model;
+              if (itemModel !== void 0) {
+                scoreboard.record(itemModel, challenges.get(code)?.difficulty ?? "unknown", false);
+                persistScoreboard();
+                audit({ type: "scoreboard", model: itemModel, code, round, solved: false, reason: "timeout" });
+              }
+            }
             progress.update(code, { rounds: round });
             if (round >= config.maxRounds) {
-              progress.update(code, { state: "failed", reason: `solver ${view.state} at round ${round}: ${detail.slice(0, 120)}` });
+              progress.update(code, { state: "failed", reason: `solver ${view.state} at round ${round}: ${detail2.slice(0, 120)}` });
               summaryLines.push(`${code}: failed (solver ${view.state} at round ${round})`);
             } else {
               summaryLines.push(`${code}: round ${round} ${view.state}, advancing`);
@@ -892,7 +986,7 @@ async function run(ctx, args, agent) {
             ...approach !== "" ? { approach } : {}
           });
           const itemId = ideas.length === 1 && approach === "" ? `${target.unique_code}#s${seed}` : `${target.unique_code}#s${seed}-i${index + 1}`;
-          const executorModel = rotateModel(config.executorModels, index);
+          const executorModel = scoreboard.pickFor(target.difficulty, config.executorModels, config.priceOrder);
           const executorEffort = config.policy.effortHard ?? config.policy.effortRetry ?? "max";
           roundLabels.set(itemId, label);
           campaign.add({

@@ -5,6 +5,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { ChallengeInfo } from '../../src/adapters/tsecbench.ts'
 import {
+  ExecutorScoreboard,
   RunBudget,
   RunProgress,
   baseId,
@@ -16,7 +17,6 @@ import {
   parseIdeas,
   parseObservations,
   policyFor,
-  rotateModel,
   roundOf,
   selectTargets,
 } from '../src/orchestrator.ts'
@@ -144,11 +144,38 @@ describe('codeOf / roundOf', () => {
     expect(baseId('g-18#s1-i2-r3')).toBe('g-18#s1-i2')
     expect(baseId('g-18#s1')).toBe('g-18#s1')
   })
-  it('rotateModel cycles through the executor rotation', () => {
-    const models = ['kimi-k3', 'deepseek-v4-flash', 'deepseek-v4-pro']
-    expect(rotateModel(models, 0)).toBe('kimi-k3')
-    expect(rotateModel(models, 3)).toBe('kimi-k3')
-    expect(rotateModel(models, 5)).toBe('deepseek-v4-pro')
+})
+
+describe('ExecutorScoreboard', () => {
+  const candidates = ['kimi-k3', 'deepseek-v4-flash', 'deepseek-v4-pro']
+  const priceOrder = ['deepseek-v4-flash', 'kimi-k3', 'deepseek-v4-pro']
+
+  it('cold start: all candidates equal → cheapest wins', () => {
+    const board = new ExecutorScoreboard()
+    expect(board.pickFor('hard', candidates, priceOrder)).toBe('deepseek-v4-flash')
+  })
+  it('learns: the model with the best hard-difficulty record gets picked', () => {
+    const board = new ExecutorScoreboard()
+    board.record('kimi-k3', 'hard', false)
+    board.record('kimi-k3', 'hard', false)
+    board.record('deepseek-v4-pro', 'hard', true)
+    board.record('deepseek-v4-pro', 'hard', true)
+    board.record('deepseek-v4-pro', 'hard', true)
+    expect(board.pickFor('hard', candidates, priceOrder)).toBe('deepseek-v4-pro')
+  })
+  it('per-difficulty isolation: hard champion does not capture easy picks', () => {
+    const board = new ExecutorScoreboard()
+    board.record('deepseek-v4-pro', 'hard', true)
+    board.record('deepseek-v4-pro', 'hard', true)
+    board.record('kimi-k3', 'easy', true)
+    board.record('kimi-k3', 'easy', true)
+    expect(board.pickFor('easy', candidates, priceOrder)).toBe('kimi-k3')
+  })
+  it('JSON roundtrip preserves records', () => {
+    const board = new ExecutorScoreboard()
+    board.record('kimi-k3', 'hard', true)
+    const restored = ExecutorScoreboard.fromJSON(JSON.parse(JSON.stringify(board.toJSON())))
+    expect(restored.pickFor('hard', candidates, priceOrder)).toBe('kimi-k3')
   })
 })
 

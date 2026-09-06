@@ -15,6 +15,7 @@ import { HintLedger } from '../../../src/hint-ledger.ts'
 import { addFact, createProfile, parse as parseProfile, render as renderProfile } from '../../../src/profile.ts'
 import { TsecbenchAdapter, type ChallengeInfo, type FetchLike } from '../../../src/adapters/tsecbench.ts'
 import {
+  ExecutorScoreboard,
   RunBudget,
   RunProgress,
   baseId,
@@ -26,7 +27,6 @@ import {
   parseIdeas,
   parseObservations,
   policyFor,
-  rotateModel,
   roundOf,
   selectTargets,
 } from './orchestrator.ts'
@@ -50,8 +50,10 @@ interface StartArgs {
   maxIdeasPerChallenge?: number
   /** 每个模型最多出几条思路。 */
   maxIdeasPerModel?: number
-  /** 执行者模型轮换表（思路执行者按序轮换，摊薄供应商限流）。 */
+  /** 执行者候选池（战绩账本从中选最合适者；同分按价格序）。 */
   executorModels?: string[]
+  /** 模型价格序（便宜→贵，同分经济性 tiebreak）。 */
+  priceOrder?: string[]
   /** 题集画像文件路径（跨题可泛化观察自积累；缺省 $DSH_HOME/storages/xiaochang-profile.md）。 */
   profilePath?: string
   budgetMinutes?: number
@@ -110,7 +112,8 @@ export function apply(ctx: Context): void {
       fanoutModels: { type: 'array', description: 'Idea-gathering models (jisi fanout) for hard/escalation rounds. Default [deepseek-v4-pro, kimi-k3, glm-5.3].' },
       maxIdeasPerChallenge: { type: 'number', description: 'Max approaches executed in parallel per challenge round. Default 9.' },
       maxIdeasPerModel: { type: 'number', description: 'Max approaches each idea model may propose. Default 5.' },
-      executorModels: { type: 'array', description: 'Executor model rotation for idea items. Default [kimi-k3, deepseek-v4-flash, deepseek-v4-pro, glm-5.3].' },
+      executorModels: { type: 'array', description: 'Executor candidate pool — the scoreboard assigns the most suitable per task (learned success rates, price tiebreak). Default [kimi-k3, deepseek-v4-flash, deepseek-v4-pro, glm-5.3].' },
+      priceOrder: { type: 'array', description: 'Model price order cheap→expensive for tiebreaks. Default [deepseek-v4-flash, glm-5.3-flash, kimi-k3, glm-5.3, deepseek-v4-pro].' },
       profilePath: { type: 'string', description: 'Org-profile file for cross-challenge observations (local only). Default $DSH_HOME/storages/xiaochang-profile.md.' },
       budgetMinutes: { type: 'number', description: 'Total wall-clock budget. Default 320.' },
       roundsPerChallenge: { type: 'number', description: 'Max solver rounds per challenge. Default 3.' },
@@ -165,6 +168,8 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
     maxIdeasPerChallenge: args.maxIdeasPerChallenge ?? 9,
     maxIdeasPerModel: args.maxIdeasPerModel ?? 5,
     executorModels: args.executorModels ?? ['kimi-k3', 'deepseek-v4-flash', 'deepseek-v4-pro', 'glm-5.3'],
+    priceOrder: args.priceOrder ?? ['deepseek-v4-flash', 'glm-5.3-flash', 'kimi-k3', 'glm-5.3', 'deepseek-v4-pro'],
+    scoreboardPath: join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-scoreboard.json'),
     profilePath: args.profilePath ?? join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-profile.md'),
     workRoot: process.cwd(),
   }
@@ -190,6 +195,19 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
       mkdirSync(join(config.profilePath, '..'), { recursive: true })
       writeFileSync(config.profilePath, renderProfile(profile))
     } catch { /* 画像落盘失败不致命 */ }
+  }
+  // 执行者战绩账本：跨题/跨 run 经验积累（本地私知），派单选最合适者。
+  let scoreboard = new ExecutorScoreboard()
+  try {
+    if (existsSync(config.scoreboardPath)) {
+      scoreboard = ExecutorScoreboard.fromJSON(JSON.parse(readFileSync(config.scoreboardPath, 'utf8')))
+    }
+  } catch { /* 账本损坏：空账本起跑 */ }
+  const persistScoreboard = (): void => {
+    try {
+      mkdirSync(join(config.scoreboardPath, '..'), { recursive: true })
+      writeFileSync(config.scoreboardPath, JSON.stringify(scoreboard.toJSON()))
+    } catch { /* 落盘失败不致命 */ }
   }
   // 同题共享战报：并行思路相互联系的唯一信道（工作根/每题/FINDINGS.md）。
   const boardPathFor = (code: string): string => join(config.workRoot, code, 'FINDINGS.md')
@@ -350,6 +368,13 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
               if (res.correct && !accepted.includes(flag)) accepted.push(flag)
             } catch { /* duplicate/校验错误忽略 */ }
           }
+          // 战绩记账：真实求解结局（拿到 flag 与否）才计入执行者能力。
+          const itemModel = view.item.model
+          if (itemModel !== undefined) {
+            scoreboard.record(itemModel, challenges.get(code)?.difficulty ?? 'unknown', accepted.length > 0)
+            persistScoreboard()
+            audit({ type: 'scoreboard', model: itemModel, code, round, solved: accepted.length > 0 })
+          }
           // 画像积累：把求解者自报的可泛化观察并入题集画像（去重、本地落盘）。
           for (const note of parseObservations(view.terminalDetail ?? '')) {
             addFact(profile, { kind: 'other', note })
@@ -393,12 +418,22 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
             campaign.add({
               id: `${base}-r${retries + 1}`,
               label: cached ?? `retry ${code} round ${round}`,
-              model: rotateModel(config.executorModels, retries + 1),
+              model: scoreboard.pickFor(challenge?.difficulty ?? 'hard', config.executorModels, config.priceOrder),
               reasoningEffort: config.policy.effortHard ?? config.policy.effortRetry ?? 'max',
               priority: { tier: tierOf(challenge?.difficulty ?? 'hard'), score: 9999 },
             })
             summaryLines.push(`${code}: round ${round} transient failure (retry ${retries + 1}/5)`)
           } else {
+            // 轮次超时 = 真实能力结局（打了但没破）；瞬时/限流失败不计入战绩。
+            const detail = view.terminalDetail ?? ''
+            if (detail.includes('round timeout')) {
+              const itemModel = view.item.model
+              if (itemModel !== undefined) {
+                scoreboard.record(itemModel, challenges.get(code)?.difficulty ?? 'unknown', false)
+                persistScoreboard()
+                audit({ type: 'scoreboard', model: itemModel, code, round, solved: false, reason: 'timeout' })
+              }
+            }
             progress.update(code, { rounds: round })
             if (round >= config.maxRounds) {
               progress.update(code, { state: 'failed', reason: `solver ${view.state} at round ${round}: ${detail.slice(0, 120)}` })
@@ -518,9 +553,8 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
           const itemId = ideas.length === 1 && approach === ''
             ? `${target.unique_code}#s${seed}`
             : `${target.unique_code}#s${seed}-i${index + 1}`
-          // 执行者 ≠ 思路提供者；大兵团模式下执行者按轮换表指派（effort 交给
-          // 集思守卫：模型未宣告的 effort 自动丢弃）。
-          const executorModel = rotateModel(config.executorModels, index)
+          // 执行者 ≠ 思路提供者；派单由战绩账本选最合适者（胜率优先，同分按价格序）。
+          const executorModel = scoreboard.pickFor(target.difficulty, config.executorModels, config.priceOrder)
           const executorEffort = config.policy.effortHard ?? config.policy.effortRetry ?? 'max'
           roundLabels.set(itemId, label)
           campaign.add({

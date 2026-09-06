@@ -254,11 +254,91 @@ export function parseObservations(text: string, cap = 5): string[] {
 }
 
 /**
- * 执行者模型轮换：大兵团模式下多条思路并行，执行者按序轮换
- * （思路提供者 ≠ 执行者；轮换摊薄单一供应商的并发限流）。
+ * 执行者战绩账本（经济学 + 经验积累）：按 (模型, 难度) 累计胜负，
+ * 派单时选"最合适"的执行者——平滑后的胜率最高者优先，同分按价格序。
+ * 冷启动靠先验（平滑项）；跨题积累；随 run 序列化落盘（本地私知）。
  */
-export function rotateModel(models: readonly string[], index: number): string {
-  return models[index % models.length] ?? models[0] ?? 'deepseek-v4-pro'
+export interface ExecutorRecord {
+  attempts: number
+  solves: number
+  /** 按难度的细分战绩。 */
+  byDifficulty: Record<string, { attempts: number; solves: number }>
+}
+
+export interface ExecutorScoreboardData {
+  models: Record<string, ExecutorRecord>
+}
+
+export class ExecutorScoreboard {
+  private readonly models = new Map<string, ExecutorRecord>()
+
+  static fromJSON(data: unknown): ExecutorScoreboard {
+    const board = new ExecutorScoreboard()
+    const models = (data as { models?: Record<string, ExecutorRecord> } | undefined)?.models ?? {}
+    for (const [model, record] of Object.entries(models)) {
+      if (record === undefined || typeof record.attempts !== 'number') continue
+      board.models.set(model, {
+        attempts: record.attempts,
+        solves: record.solves,
+        byDifficulty: { ...(record.byDifficulty ?? {}) },
+      })
+    }
+    return board
+  }
+
+  toJSON(): ExecutorScoreboardData {
+    const models: Record<string, ExecutorRecord> = {}
+    for (const [model, record] of this.models) models[model] = record
+    return { models }
+  }
+
+  private recordOf(model: string): ExecutorRecord {
+    const existing = this.models.get(model)
+    if (existing !== undefined) return existing
+    const created: ExecutorRecord = { attempts: 0, solves: 0, byDifficulty: {} }
+    this.models.set(model, created)
+    return created
+  }
+
+  /** 记一局：某执行者打某难度的题，是否拿到 flag。 */
+  record(model: string, difficulty: string, solved: boolean): void {
+    const record = this.recordOf(model)
+    record.attempts += 1
+    if (solved) record.solves += 1
+    const by = record.byDifficulty[difficulty] ?? (record.byDifficulty[difficulty] = { attempts: 0, solves: 0 })
+    by.attempts += 1
+    if (solved) by.solves += 1
+  }
+
+  /** 平滑胜率（Laplace：难度细分优先；无细分样本回落全局；无记录 = 先验 0.5）。 */
+  private rate(model: string, difficulty: string): number {
+    const record = this.models.get(model)
+    if (record === undefined) return 0.5
+    const by = record.byDifficulty[difficulty]
+    if (by !== undefined && by.attempts > 0) {
+      return (by.solves + 1) / (by.attempts + 2)
+    }
+    return (record.solves + 1) / (record.attempts + 2)
+  }
+
+  /**
+   * 选执行者：候选池内平滑胜率最高者；同分（差距 < 1%）按 priceOrder 靠前者。
+   */
+  pickFor(difficulty: string, candidates: readonly string[], priceOrder: readonly string[] = []): string {
+    let best: string | undefined
+    let bestRate = -1
+    let bestPrice = Number.POSITIVE_INFINITY
+    for (const model of candidates) {
+      const rate = this.rate(model, difficulty)
+      const price = priceOrder.includes(model) ? priceOrder.indexOf(model) : priceOrder.length
+      if (best === undefined || rate > bestRate + 0.01 || (Math.abs(rate - bestRate) <= 0.01 && price < bestPrice)) {
+        best = model
+        bestRate = rate
+        bestPrice = price
+      }
+    }
+    return best ?? candidates[0] ?? 'deepseek-v4-pro'
+  }
 }
 
 /** 战役预算（墙钟）。 */
