@@ -373,6 +373,9 @@ function parseObservations(text, cap = 5) {
   }
   return out;
 }
+function rotateModel(models, index) {
+  return models[index % models.length] ?? models[0] ?? "deepseek-v4-pro";
+}
 var RunBudget = class {
   constructor(limitMs, now = Date.now, startedAt) {
     this.limitMs = limitMs;
@@ -406,6 +409,9 @@ function roundOf(itemId) {
   const match = /#s?(\d+)/.exec(itemId);
   const parsed = match !== null ? Number(match[1]) : 1;
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+function baseId(itemId) {
+  return itemId.replace(/-r\d+$/, "");
 }
 var RunProgress = class _RunProgress {
   records = /* @__PURE__ */ new Map();
@@ -495,7 +501,7 @@ function apply(ctx) {
     name: "xiaochang_start",
     description: "Start (or resume) an autonomous benchmark run on tsecbench: clean-room gated solver rounds driven by the hufu campaign over the jisi channel, with container lifecycle management, flag submission, hint economics, and JSONL crash-recovery snapshots. Returns the final summary. Runs for up to budgetMinutes.",
     parameters: {
-      concurrency: { type: "number", description: "Solver concurrency (container slots, max 3). Default 3." },
+      concurrency: { type: "number", description: "Solver concurrency \u2014 total parallel executor slots (campaign-wide). Platform caps CONTAINERS at 3, not solvers: many ideas may hammer the same container. Default 9." },
       model: { type: "string", description: "Solver model for easy challenges. Default kimi-k3." },
       modelMedium: { type: "string", description: "Solver model for medium challenges. Default deepseek-v4-flash." },
       modelHard: { type: "string", description: "Solver model for hard/insane challenges. Default deepseek-v4-pro." },
@@ -504,8 +510,9 @@ function apply(ctx) {
       effortHard: { type: "string", description: "Reasoning effort for hard/insane. Default max." },
       effortRetry: { type: "string", description: "Reasoning effort from round 2 on (escalation). Default max." },
       fanoutModels: { type: "array", description: "Idea-gathering models (jisi fanout) for hard/escalation rounds. Default [deepseek-v4-pro, kimi-k3, glm-5.3]." },
-      maxIdeasPerChallenge: { type: "number", description: "Max approaches executed in parallel per challenge round. Default 6." },
-      maxIdeasPerModel: { type: "number", description: "Max approaches each idea model may propose. Default 3." },
+      maxIdeasPerChallenge: { type: "number", description: "Max approaches executed in parallel per challenge round. Default 9." },
+      maxIdeasPerModel: { type: "number", description: "Max approaches each idea model may propose. Default 5." },
+      executorModels: { type: "array", description: "Executor model rotation for idea items. Default [kimi-k3, deepseek-v4-flash, deepseek-v4-pro, glm-5.3]." },
       profilePath: { type: "string", description: "Org-profile file for cross-challenge observations (local only). Default $DSH_HOME/storages/xiaochang-profile.md." },
       budgetMinutes: { type: "number", description: "Total wall-clock budget. Default 320." },
       roundsPerChallenge: { type: "number", description: "Max solver rounds per challenge. Default 3." },
@@ -539,7 +546,7 @@ async function run(ctx, args, agent) {
   }
   const jisi = ctx.get?.("jisi");
   const config = {
-    concurrency: Math.min(3, args.concurrency ?? 3),
+    concurrency: args.concurrency ?? 9,
     budgetMs: (args.budgetMinutes ?? 320) * 6e4,
     maxRounds: args.roundsPerChallenge ?? 3,
     roundTimeoutMs: (args.roundTimeoutMinutes ?? 20) * 6e4,
@@ -556,8 +563,9 @@ async function run(ctx, args, agent) {
       effortRetry: args.effortRetry ?? "max"
     },
     fanoutModels: args.fanoutModels ?? ["deepseek-v4-pro", "kimi-k3", "glm-5.3"],
-    maxIdeasPerChallenge: args.maxIdeasPerChallenge ?? 6,
-    maxIdeasPerModel: args.maxIdeasPerModel ?? 3,
+    maxIdeasPerChallenge: args.maxIdeasPerChallenge ?? 9,
+    maxIdeasPerModel: args.maxIdeasPerModel ?? 5,
+    executorModels: args.executorModels ?? ["kimi-k3", "deepseek-v4-flash", "deepseek-v4-pro", "glm-5.3"],
     profilePath: args.profilePath ?? join(env.DSH_HOME ?? ".", "storages", "xiaochang-profile.md"),
     workRoot: process.cwd()
   };
@@ -759,19 +767,18 @@ async function run(ctx, args, agent) {
         } else {
           const detail = view.terminalDetail ?? "";
           const transient = /429|rate.?limit|overload|too many|限流|频率|busy/i.test(detail) || detail.trim() === "";
-          const retryKey = `${code}#${round}`;
-          const retries = rateRetries.get(retryKey) ?? 0;
+          const base = baseId(view.item.id);
+          const retries = rateRetries.get(base) ?? 0;
           if (transient && retries < 5) {
-            rateRetries.set(retryKey, retries + 1);
-            audit({ type: "rate-retry", code, round, retries: retries + 1 });
-            const cached = roundLabels.get(retryKey);
+            rateRetries.set(base, retries + 1);
+            audit({ type: "rate-retry", id: view.item.id, round, retries: retries + 1 });
+            const cached = roundLabels.get(base);
             const challenge = challenges.get(code);
-            const dispatchPolicy = policyFor(config.policy, challenge?.difficulty ?? "hard", round);
             campaign.add({
-              id: `${retryKey}-r${retries + 1}`,
+              id: `${base}-r${retries + 1}`,
               label: cached ?? `retry ${code} round ${round}`,
-              model: dispatchPolicy.model,
-              ...dispatchPolicy.reasoningEffort !== void 0 ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {},
+              model: rotateModel(config.executorModels, retries + 1),
+              reasoningEffort: config.policy.effortHard ?? config.policy.effortRetry ?? "max",
               priority: { tier: tierOf(challenge?.difficulty ?? "hard"), score: 9999 }
             });
             summaryLines.push(`${code}: round ${round} transient failure (retry ${retries + 1}/5)`);
@@ -885,15 +892,17 @@ async function run(ctx, args, agent) {
             ...approach !== "" ? { approach } : {}
           });
           const itemId = ideas.length === 1 && approach === "" ? `${target.unique_code}#s${seed}` : `${target.unique_code}#s${seed}-i${index + 1}`;
-          roundLabels.set(`${target.unique_code}#${seed}`, label);
+          const executorModel = rotateModel(config.executorModels, index);
+          const executorEffort = config.policy.effortHard ?? config.policy.effortRetry ?? "max";
+          roundLabels.set(itemId, label);
           campaign.add({
             id: itemId,
             label,
-            model: dispatchPolicy.model,
-            ...dispatchPolicy.reasoningEffort !== void 0 ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {},
+            model: executorModel,
+            reasoningEffort: executorEffort,
             priority: { tier: tierOf(target.difficulty), score: target.total_score * (config.maxRounds - seed + 1) }
           });
-          audit({ type: "enqueue", code: target.unique_code, round: seed, model: dispatchPolicy.model, effort: dispatchPolicy.reasoningEffort, addrs, approach: approach === "" ? void 0 : approach.slice(0, 80) });
+          audit({ type: "enqueue", code: target.unique_code, round: seed, model: executorModel, effort: executorEffort, addrs, approach: approach === "" ? void 0 : approach.slice(0, 80) });
         }
         progress.update(target.unique_code, { difficulty: target.difficulty, rounds: seed });
         changed = true;

@@ -253,6 +253,14 @@ export function parseObservations(text: string, cap = 5): string[] {
   return out
 }
 
+/**
+ * 执行者模型轮换：大兵团模式下多条思路并行，执行者按序轮换
+ * （思路提供者 ≠ 执行者；轮换摊薄单一供应商的并发限流）。
+ */
+export function rotateModel(models: readonly string[], index: number): string {
+  return models[index % models.length] ?? models[0] ?? 'deepseek-v4-pro'
+}
+
 /** 战役预算（墙钟）。 */
 export class RunBudget {
   private readonly startedAt: number
@@ -322,6 +330,11 @@ export function roundOf(itemId: string): number {
   const match = /#s?(\d+)/.exec(itemId)
   const parsed = match !== null ? Number(match[1]) : 1
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 1
+}
+
+/** 基础项 id：去掉限流重试后缀（`-r<n>`），同项重试共用同一基础键。 */
+export function baseId(itemId: string): string {
+  return itemId.replace(/-r\d+$/, '')
 }
 
 export type ChallengeState = 'solving' | 'complete' | 'failed' | 'skipped'

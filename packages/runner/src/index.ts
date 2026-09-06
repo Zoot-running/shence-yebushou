@@ -17,6 +17,7 @@ import { TsecbenchAdapter, type ChallengeInfo, type FetchLike } from '../../../s
 import {
   RunBudget,
   RunProgress,
+  baseId,
   buildIdeaPrompt,
   buildSolverPrompt,
   cleanRoomGate,
@@ -25,6 +26,7 @@ import {
   parseIdeas,
   parseObservations,
   policyFor,
+  rotateModel,
   roundOf,
   selectTargets,
 } from './orchestrator.ts'
@@ -44,10 +46,12 @@ interface StartArgs {
   effortRetry?: string
   /** 集思思路征集模型（hard/escalation 轮次 fanout）。 */
   fanoutModels?: string[]
-  /** 每题每轮最多执行多少条思路（虎符并行上限）。 */
+  /** 每题每轮最多执行多少条思路（虎符并行上限；平台容器上限另算，只约束题数）。 */
   maxIdeasPerChallenge?: number
   /** 每个模型最多出几条思路。 */
   maxIdeasPerModel?: number
+  /** 执行者模型轮换表（思路执行者按序轮换，摊薄供应商限流）。 */
+  executorModels?: string[]
   /** 题集画像文件路径（跨题可泛化观察自积累；缺省 $DSH_HOME/storages/xiaochang-profile.md）。 */
   profilePath?: string
   budgetMinutes?: number
@@ -95,7 +99,7 @@ export function apply(ctx: Context): void {
     description:
       'Start (or resume) an autonomous benchmark run on tsecbench: clean-room gated solver rounds driven by the hufu campaign over the jisi channel, with container lifecycle management, flag submission, hint economics, and JSONL crash-recovery snapshots. Returns the final summary. Runs for up to budgetMinutes.',
     parameters: {
-      concurrency: { type: 'number', description: 'Solver concurrency (container slots, max 3). Default 3.' },
+      concurrency: { type: 'number', description: 'Solver concurrency — total parallel executor slots (campaign-wide). Platform caps CONTAINERS at 3, not solvers: many ideas may hammer the same container. Default 9.' },
       model: { type: 'string', description: 'Solver model for easy challenges. Default kimi-k3.' },
       modelMedium: { type: 'string', description: 'Solver model for medium challenges. Default deepseek-v4-flash.' },
       modelHard: { type: 'string', description: 'Solver model for hard/insane challenges. Default deepseek-v4-pro.' },
@@ -104,8 +108,9 @@ export function apply(ctx: Context): void {
       effortHard: { type: 'string', description: 'Reasoning effort for hard/insane. Default max.' },
       effortRetry: { type: 'string', description: 'Reasoning effort from round 2 on (escalation). Default max.' },
       fanoutModels: { type: 'array', description: 'Idea-gathering models (jisi fanout) for hard/escalation rounds. Default [deepseek-v4-pro, kimi-k3, glm-5.3].' },
-      maxIdeasPerChallenge: { type: 'number', description: 'Max approaches executed in parallel per challenge round. Default 6.' },
-      maxIdeasPerModel: { type: 'number', description: 'Max approaches each idea model may propose. Default 3.' },
+      maxIdeasPerChallenge: { type: 'number', description: 'Max approaches executed in parallel per challenge round. Default 9.' },
+      maxIdeasPerModel: { type: 'number', description: 'Max approaches each idea model may propose. Default 5.' },
+      executorModels: { type: 'array', description: 'Executor model rotation for idea items. Default [kimi-k3, deepseek-v4-flash, deepseek-v4-pro, glm-5.3].' },
       profilePath: { type: 'string', description: 'Org-profile file for cross-challenge observations (local only). Default $DSH_HOME/storages/xiaochang-profile.md.' },
       budgetMinutes: { type: 'number', description: 'Total wall-clock budget. Default 320.' },
       roundsPerChallenge: { type: 'number', description: 'Max solver rounds per challenge. Default 3.' },
@@ -140,7 +145,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
   }
   const jisi = (ctx as unknown as { get?: (name: string) => unknown }).get?.('jisi') as JisiLike | undefined
   const config = {
-    concurrency: Math.min(3, args.concurrency ?? 3),
+    concurrency: args.concurrency ?? 9,
     budgetMs: (args.budgetMinutes ?? 320) * 60_000,
     maxRounds: args.roundsPerChallenge ?? 3,
     roundTimeoutMs: (args.roundTimeoutMinutes ?? 20) * 60_000,
@@ -157,8 +162,9 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
       effortRetry: args.effortRetry ?? 'max',
     } satisfies ModelPolicy,
     fanoutModels: args.fanoutModels ?? ['deepseek-v4-pro', 'kimi-k3', 'glm-5.3'],
-    maxIdeasPerChallenge: args.maxIdeasPerChallenge ?? 6,
-    maxIdeasPerModel: args.maxIdeasPerModel ?? 3,
+    maxIdeasPerChallenge: args.maxIdeasPerChallenge ?? 9,
+    maxIdeasPerModel: args.maxIdeasPerModel ?? 5,
+    executorModels: args.executorModels ?? ['kimi-k3', 'deepseek-v4-flash', 'deepseek-v4-pro', 'glm-5.3'],
     profilePath: args.profilePath ?? join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-profile.md'),
     workRoot: process.cwd(),
   }
@@ -373,22 +379,22 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
             summaryLines.push(`${code}: round ${round} done, ${merged.length}/${flagCount} flags`)
           }
         } else {
-          // 限流/瞬时错误（含空诊断的静默失败）：不消耗轮次，同轮重试（最多 5 次）。
+          // 限流/瞬时错误（含空诊断的静默失败）：不消耗轮次，同项重试（最多 5 次）。
+          // retry 以"基础项 id"为键（含思路编号），重试同一思路、不串思路。
           const detail = view.terminalDetail ?? ''
           const transient = /429|rate.?limit|overload|too many|限流|频率|busy/i.test(detail) || detail.trim() === ''
-          const retryKey = `${code}#${round}`
-          const retries = rateRetries.get(retryKey) ?? 0
+          const base = baseId(view.item.id)
+          const retries = rateRetries.get(base) ?? 0
           if (transient && retries < 5) {
-            rateRetries.set(retryKey, retries + 1)
-            audit({ type: 'rate-retry', code, round, retries: retries + 1 })
-            const cached = roundLabels.get(retryKey)
+            rateRetries.set(base, retries + 1)
+            audit({ type: 'rate-retry', id: view.item.id, round, retries: retries + 1 })
+            const cached = roundLabels.get(base)
             const challenge = challenges.get(code)
-            const dispatchPolicy = policyFor(config.policy, challenge?.difficulty ?? 'hard', round)
             campaign.add({
-              id: `${retryKey}-r${retries + 1}`,
+              id: `${base}-r${retries + 1}`,
               label: cached ?? `retry ${code} round ${round}`,
-              model: dispatchPolicy.model,
-              ...(dispatchPolicy.reasoningEffort !== undefined ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {}),
+              model: rotateModel(config.executorModels, retries + 1),
+              reasoningEffort: config.policy.effortHard ?? config.policy.effortRetry ?? 'max',
               priority: { tier: tierOf(challenge?.difficulty ?? 'hard'), score: 9999 },
             })
             summaryLines.push(`${code}: round ${round} transient failure (retry ${retries + 1}/5)`)
@@ -512,15 +518,19 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
           const itemId = ideas.length === 1 && approach === ''
             ? `${target.unique_code}#s${seed}`
             : `${target.unique_code}#s${seed}-i${index + 1}`
-          roundLabels.set(`${target.unique_code}#${seed}`, label)
+          // 执行者 ≠ 思路提供者；大兵团模式下执行者按轮换表指派（effort 交给
+          // 集思守卫：模型未宣告的 effort 自动丢弃）。
+          const executorModel = rotateModel(config.executorModels, index)
+          const executorEffort = config.policy.effortHard ?? config.policy.effortRetry ?? 'max'
+          roundLabels.set(itemId, label)
           campaign.add({
             id: itemId,
             label,
-            model: dispatchPolicy.model,
-            ...(dispatchPolicy.reasoningEffort !== undefined ? { reasoningEffort: dispatchPolicy.reasoningEffort } : {}),
+            model: executorModel,
+            reasoningEffort: executorEffort,
             priority: { tier: tierOf(target.difficulty), score: target.total_score * (config.maxRounds - seed + 1) },
           })
-          audit({ type: 'enqueue', code: target.unique_code, round: seed, model: dispatchPolicy.model, effort: dispatchPolicy.reasoningEffort, addrs, approach: approach === '' ? undefined : approach.slice(0, 80) })
+          audit({ type: 'enqueue', code: target.unique_code, round: seed, model: executorModel, effort: executorEffort, addrs, approach: approach === '' ? undefined : approach.slice(0, 80) })
         }
         progress.update(target.unique_code, { difficulty: target.difficulty, rounds: seed })
         changed = true

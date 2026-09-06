@@ -7,6 +7,7 @@ import type { ChallengeInfo } from '../../src/adapters/tsecbench.ts'
 import {
   RunBudget,
   RunProgress,
+  baseId,
   buildIdeaPrompt,
   buildSolverPrompt,
   cleanRoomGate,
@@ -15,6 +16,7 @@ import {
   parseIdeas,
   parseObservations,
   policyFor,
+  rotateModel,
   roundOf,
   selectTargets,
 } from '../src/orchestrator.ts'
@@ -136,6 +138,17 @@ describe('codeOf / roundOf', () => {
   it('falls back safely for malformed ids', () => {
     expect(codeOf('odd-id')).toBe('odd-id')
     expect(roundOf('odd-id')).toBe(1)
+  })
+  it('baseId strips retry suffixes and keeps the idea index', () => {
+    expect(baseId('g-18#s1-i2')).toBe('g-18#s1-i2')
+    expect(baseId('g-18#s1-i2-r3')).toBe('g-18#s1-i2')
+    expect(baseId('g-18#s1')).toBe('g-18#s1')
+  })
+  it('rotateModel cycles through the executor rotation', () => {
+    const models = ['kimi-k3', 'deepseek-v4-flash', 'deepseek-v4-pro']
+    expect(rotateModel(models, 0)).toBe('kimi-k3')
+    expect(rotateModel(models, 3)).toBe('kimi-k3')
+    expect(rotateModel(models, 5)).toBe('deepseek-v4-pro')
   })
 })
 
