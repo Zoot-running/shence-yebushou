@@ -48,11 +48,7 @@ goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goa
    - 多条思路同时入队并行跑；`dependsOn` 可做图状依赖（如"综合"依赖所有思路结果）。
    - 任一思路拿齐 flag → `xiaochang_submit` 交卷 → `xiaochang_report(code, complete)`（自动关容器+剪枝同题其余兵）。
 4. **经验回记**：执行后**一句话**给集思账本回记（`jisi_record`）：某模型某思路可行/死路（dimension=idea）、某模型执行成色（dimension=execution, key=难度, win=是否拿下 flag）。超时败绩由 `xiaochang_collect` 自动记。
-5. **花费纪律（每轮必看 `jisi_usage`，烧钱就是事故）**：
-   - 缺省执行者 = deepseek-v4-flash（便宜）；**难题升级优先 deepseek-v4-pro**，
-     只有能力账本明确显示 kimi-k3 在某难度/题型有独到胜率时才派 k3（k3 是烧钱大户，实测一天 ¥180+）。
-   - fanout 征集思路默认用便宜三档（deepseek-v4-pro + glm-5.3 + deepseek-v4-flash），不要默认带 k3。
-   - 执行 prompt 控制篇幅（题面+入口+战报纪律+思路即可，不抄整段方法论）；输出只取 flag/观察，不让执行者写长报告。
+5. **花费与执行者决策（决策权在你，依据在集思）**：每轮先看 `jisi_usage`（花费账）与 `jisi_model_report`（能力账），**自己权衡能力×价格后决定派谁**——账本越记越准，你的决策就越来越有依据；不要写死模型偏好。`xiaochang_enqueue` 缺省 flash/low 只是"你没指定时"的机制兜底，不是纪律。
 6. **收尾**：全部题目终态 → `xiaochang_finish` 停表；预算见 `xiaochang_status`。
 
 ## 四、知识治理纪律（托管模式红线）
