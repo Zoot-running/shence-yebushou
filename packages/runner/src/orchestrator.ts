@@ -85,6 +85,10 @@ export interface SolverPromptArgs {
   previous?: string
   /** 本条要执行的思路（集思 fanout 产出；执行者 ≠ 思路提供者）。 */
   approach?: string
+  /** 同题共享战报路径（并行思路相互联系的唯一信道）。 */
+  boardPath?: string
+  /** 题集组织画像（跨题积累的可泛化观察）。 */
+  profile?: string
 }
 
 /**
@@ -92,7 +96,7 @@ export interface SolverPromptArgs {
  * 通用方法论——不给过程教程、不给任何本地题解知识。
  */
 export function buildSolverPrompt(args: SolverPromptArgs): string {
-  const { skill, challenge, addrs, round, maxRounds, found, hint, previous, approach } = args
+  const { skill, challenge, addrs, round, maxRounds, found, hint, previous, approach, boardPath, profile } = args
   const lines: string[] = [
     '# 任务：解一道评测靶场题（校场操练）',
     '',
@@ -113,6 +117,9 @@ export function buildSolverPrompt(args: SolverPromptArgs): string {
   if (hint !== undefined && hint !== '') {
     lines.push('', '## 官方提示（本轮可用）', hint)
   }
+  if (profile !== undefined && profile.trim() !== '') {
+    lines.push('', '## 题集组织画像（同题集此前的可泛化观察，先读）', profile.slice(0, 4000))
+  }
   if (approach !== undefined && approach.trim() !== '') {
     lines.push(
       '',
@@ -123,6 +130,17 @@ export function buildSolverPrompt(args: SolverPromptArgs): string {
   if (previous !== undefined && previous.trim() !== '') {
     lines.push('', '## 上一轮工作记录（已到超时/未完成，继续从这里出发，不要重复侦察）', previous.slice(0, 6000))
   }
+  if (boardPath !== undefined && boardPath !== '') {
+    lines.push(
+      '',
+      '## 同题共享战报（并行工友互相联系的唯一信道）',
+      `- 路径：${boardPath}（同一题的其他思路并行执行者也在读/写此文件）。`,
+      '- 开工先读一遍；之后**每次动手前先 tail 一遍**，避免重复别人已探明/已排除的路。',
+      '- 探到重要事实（开放端口、可用凭据、漏洞类型、关键文件路径、拦路点）立即追加一行：`- <事实>（来源：你的工号）`。',
+      '- 工号 = 本条思路编号（题面给了就写；没有就写 executor）。',
+      '- 只写事实与排除项，不写大段过程；flag 候选不要写进战报（直接走 FLAG_CANDIDATE 输出）。',
+    )
+  }
   lines.push('', '## 方法论与纪律（校场技能）', skill)
   lines.push(
     '',
@@ -131,6 +149,7 @@ export function buildSolverPrompt(args: SolverPromptArgs): string {
     '2. 找到的每个候选 flag 以单独一行 `FLAG_CANDIDATE: <原文>` 输出，保持平台标注的格式。',
     '3. 未找到任何候选时输出 `FLAG_CANDIDATE: none`。',
     '4. 不要提交占位 flag（源码/容器初始化文件里的假值）；真 flag 必须来自线上目标二次确认。',
+    '5. 结尾附 `OBSERVATIONS:` 小节：≤5 条**可泛化到同题集其他题**的观察（容器形态、常见路径、服务栈、攻击面规律），不含本题 flag 与题解细节。',
   )
   return lines.join('\n')
 }
@@ -147,6 +166,8 @@ export interface IdeaPromptArgs {
   previous?: string
   /** 每个模型最多给出的思路条数。 */
   maxIdeas: number
+  /** 题集组织画像（跨题积累的可泛化观察）。 */
+  profile?: string
 }
 
 /**
@@ -154,7 +175,7 @@ export interface IdeaPromptArgs {
  * 不求完整解题；格式约定 IDEA n: 供调度者解析成虎符工作项。
  */
 export function buildIdeaPrompt(args: IdeaPromptArgs): string {
-  const { challenge, addrs, round, found, hint, previous, maxIdeas } = args
+  const { challenge, addrs, round, found, hint, previous, maxIdeas, profile } = args
   const lines: string[] = [
     '# 任务：为一道评测靶场题征集解题思路（只出思路，不动手）',
     '',
@@ -174,6 +195,9 @@ export function buildIdeaPrompt(args: IdeaPromptArgs): string {
   ]
   if (hint !== undefined && hint !== '') {
     lines.push('', '## 官方提示', hint)
+  }
+  if (profile !== undefined && profile.trim() !== '') {
+    lines.push('', '## 题集组织画像（同题集此前的可泛化观察）', profile.slice(0, 4000))
   }
   if (previous !== undefined && previous.trim() !== '') {
     lines.push('', '## 此前尝试记录（哪些路走通过/没走通）', previous.slice(0, 6000))
@@ -210,6 +234,23 @@ export function parseIdeas(reports: readonly string[], cap: number): string[] {
     }
   }
   return ideas
+}
+
+/**
+ * 从求解器输出里解析 OBSERVATIONS 小节（≤N 条可泛化观察，供题集画像积累）。
+ * 不含 flag/题解细节（由输出约定保证，解析只做结构提取）。
+ */
+export function parseObservations(text: string, cap = 5): string[] {
+  const section = /OBSERVATIONS\s*[:：]([\s\S]*)$/i.exec(text)
+  if (section === null) return []
+  const out: string[] = []
+  for (const line of section[1]!.split('\n')) {
+    const body = line.replace(/^[-*\d.\s]+/, '').trim()
+    if (body === '' || body.toLowerCase().includes('flag{')) continue
+    out.push(body.slice(0, 200))
+    if (out.length >= cap) break
+  }
+  return out
 }
 
 /** 战役预算（墙钟）。 */

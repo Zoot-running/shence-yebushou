@@ -12,6 +12,7 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { HintLedger } from '../../../src/hint-ledger.ts'
+import { addFact, createProfile, parse as parseProfile, render as renderProfile } from '../../../src/profile.ts'
 import { TsecbenchAdapter, type ChallengeInfo, type FetchLike } from '../../../src/adapters/tsecbench.ts'
 import {
   RunBudget,
@@ -22,6 +23,7 @@ import {
   codeOf,
   extractFlags,
   parseIdeas,
+  parseObservations,
   policyFor,
   roundOf,
   selectTargets,
@@ -46,6 +48,8 @@ interface StartArgs {
   maxIdeasPerChallenge?: number
   /** 每个模型最多出几条思路。 */
   maxIdeasPerModel?: number
+  /** 题集画像文件路径（跨题可泛化观察自积累；缺省 $DSH_HOME/storages/xiaochang-profile.md）。 */
+  profilePath?: string
   budgetMinutes?: number
   roundsPerChallenge?: number
   roundTimeoutMinutes?: number
@@ -102,6 +106,7 @@ export function apply(ctx: Context): void {
       fanoutModels: { type: 'array', description: 'Idea-gathering models (jisi fanout) for hard/escalation rounds. Default [deepseek-v4-pro, kimi-k3, glm-5.3].' },
       maxIdeasPerChallenge: { type: 'number', description: 'Max approaches executed in parallel per challenge round. Default 6.' },
       maxIdeasPerModel: { type: 'number', description: 'Max approaches each idea model may propose. Default 3.' },
+      profilePath: { type: 'string', description: 'Org-profile file for cross-challenge observations (local only). Default $DSH_HOME/storages/xiaochang-profile.md.' },
       budgetMinutes: { type: 'number', description: 'Total wall-clock budget. Default 320.' },
       roundsPerChallenge: { type: 'number', description: 'Max solver rounds per challenge. Default 3.' },
       roundTimeoutMinutes: { type: 'number', description: 'Per-round solver timeout. Default 20.' },
@@ -154,6 +159,8 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
     fanoutModels: args.fanoutModels ?? ['deepseek-v4-pro', 'kimi-k3', 'glm-5.3'],
     maxIdeasPerChallenge: args.maxIdeasPerChallenge ?? 6,
     maxIdeasPerModel: args.maxIdeasPerModel ?? 3,
+    profilePath: args.profilePath ?? join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-profile.md'),
+    workRoot: process.cwd(),
   }
   const snapshotPath = join(env.DSH_HOME ?? '.', 'storages', 'xiaochang-run.jsonl')
 
@@ -163,6 +170,33 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
   }
 
   const skill = readFileSync(new URL('../prompts/solver.md', import.meta.url), 'utf8')
+
+  // 题集画像（夜不收组织画像机制）：跨题可泛化观察，本地文件自积累；画像只产出、不内置。
+  let profile = createProfile('tsecbench-set')
+  try {
+    if (existsSync(config.profilePath)) {
+      profile = parseProfile(readFileSync(config.profilePath, 'utf8'))
+    }
+  } catch { /* 画像损坏：空画像起跑 */ }
+  const profileText = (): string => renderProfile(profile)
+  const persistProfile = (): void => {
+    try {
+      mkdirSync(join(config.profilePath, '..'), { recursive: true })
+      writeFileSync(config.profilePath, renderProfile(profile))
+    } catch { /* 画像落盘失败不致命 */ }
+  }
+  // 同题共享战报：并行思路相互联系的唯一信道（工作根/每题/FINDINGS.md）。
+  const boardPathFor = (code: string): string => join(config.workRoot, code, 'FINDINGS.md')
+  const seedBoard = (code: string, addrs: readonly string[]): string => {
+    const path = boardPathFor(code)
+    try {
+      mkdirSync(join(path, '..'), { recursive: true })
+      if (!existsSync(path)) {
+        writeFileSync(path, `# 战报：${code}\n\n- 靶场入口：${addrs.join('、')}\n- 规则：只写事实与排除项，每行一条；flag 候选不写这里。\n`)
+      }
+    } catch { /* 战报不可写：求解者仍可单打（boardPath 提示降级） */ }
+    return path
+  }
 
   // 恢复：读快照（崩溃后重新调用本工具即续跑）。
   let progress: RunProgress
@@ -310,6 +344,11 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
               if (res.correct && !accepted.includes(flag)) accepted.push(flag)
             } catch { /* duplicate/校验错误忽略 */ }
           }
+          // 画像积累：把求解者自报的可泛化观察并入题集画像（去重、本地落盘）。
+          for (const note of parseObservations(view.terminalDetail ?? '')) {
+            addFact(profile, { kind: 'other', note })
+          }
+          persistProfile()
           const merged = [...new Set([...p.flags, ...accepted])]
           const challenge = challenges.get(code)
           const flagCount = challenge?.flag_count ?? Number.POSITIVE_INFINITY
@@ -424,6 +463,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
           } catch { /* 已通关题无 hint；忽略 */ }
         }
         const dispatchPolicy = policyFor(config.policy, target.difficulty, seed)
+        const boardPath = seedBoard(target.unique_code, addrs)
 
         // 集思开路：hard/insane 从第 1 轮、其余难度从第 2 轮起，先 fanout 征集思路；
         // 思路到手模型即释放；思路拆成虎符工作项并行执行（执行者 ≠ 思路提供者）。
@@ -440,6 +480,7 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
                 hint,
                 previous: lastRoundDetail.get(target.unique_code),
                 maxIdeas: config.maxIdeasPerModel,
+                profile: profileText(),
               }),
             }
             const ideaReports = await jisi.fanout(agent, ideaWork, config.fanoutModels, {
@@ -464,6 +505,8 @@ async function run(ctx: Context, args: StartArgs, agent: unknown): Promise<strin
             found,
             hint,
             previous: lastRoundDetail.get(target.unique_code),
+            boardPath,
+            profile: profileText(),
             ...(approach !== '' ? { approach } : {}),
           })
           const itemId = ideas.length === 1 && approach === ''

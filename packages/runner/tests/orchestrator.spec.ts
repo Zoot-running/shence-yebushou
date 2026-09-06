@@ -13,6 +13,7 @@ import {
   codeOf,
   extractFlags,
   parseIdeas,
+  parseObservations,
   policyFor,
   roundOf,
   selectTargets,
@@ -183,6 +184,32 @@ describe('buildIdeaPrompt / parseIdeas', () => {
     })
     expect(prompt).toContain('本条要执行的思路')
     expect(prompt).toContain('先试 SQL 注入')
+  })
+  it('executor prompt carries the shared board and org profile sections', () => {
+    const prompt = buildSolverPrompt({
+      skill: 'M',
+      challenge: CH('x'),
+      addrs: [],
+      round: 1,
+      maxRounds: 3,
+      found: [],
+      boardPath: '/work/x/FINDINGS.md',
+      profile: '# 画像\ntech',
+    })
+    expect(prompt).toContain('同题共享战报')
+    expect(prompt).toContain('/work/x/FINDINGS.md')
+    expect(prompt).toContain('题集组织画像')
+    expect(prompt).toContain('tech')
+  })
+})
+
+describe('parseObservations', () => {
+  it('extracts generic observation lines and drops flag values', () => {
+    const text = 'done.\nOBSERVATIONS:\n- 容器多为 python 服务\n- 常见路径 /challenge/flag.txt\n- flag{secret_value}'
+    expect(parseObservations(text)).toEqual(['容器多为 python 服务', '常见路径 /challenge/flag.txt'])
+  })
+  it('returns [] without the section', () => {
+    expect(parseObservations('nothing here')).toEqual([])
   })
 })
 
