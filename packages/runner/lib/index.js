@@ -628,6 +628,12 @@ boardPath=${c().boardPath(args.code)}`;
       const seq = s.progress.get(args.code)?.rounds ?? 0;
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`;
       const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy);
+      if (jisi !== void 0) {
+        const listed = await jisi.listModels();
+        if (!listed.some((m) => m.id === executor.model)) {
+          return `xiaochang_enqueue: model ${executor.model} is not in the registered model catalog (jisi listModels) \u2014 pick a listed model`;
+        }
+      }
       c().add({
         id: itemId,
         label: args.prompt,

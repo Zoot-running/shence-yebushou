@@ -70,6 +70,8 @@ interface JisiLike {
   ledger: {
     record(model: string, dimension: 'execution' | 'idea', key: string, win: boolean): void
   }
+  /** 模型目录（含 provider 归属）；enqueue 用其校验模型可派。 */
+  listModels(): Promise<Array<{ id: string; provider: string }>>
 }
 
 interface SetupArgs {
@@ -427,6 +429,14 @@ export function apply(ctx: Context): void {
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`
       // 执行者模型/强度：主 agent 逐项覆盖优先，缺省兜底；模型锁定时强制缺省。
       const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy)
+      // F8 护栏：模型必须出现在集思目录（能解析到 provider），否则拒绝入队——
+      // 防"目录外模型"被静默送到默认 provider 后无声失败。
+      if (jisi !== undefined) {
+        const listed = await jisi.listModels()
+        if (!listed.some(m => m.id === executor.model)) {
+          return `xiaochang_enqueue: model ${executor.model} is not in the registered model catalog (jisi listModels) — pick a listed model`
+        }
+      }
       c().add({
         id: itemId,
         label: args.prompt,
