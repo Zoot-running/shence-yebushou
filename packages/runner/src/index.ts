@@ -119,6 +119,7 @@ interface CampaignState {
 }
 
 let state: CampaignState | undefined
+let heartbeatTimer: ReturnType<typeof setInterval> | undefined
 
 function requireState(): CampaignState {
   if (state === undefined) throw new Error('xiaochang: not set up — call xiaochang_setup first')
@@ -268,6 +269,14 @@ export function apply(ctx: Context): void {
       const fresh = await s.adapter.listChallenges()
       for (const ch of fresh) s.challenges.set(ch.unique_code, ch)
       persistProgress(s)
+      // F15：审计心跳必须是独立定时器——长工具调用（fanout 慢模型/长派单轮）期间
+      // 活动驱动的心跳会停摆，guard 的 stale 看门狗可能误杀健康进程。
+      if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer)
+      heartbeatTimer = setInterval(() => {
+        if (state === undefined) return
+        audit(state.auditPath, { type: 'heartbeat', at: Date.now() })
+      }, 120_000)
+      ;(heartbeatTimer as { unref?: () => void }).unref?.()
       return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}`
     },
   }))
