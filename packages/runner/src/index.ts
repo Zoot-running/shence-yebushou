@@ -223,6 +223,15 @@ export function apply(ctx: Context): void {
   let campaign: HufuLike | undefined
   let campaignId: string | undefined
 
+  // F15+F23：审计心跳在插件装载层启动（每次进程 boot 都生效），不依赖 setup——
+  // resumed 化身可能不重调 setup，绑 setup 会造成守护链误杀（run 7 02:28 实锤：
+  // 分析 10 分钟无活动行 → guard 判假死）。
+  heartbeatTimer = setInterval(() => {
+    const home = process.env.DSH_HOME ?? '.'
+    audit(join(home, 'storages', 'xiaochang-run-audit.jsonl'), { type: 'heartbeat', at: Date.now() })
+  }, 120_000)
+  ;(heartbeatTimer as { unref?: () => void }).unref?.()
+
   const c = (): HufuLike => {
     if (campaign === undefined) throw new Error('xiaochang: not set up — call xiaochang_setup first')
     return campaign
@@ -322,14 +331,6 @@ export function apply(ctx: Context): void {
       const fresh = await s.adapter.listChallenges()
       for (const ch of fresh) s.challenges.set(ch.unique_code, ch)
       persistProgress(s)
-      // F15：审计心跳必须是独立定时器——长工具调用（fanout 慢模型/长派单轮）期间
-      // 活动驱动的心跳会停摆，guard 的 stale 看门狗可能误杀健康进程。
-      if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer)
-      heartbeatTimer = setInterval(() => {
-        if (state === undefined) return
-        audit(state.auditPath, { type: 'heartbeat', at: Date.now() })
-      }, 120_000)
-      ;(heartbeatTimer as { unref?: () => void }).unref?.()
       return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}, campaign=${created.id}, swept=${swept}`
     },
   }))

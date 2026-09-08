@@ -440,6 +440,11 @@ function apply(ctx) {
   const holder = ctx.hufu;
   let campaign;
   let campaignId;
+  heartbeatTimer = setInterval(() => {
+    const home = process.env.DSH_HOME ?? ".";
+    audit(join2(home, "storages", "xiaochang-run-audit.jsonl"), { type: "heartbeat", at: Date.now() });
+  }, 12e4);
+  heartbeatTimer.unref?.();
   const c = () => {
     if (campaign === void 0) throw new Error("xiaochang: not set up \u2014 call xiaochang_setup first");
     return campaign;
@@ -533,12 +538,6 @@ function apply(ctx) {
       const fresh = await s.adapter.listChallenges();
       for (const ch of fresh) s.challenges.set(ch.unique_code, ch);
       persistProgress(s);
-      if (heartbeatTimer !== void 0) clearInterval(heartbeatTimer);
-      heartbeatTimer = setInterval(() => {
-        if (state === void 0) return;
-        audit(state.auditPath, { type: "heartbeat", at: Date.now() });
-      }, 12e4);
-      heartbeatTimer.unref?.();
       return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}, campaign=${created.id}, swept=${swept}`;
     }
   }));
