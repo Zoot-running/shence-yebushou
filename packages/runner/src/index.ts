@@ -7,7 +7,7 @@
  * @module @shence/xiaochang-runner
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -168,7 +168,6 @@ function openCount(campaign: HufuLike): number {
 }
 
 function walk(dir: string): string[] {
-  const { readdirSync, statSync } = require('node:fs') as typeof import('node:fs')
   const out: string[] = []
   for (const name of readdirSync(dir)) {
     const full = join(dir, name)
@@ -181,7 +180,6 @@ function walk(dir: string): string[] {
 
 /** 轻量扫 cwd 遗留（pre-run sweep 兜底）：题号工件（g-*）与旧战报 FINDINGS.md，mtime 早于 startedAt。 */
 function scanLegacyCwd(cwd: string, startedAt: number): string[] {
-  const { readdirSync, statSync } = require('node:fs') as typeof import('node:fs')
   const out: string[] = []
   const consider = (full: string): void => {
     try {

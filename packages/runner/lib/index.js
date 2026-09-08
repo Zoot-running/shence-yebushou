@@ -1,12 +1,5 @@
-var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require : typeof Proxy !== "undefined" ? new Proxy(x, {
-  get: (a, b) => (typeof require !== "undefined" ? require : a)[b]
-}) : x)(function(x) {
-  if (typeof require !== "undefined") return require.apply(this, arguments);
-  throw Error('Dynamic require of "' + x + '" is not supported');
-});
-
 // src/index.ts
-import { existsSync, mkdirSync as mkdirSync2, readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync as mkdirSync2, readFileSync, readdirSync as readdirSync2, statSync as statSync2, writeFileSync, appendFileSync } from "node:fs";
 import { join as join2 } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
@@ -394,7 +387,6 @@ function openCount(campaign) {
   return campaign.ledger.views().filter((v) => v.state === "dispatched" || v.state === "help" || v.state === "stalled").length;
 }
 function walk(dir) {
-  const { readdirSync: readdirSync2, statSync: statSync2 } = __require("node:fs");
   const out = [];
   for (const name2 of readdirSync2(dir)) {
     const full = join2(dir, name2);
@@ -405,7 +397,6 @@ function walk(dir) {
   return out;
 }
 function scanLegacyCwd(cwd, startedAt) {
-  const { readdirSync: readdirSync2, statSync: statSync2 } = __require("node:fs");
   const out = [];
   const consider = (full) => {
     try {
