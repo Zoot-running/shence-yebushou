@@ -42,15 +42,17 @@ goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goa
 - 每轮结束前：可派即派、可开即开，不留空槽位再结束本轮。
 
 1. **开题（难度编排）**：`xiaochang_list` 选未完成题——先 easy 清场并**校准本 run 的 flag 放置习惯**；容器永远 3 个开满；高分/链条题（S 级）单独排重兵；hint 按分值决策（500 分题值得扣 10%）。
-2. **集思征集思路（jisi_fanout 工具，随时可用、不强求）**：卡题时（或任何你觉得需要多视角的时候）可以调 `jisi_fanout` 让多模型各出 N 条思路，你做综合判断——何时调、调谁、要几条由你判断；这是每个 agent 都有的公共工具，不限于调度者。easy 题首轮可跳过征集直接派单。
+2. **集思征集思路（jisi_fanout 工具，随时可用、不强求）**：卡题时（或任何你觉得需要多视角的时候）调 `jisi_fanout` 让多模型各出 N 条思路——**fanout 先行**：hard 题开打前先 fanout 一发并行征思路（~2 分钟拿到 N 个视角），比你自己单线程深挖更快；fanout 缺省 notify 模式**立即返回**（各模型先完成先到，慢的不阻塞你），每路报告带 `[fanout:id] [model] [question]` 信封（多次 fanout 交错也不乱）；**题目一有解立即 `jisi_fanout_drop <id>`** 停掉剩余思考省 token。collect 模式只在"现在就要一批思路再派单"时用（带 timeoutMinutes）。easy 题首轮可跳过征集直接派单。
 3. **虎符大兵团（xiaochang_enqueue + xiaochang_dispatch）**：
-   - **思路是你出的**：每条执行 prompt 开头先写"我的分析"段——你判断的漏洞方向/预期路径/关键验证点（老架构实证：主 agent 出思路、子代理探索执行的打法最强）；不要让执行者从裸题面自己猜。
+   - **思路是你出的**：每条执行 prompt 开头先写"我的分析"段——你判断的漏洞方向/预期路径/关键验证点（老架构实证：主 agent 出思路、子代理探索执行的打法最强）；不要让执行者从裸题面自己猜。**但你自己的深挖有预算**：每题亲挖 ≤1 轮时间；超时先派一版执行者（你的分析进 prompt），把"验证/爆破"交给执行者——你的时间是调度与判断（run 6 教训：亲挖产出尖 prompt 价值真实，但串行亲挖让 4 题执行者空转 ~45 分钟）。
    - 你写执行 prompt：我的分析 + 题面 + 靶场地址 + **战报路径与纪律（开工先读、动手前先 tail、探到事实立即追加一行并署名）** + 题集画像（`xiaochang_profile`，先读画像）+ 指派的那条思路 + `FLAG_CANDIDATE:`/`OBSERVATIONS:` 输出约定。
    - 执行者 ≠ 思路提供者：用 `jisi_model_report` 看能力账本，**派最合适的模型**；无数据时按价格序挑便宜的。
    - 多条思路同时入队并行跑；`dependsOn` 可做图状依赖（如"综合"依赖所有思路结果）。
-   - **难题用 continuable 执行者**（hufu_enqueue 带 continuable=true）：同一子代理跨轮
-     续战、保留原生上下文（老架构的磨题打法）；它 settle 后由你判断结局并 `hufu_report`
-     落账，卡住时 `hufu_continue` 把新发现喂给它——而不是杀号重来。
+   - **hard 题第 2 轮起优先 continuable 执行者**（`xiaochang_enqueue` 带 continuable=true）：
+     同一子代理跨轮续战、保留原生上下文（磨题打法；虎符的调度语义：长任务/难任务/
+     已派过但无结果的任务都适合续战而非重开新兵）；它 settle 后由你判断结局并
+     `xiaochang_report(code, ...)` 落账，卡住时 `hufu_continue` 把新发现喂给它。
+     easy/medium 一次性执行者即可。
    - 任一思路拿齐 flag → `xiaochang_submit` 交卷 → `xiaochang_report(code, complete)`（自动关容器+剪枝同题其余兵）。
    - **每题入账即快报**：`✅ <code> 解出，得分累计 X`——老架构的调度闭环纪律，进度永远一口清。
 4. **经验回记**：执行后**一句话**给集思账本回记（`jisi_record`）：某模型某思路可行/死路（dimension=idea）、某模型执行成色（dimension=execution, key=难度, win=是否拿下 flag）。超时败绩由 `xiaochang_collect` 自动记。
