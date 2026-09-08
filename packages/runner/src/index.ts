@@ -22,6 +22,7 @@ import {
   parseObservations,
   resolveExecutor,
   roundOf,
+  sweepLegacyWorkdir,
 } from './orchestrator.ts'
 
 export const name = 'shence-xiaochang-runner'
@@ -63,6 +64,12 @@ interface HufuLike {
   ledger: {
     views(): Array<{ item: { id: string; model?: string }; state: string; seed: number; terminalDetail?: string; dispatchedAt?: number; lastProgressAt?: number }>
   }
+}
+
+/** 虎符宿主服务面（createCampaign 稳定 id 幂等恢复 + finish 归档）。 */
+interface HufuHolderLike {
+  createCampaign(p: unknown, c: object, items: unknown[], opts?: { id?: string }): { id: string; campaign: HufuLike }
+  finish?(id: string): void
 }
 
 /** 集思服务面（能力账本；fanout 由主 agent 经 jisi_fanout 工具调用）。 */
@@ -172,10 +179,51 @@ function walk(dir: string): string[] {
   return out
 }
 
+/** 轻量扫 cwd 遗留（pre-run sweep 兜底）：题号工件（g-*）与旧战报 FINDINGS.md，mtime 早于 startedAt。 */
+function scanLegacyCwd(cwd: string, startedAt: number): string[] {
+  const { readdirSync, statSync } = require('node:fs') as typeof import('node:fs')
+  const out: string[] = []
+  const consider = (full: string): void => {
+    try {
+      if (statSync(full).mtimeMs < startedAt) out.push(full)
+    } catch { /* 忽略 */ }
+  }
+  try {
+    for (const name of readdirSync(cwd)) {
+      if (!/^g[-_]?\d/.test(name) && name !== 'boards') continue
+      const full = join(cwd, name)
+      const stat = statSync(full)
+      if (stat.isDirectory()) {
+        if (name === 'boards') {
+          // 只看各组的 FINDINGS.md（跨 run 战报泄漏面）。
+          for (const entry of readdirSync(full)) {
+            const nested = join(full, entry)
+            try {
+              if (statSync(nested).isDirectory()) {
+                for (const inner of readdirSync(nested)) {
+                  if (inner === 'FINDINGS.md') consider(join(nested, inner))
+                }
+              }
+            } catch { /* 忽略 */ }
+          }
+        } else {
+          for (const file of walk(full)) {
+            if (file.endsWith('.md') || file.endsWith('.txt') || file.endsWith('.py') || file.endsWith('.json') || file.endsWith('.html') || file.endsWith('.sh')) consider(file)
+          }
+        }
+      } else {
+        consider(full)
+      }
+    }
+  } catch { /* 忽略 */ }
+  return out
+}
+
 export function apply(ctx: Context): void {
   const jisi = (ctx as unknown as { get?: (name: string) => unknown }).get?.('jisi') as JisiLike | undefined
-  const holder = (ctx as unknown as { hufu: { createCampaign(p: unknown, c: object, items: unknown[]): { campaign: HufuLike } } }).hufu
+  const holder = (ctx as unknown as { hufu: HufuHolderLike }).hufu
   let campaign: HufuLike | undefined
+  let campaignId: string | undefined
 
   const c = (): HufuLike => {
     if (campaign === undefined) throw new Error('xiaochang: not set up — call xiaochang_setup first')
@@ -257,12 +305,19 @@ export function apply(ctx: Context): void {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
       } catch { /* 画像损坏：空画像 */ }
       state = s
-      campaign = holder.createCampaign(agent, {
+      // 稳定 campaignId：跨进程崩溃/重启幂等恢复（虎符快照），prompt 本体不丢（F18）。
+      const stableId = `tsecbench-run-${args.runId ?? 'pending'}`
+      // F5/F6 机制化：pre-run sweep——把早于本 run 开始时间的题号工件与旧 run 战报
+      // 移入 cwd/.archive/<campaignId>/（靠配置隔离，不靠手工清扫）。
+      const swept = sweepLegacyWorkdir(process.cwd(), s.startedAt, `.archive/${stableId}`)
+      const created = holder.createCampaign(agent, {
         concurrency: s.concurrency,
         stallAfterMs: s.roundTimeoutMs + 10 * 60_000,
         heartbeatMs: 15 * 60_000,
         budgetMs: s.budgetMs,
-      }, []).campaign
+      }, [], { id: stableId, boardNamespace: `${args.runId ?? 'pending'}` })
+      campaign = created.campaign
+      campaignId = created.id
       if (!(await s.adapter.gatewayHealthy())) {
         return 'xiaochang_setup: VPN gateway not healthy — connect the run VPN first'
       }
@@ -277,7 +332,7 @@ export function apply(ctx: Context): void {
         audit(state.auditPath, { type: 'heartbeat', at: Date.now() })
       }, 120_000)
       ;(heartbeatTimer as { unref?: () => void }).unref?.()
-      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}`
+      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}, campaign=${created.id}, swept=${swept}`
     },
   }))
 
@@ -294,11 +349,17 @@ export function apply(ctx: Context): void {
       const fresh = await s.adapter.listChallenges()
       for (const ch of fresh) s.challenges.set(ch.unique_code, ch)
       // clean-room 门禁：本地私知里出现该题号 → 弃权。
+      // 扫描面（F5 扩扫）：knowledgeDir 全部 + cwd 中早于本 run 开始时间的遗留工件
+      // （pre-run sweep 的兜底：漏网的上 run 题号目录/战报也算污染；本 run 自己的工件不受影响）。
       const localFiles: Array<{ file: string; text: string }> = []
       if (existsSync(s.knowledgeDir)) {
         for (const file of walk(s.knowledgeDir)) {
           try { localFiles.push({ file, text: readFileSync(file, 'utf8') }) } catch { /* 非文本 */ }
         }
+      }
+      const legacyWorkdirFiles = scanLegacyCwd(process.cwd(), s.startedAt)
+      for (const file of legacyWorkdirFiles) {
+        try { localFiles.push({ file, text: readFileSync(file, 'utf8') }) } catch { /* 非文本 */ }
       }
       for (const ch of fresh) {
         if (s.progress.get(ch.unique_code) !== undefined) continue
@@ -624,6 +685,8 @@ export function apply(ctx: Context): void {
         s.progress.update(ch.unique_code, { containerClosed: true })
       }
       persistProgress(s)
+      // 虎符收尾：终态快照落盘并移入归档（防下个进程误恢复本战役）。
+      if (campaignId !== undefined) holder.finish?.(campaignId)
       const final = await s.adapter.listChallenges()
       const score = s.adapter.scoreOf(final)
       const allTerminal = final.every(ch => ch.is_completed || ['failed', 'skipped'].includes(s.progress.get(ch.unique_code)?.state ?? ''))

@@ -7,10 +7,42 @@
  */
 
 import type { ChallengeInfo } from '../../../src/adapters/tsecbench.ts'
+import { mkdirSync, readdirSync, renameSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 
 export interface CleanRoomVerdict {
   contaminated: boolean
   hits: string[]
+}
+
+/**
+ * pre-run sweep（F5 机制化）：把 cwd 里早于 startedAt 的题号工件/旧 run 战报
+ * 移入归档目录，防止上一 run 的解与 flag 泄漏进本 run（run 6 前 27 分钟旧工件红利）。
+ * 保留：工具链目录、启动脚本（run*-launch/order）、普通隐藏配置；`.run*` 旧会话副本归档。
+ * @param cwd - 战役工作目录。
+ * @param startedAt - 本 run 开始时间戳（早于它的都是上一 run 遗留）。
+ * @param archiveRel - 归档相对目录（如 `.archive/tsecbench-run-15998`）。
+ * @returns 移走的条目数。
+ */
+export function sweepLegacyWorkdir(cwd: string, startedAt: number, archiveRel: string): number {
+  const KEEP_DIRS = new Set(['.venv', '.gocache', '.gopath', '.g10test', '.git', 'node_modules', '.archive'])
+  const KEEP_FILE_RE = /^run\d+-(launch|order)\.(sh|txt)$/
+  let moved = 0
+  try {
+    for (const name of readdirSync(cwd)) {
+      // 普通隐藏配置保留；.run*（旧会话副本）要归档。
+      if (name.startsWith('.') && !name.startsWith('.run')) continue
+      if (KEEP_DIRS.has(name)) continue
+      if (KEEP_FILE_RE.test(name)) continue
+      const full = join(cwd, name)
+      const stat = statSync(full)
+      if (stat.mtimeMs >= startedAt) continue
+      mkdirSync(join(cwd, archiveRel), { recursive: true })
+      renameSync(full, join(cwd, archiveRel, name))
+      moved += 1
+    }
+  } catch { /* 清场失败不致命（下个 run 再扫） */ }
+  return moved
 }
 
 /**

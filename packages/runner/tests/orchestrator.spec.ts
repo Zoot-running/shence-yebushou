@@ -92,3 +92,42 @@ describe('resolveExecutor', () => {
     })
   })
 })
+
+describe('sweepLegacyWorkdir', () => {
+  it('archives pre-run artifacts, keeps tooling and run scripts', () => {
+    const { mkdtempSync, writeFileSync, utimesSync, readdirSync, existsSync } = require('node:fs') as typeof import('node:fs')
+    const { tmpdir } = require('node:os') as typeof import('node:os')
+    const { join } = require('node:path') as typeof import('node:path')
+    const { sweepLegacyWorkdir } = require('../src/orchestrator.ts') as typeof import('../src/orchestrator.ts')
+    const dir = mkdtempSync(join(tmpdir(), 'sweep-'))
+    const old = new Date('2026-09-07T00:00:00Z')
+    const fresh = new Date('2026-09-08T02:00:00Z')
+    const startedAt = Date.parse('2026-09-08T01:47:00Z')
+    const touch = (p: string, t: Date): void => { writeFileSync(p, 'x'); utimesSync(p, t, t) }
+    // 旧题号工件 → 归档
+    const gdir = join(dir, 'g-02')
+    require('node:fs').mkdirSync(gdir)
+    touch(join(gdir, 'solve.py'), old)
+    utimesSync(gdir, old, old)
+    // 旧战报 → 归档（boards 整个目录）
+    const bdir = join(dir, 'boards', 'g-03')
+    require('node:fs').mkdirSync(bdir, { recursive: true })
+    touch(join(bdir, 'FINDINGS.md'), old)
+    utimesSync(join(dir, 'boards'), old, old)
+    utimesSync(bdir, old, old)
+    // 工具链/启动脚本/新工件 → 保留
+    require('node:fs').mkdirSync(join(dir, '.venv'))
+    touch(join(dir, '.venv', 'python'), old)
+    touch(join(dir, 'run7-launch.sh'), old)
+    require('node:fs').mkdirSync(join(dir, 'g-04'))
+    touch(join(dir, 'g-04', 'work'), fresh)
+    const moved = sweepLegacyWorkdir(dir, startedAt, '.archive/test')
+    expect(moved).toBe(2) // g-02 目录 + boards 目录
+    expect(existsSync(join(dir, '.archive', 'test', 'g-02', 'solve.py'))).toBe(true)
+    expect(existsSync(join(dir, '.archive', 'test', 'boards', 'g-03', 'FINDINGS.md'))).toBe(true)
+    expect(existsSync(join(dir, '.venv'))).toBe(true)
+    expect(existsSync(join(dir, 'run7-launch.sh'))).toBe(true)
+    expect(existsSync(join(dir, 'g-04'))).toBe(true)
+    expect(readdirSync(dir)).toContain('.archive')
+  })
+})

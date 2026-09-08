@@ -6,8 +6,8 @@ var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require
 });
 
 // src/index.ts
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync as mkdirSync2, readFileSync, writeFileSync, appendFileSync } from "node:fs";
+import { join as join2 } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
 // ../../src/hint-ledger.ts
@@ -206,6 +206,28 @@ var TsecbenchAdapter = class {
 };
 
 // src/orchestrator.ts
+import { mkdirSync, readdirSync, renameSync, statSync } from "node:fs";
+import { join } from "node:path";
+function sweepLegacyWorkdir(cwd, startedAt, archiveRel) {
+  const KEEP_DIRS = /* @__PURE__ */ new Set([".venv", ".gocache", ".gopath", ".g10test", ".git", "node_modules", ".archive"]);
+  const KEEP_FILE_RE = /^run\d+-(launch|order)\.(sh|txt)$/;
+  let moved = 0;
+  try {
+    for (const name2 of readdirSync(cwd)) {
+      if (name2.startsWith(".") && !name2.startsWith(".run")) continue;
+      if (KEEP_DIRS.has(name2)) continue;
+      if (KEEP_FILE_RE.test(name2)) continue;
+      const full = join(cwd, name2);
+      const stat = statSync(full);
+      if (stat.mtimeMs >= startedAt) continue;
+      mkdirSync(join(cwd, archiveRel), { recursive: true });
+      renameSync(full, join(cwd, archiveRel, name2));
+      moved += 1;
+    }
+  } catch {
+  }
+  return moved;
+}
 function cleanRoomGate(code, localFiles) {
   const hits = [];
   for (const { file, text } of localFiles) {
@@ -348,7 +370,7 @@ function audit(path, line) {
 }
 function persistProgress(s) {
   try {
-    mkdirSync(join(s.snapshotPath, ".."), { recursive: true });
+    mkdirSync2(join2(s.snapshotPath, ".."), { recursive: true });
     appendFileSync(s.snapshotPath, `${s.progress.line()}
 `);
   } catch {
@@ -356,7 +378,7 @@ function persistProgress(s) {
 }
 function persistProfile(s) {
   try {
-    mkdirSync(join(s.profilePath, ".."), { recursive: true });
+    mkdirSync2(join2(s.profilePath, ".."), { recursive: true });
     writeFileSync(s.profilePath, render(s.profile));
   } catch {
   }
@@ -372,13 +394,53 @@ function openCount(campaign) {
   return campaign.ledger.views().filter((v) => v.state === "dispatched" || v.state === "help" || v.state === "stalled").length;
 }
 function walk(dir) {
-  const { readdirSync, statSync } = __require("node:fs");
+  const { readdirSync: readdirSync2, statSync: statSync2 } = __require("node:fs");
   const out = [];
-  for (const name2 of readdirSync(dir)) {
-    const full = join(dir, name2);
-    const stat = statSync(full);
+  for (const name2 of readdirSync2(dir)) {
+    const full = join2(dir, name2);
+    const stat = statSync2(full);
     if (stat.isDirectory()) out.push(...walk(full));
     else out.push(full);
+  }
+  return out;
+}
+function scanLegacyCwd(cwd, startedAt) {
+  const { readdirSync: readdirSync2, statSync: statSync2 } = __require("node:fs");
+  const out = [];
+  const consider = (full) => {
+    try {
+      if (statSync2(full).mtimeMs < startedAt) out.push(full);
+    } catch {
+    }
+  };
+  try {
+    for (const name2 of readdirSync2(cwd)) {
+      if (!/^g[-_]?\d/.test(name2) && name2 !== "boards") continue;
+      const full = join2(cwd, name2);
+      const stat = statSync2(full);
+      if (stat.isDirectory()) {
+        if (name2 === "boards") {
+          for (const entry of readdirSync2(full)) {
+            const nested = join2(full, entry);
+            try {
+              if (statSync2(nested).isDirectory()) {
+                for (const inner of readdirSync2(nested)) {
+                  if (inner === "FINDINGS.md") consider(join2(nested, inner));
+                }
+              }
+            } catch {
+            }
+          }
+        } else {
+          for (const file of walk(full)) {
+            if (file.endsWith(".md") || file.endsWith(".txt") || file.endsWith(".py") || file.endsWith(".json") || file.endsWith(".html") || file.endsWith(".sh")) consider(file);
+          }
+        }
+      } else {
+        consider(full);
+      }
+    }
+  } catch {
   }
   return out;
 }
@@ -386,6 +448,7 @@ function apply(ctx) {
   const jisi = ctx.get?.("jisi");
   const holder = ctx.hufu;
   let campaign;
+  let campaignId;
   const c = () => {
     if (campaign === void 0) throw new Error("xiaochang: not set up \u2014 call xiaochang_setup first");
     return campaign;
@@ -422,7 +485,7 @@ function apply(ctx) {
         return "xiaochang_setup: BENCHMARK_BASE_URL and BENCHMARK_TOKEN required (args or env)";
       }
       const home = env.DSH_HOME ?? ".";
-      const snapshotPath = join(home, "storages", "xiaochang-run.jsonl");
+      const snapshotPath = join2(home, "storages", "xiaochang-run.jsonl");
       let progress = new RunProgress();
       let startedAt = Date.now();
       if (existsSync(snapshotPath)) {
@@ -441,10 +504,10 @@ function apply(ctx) {
         roundTimeoutMs: (args.roundTimeoutMinutes ?? 30) * 6e4,
         maxHints: args.maxHintsPerChallenge ?? 1,
         vpnGateway: args.vpnGateway ?? "http://10.0.100.58",
-        knowledgeDir: args.knowledgeDir ?? join(home, "storages", "xiaochang-knowledge"),
-        profilePath: args.profilePath ?? join(home, "storages", "xiaochang-profile.md"),
+        knowledgeDir: args.knowledgeDir ?? join2(home, "storages", "xiaochang-knowledge"),
+        profilePath: args.profilePath ?? join2(home, "storages", "xiaochang-profile.md"),
         snapshotPath,
-        auditPath: join(home, "storages", "xiaochang-run-audit.jsonl"),
+        auditPath: join2(home, "storages", "xiaochang-run-audit.jsonl"),
         startedAt,
         adapter: new TsecbenchAdapter({ baseURL, benchmarkToken, vpnGateway: args.vpnGateway ?? "http://10.0.100.58" }, nodeFetch()),
         progress,
@@ -463,12 +526,16 @@ function apply(ctx) {
       } catch {
       }
       state = s;
-      campaign = holder.createCampaign(agent, {
+      const stableId = `tsecbench-run-${args.runId ?? "pending"}`;
+      const swept = sweepLegacyWorkdir(process.cwd(), s.startedAt, `.archive/${stableId}`);
+      const created = holder.createCampaign(agent, {
         concurrency: s.concurrency,
         stallAfterMs: s.roundTimeoutMs + 10 * 6e4,
         heartbeatMs: 15 * 6e4,
         budgetMs: s.budgetMs
-      }, []).campaign;
+      }, [], { id: stableId, boardNamespace: `${args.runId ?? "pending"}` });
+      campaign = created.campaign;
+      campaignId = created.id;
       if (!await s.adapter.gatewayHealthy()) {
         return "xiaochang_setup: VPN gateway not healthy \u2014 connect the run VPN first";
       }
@@ -481,7 +548,7 @@ function apply(ctx) {
         audit(state.auditPath, { type: "heartbeat", at: Date.now() });
       }, 12e4);
       heartbeatTimer.unref?.();
-      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}`;
+      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}, campaign=${created.id}, swept=${swept}`;
     }
   }));
   register(defineTool({
@@ -501,6 +568,13 @@ function apply(ctx) {
             localFiles.push({ file, text: readFileSync(file, "utf8") });
           } catch {
           }
+        }
+      }
+      const legacyWorkdirFiles = scanLegacyCwd(process.cwd(), s.startedAt);
+      for (const file of legacyWorkdirFiles) {
+        try {
+          localFiles.push({ file, text: readFileSync(file, "utf8") });
+        } catch {
         }
       }
       for (const ch of fresh) {
@@ -813,6 +887,7 @@ ${text}`;
         s.progress.update(ch.unique_code, { containerClosed: true });
       }
       persistProgress(s);
+      if (campaignId !== void 0) holder.finish?.(campaignId);
       const final = await s.adapter.listChallenges();
       const score = s.adapter.scoreOf(final);
       const allTerminal = final.every((ch) => ch.is_completed || ["failed", "skipped"].includes(s.progress.get(ch.unique_code)?.state ?? ""));
