@@ -481,7 +481,7 @@ function apply(ctx) {
         return "xiaochang_setup: BENCHMARK_BASE_URL and BENCHMARK_TOKEN required (args or env)";
       }
       const home = env.DSH_HOME ?? ".";
-      const snapshotPath = join2(home, "storages", "xiaochang-run.jsonl");
+      const snapshotPath = join2(home, "storages", `xiaochang-run-${args.runId ?? "pending"}.jsonl`);
       let progress = new RunProgress();
       let startedAt = Date.now();
       if (existsSync(snapshotPath)) {
@@ -524,21 +524,23 @@ function apply(ctx) {
       state = s;
       const stableId = `tsecbench-run-${args.runId ?? "pending"}`;
       const swept = sweepLegacyWorkdir(process.cwd(), s.startedAt, `.archive/${stableId}`);
-      const created = holder.createCampaign(agent, {
-        concurrency: s.concurrency,
-        stallAfterMs: s.roundTimeoutMs + 10 * 6e4,
-        heartbeatMs: 15 * 6e4,
-        budgetMs: s.budgetMs
-      }, [], { id: stableId, boardNamespace: `${args.runId ?? "pending"}` });
-      campaign = created.campaign;
-      campaignId = created.id;
       if (!await s.adapter.gatewayHealthy()) {
-        return "xiaochang_setup: VPN gateway not healthy \u2014 connect the run VPN first";
+        return "xiaochang_setup: VPN gateway not healthy \u2014 connect the run VPN first (nothing registered; safe to retry)";
       }
       const fresh = await s.adapter.listChallenges();
       for (const ch of fresh) s.challenges.set(ch.unique_code, ch);
+      if (campaign === void 0) {
+        const created = holder.createCampaign(agent, {
+          concurrency: s.concurrency,
+          stallAfterMs: s.roundTimeoutMs + 10 * 6e4,
+          heartbeatMs: 15 * 6e4,
+          budgetMs: s.budgetMs
+        }, [], { id: stableId, boardNamespace: `${args.runId ?? "pending"}` });
+        campaign = created.campaign;
+        campaignId = created.id;
+      }
       persistProgress(s);
-      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}, campaign=${created.id}, swept=${swept}`;
+      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}`;
     }
   }));
   register(defineTool({

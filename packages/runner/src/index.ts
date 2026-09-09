@@ -271,7 +271,9 @@ export function apply(ctx: Context): void {
         return 'xiaochang_setup: BENCHMARK_BASE_URL and BENCHMARK_TOKEN required (args or env)'
       }
       const home = env.DSH_HOME ?? '.'
-      const snapshotPath = join(home, 'storages', 'xiaochang-run.jsonl')
+      // F24 按 run 隔离进度快照：跨 run 共用单一文件会把上一 run 的进度/画像
+      // 恢复进新 run（run 8 实锤：setup 恢复出 run 7 的"全 40 题已完成"假进度）。
+      const snapshotPath = join(home, 'storages', `xiaochang-run-${args.runId ?? 'pending'}.jsonl`)
       // 恢复：快照存在则续跑（预算起点沿用首条快照时间）。
       let progress = new RunProgress()
       let startedAt = Date.now()
@@ -317,21 +319,27 @@ export function apply(ctx: Context): void {
       // F5/F6 机制化：pre-run sweep——把早于本 run 开始时间的题号工件与旧 run 战报
       // 移入 cwd/.archive/<campaignId>/（靠配置隔离，不靠手工清扫）。
       const swept = sweepLegacyWorkdir(process.cwd(), s.startedAt, `.archive/${stableId}`)
-      const created = holder.createCampaign(agent, {
-        concurrency: s.concurrency,
-        stallAfterMs: s.roundTimeoutMs + 10 * 60_000,
-        heartbeatMs: 15 * 60_000,
-        budgetMs: s.budgetMs,
-      }, [], { id: stableId, boardNamespace: `${args.runId ?? 'pending'}` })
-      campaign = created.campaign
-      campaignId = created.id
+      // F25：VPN 健康检查必须在注册战役之前——否则 setup 失败重试会撞
+      // "campaign id already registered"（run 8 实锤：首调在 VPN 起来前注册了空战役，
+      // 二调直接报错无法恢复）。检查不通过时什么都不注册，随时可安全重试。
       if (!(await s.adapter.gatewayHealthy())) {
-        return 'xiaochang_setup: VPN gateway not healthy — connect the run VPN first'
+        return 'xiaochang_setup: VPN gateway not healthy — connect the run VPN first (nothing registered; safe to retry)'
       }
       const fresh = await s.adapter.listChallenges()
       for (const ch of fresh) s.challenges.set(ch.unique_code, ch)
+      // F25b：同进程幂等——进程内重复 setup 复用已建战役，不二次注册。
+      if (campaign === undefined) {
+        const created = holder.createCampaign(agent, {
+          concurrency: s.concurrency,
+          stallAfterMs: s.roundTimeoutMs + 10 * 60_000,
+          heartbeatMs: 15 * 60_000,
+          budgetMs: s.budgetMs,
+        }, [], { id: stableId, boardNamespace: `${args.runId ?? 'pending'}` })
+        campaign = created.campaign
+        campaignId = created.id
+      }
       persistProgress(s)
-      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}, campaign=${created.id}, swept=${swept}`
+      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}`
     },
   }))
 

@@ -54,7 +54,7 @@
 
 ## 崩溃恢复
 
-- 进度快照：`$DSH_HOME/storages/xiaochang-run.jsonl`（追加 JSONL，容错恢复取最近可解析行）。
+- 进度快照：`$DSH_HOME/storages/xiaochang-run-<runId>.jsonl`（按 run 隔离，追加 JSONL，容错恢复取最近可解析行）。
 - 审计轨迹：`$DSH_HOME/storages/xiaochang-run-audit.jsonl`（派单/终态/限流重试）。
 - 进程死后再调一次 `xiaochang_start`：从快照恢复、清残留容器、继续未完成题目；
   丢掉的只是正在跑的那一轮（记账轮次 +1 重派）。
