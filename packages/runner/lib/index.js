@@ -597,6 +597,8 @@ ${rows.join("\n")}`;
     isConcurrencySafe: () => false,
     async execute(args) {
       const s = requireState();
+      const fresh0 = await s.adapter.listChallenges();
+      for (const x of fresh0) s.challenges.set(x.unique_code, x);
       const ch = s.challenges.get(args.code);
       if (ch === void 0) return `xiaochang_start_container: unknown challenge ${args.code}`;
       if (ch.container_status === "available" && ch.container_addr.length > 0) {

@@ -396,6 +396,10 @@ export function apply(ctx: Context): void {
     isConcurrencySafe: () => false,
     async execute(args: { code: string }) {
       const s = requireState()
+      // F27：开容器前先刷新平台状态——close 后平台异步更新，本地缓存会误判
+      // "cap reached"（run 8 实测：平台已全停，本地 openContainers 仍记 3 个）。
+      const fresh0 = await s.adapter.listChallenges()
+      for (const x of fresh0) s.challenges.set(x.unique_code, x)
       const ch = s.challenges.get(args.code)
       if (ch === undefined) return `xiaochang_start_container: unknown challenge ${args.code}`
       if (ch.container_status === 'available' && ch.container_addr.length > 0) {
