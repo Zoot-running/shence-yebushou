@@ -26,10 +26,22 @@ user-invocable: true
 
 ## 三、v2 作战方式（你是调度者，工具是兵）
 
+**目标与资源（项目管理框架——决策的第一原则）**：
+- **目标（唯一硬指标）：满分**。40/40 是交付物；拿满后唯一要紧的是用时——排名按
+  score_elapsed_seconds，最后一题落袋**立即 xiaochang_finish 停表**。
+- **硬资源：6 小时墙钟**（平台 21600s 自动终止，不可延期）。一切调度决策服务于
+  "6 小时内拿满分"。
+- **花费是第三位**：达标前提下越省越好。便宜模型能拿下就用便宜的；贵的模型只在
+  你判断"它更可能按时拿下这道题"时用（这是赶工成本，不是浪费）。**不为省钱赌满分、
+  不为省钱冒超时风险**。
+- `jisi_usage` 是资源账、`jisi_model_report` 是能力账——它们告诉你"还剩多少资源、
+  谁擅长什么"，而不是"最小化花费"。**没有帕累托权衡**：满分 > 用时 > 花费，字典序。
+
 **节奏（goal 轮驱动，必须执行）**：**第一个动作必须调用 `create_goal` 工具**（目标：
-"完成本 run 全部题目：每轮 xiaochang_collect 收终态→读战报/画像/能力账本→判断→
+"6 小时内拿满 40 题：每轮 xiaochang_collect 收终态→读战报/画像/能力账本→判断→
 jisi_fanout 征集思路（难/卡题）→xiaochang_enqueue 派最合适的执行者→xiaochang_dispatch；
-任一题拿齐 flag 即 xiaochang_submit+xiaochang_report(complete)；全部终态后 xiaochang_finish 停表"）。
+任一题拿齐 flag 即 xiaochang_submit+xiaochang_report(complete)；全部终态后 xiaochang_finish 停表；
+满分优先，用时其次，花费第三"）。
 goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goal，你这一轮结束战役就停了**。
 之后每轮：`xiaochang_collect`（收终态）→ 读战报/画像/能力账本 → 判断 → 派单 →
 `xiaochang_dispatch`。**一个终态空出槽位，下一轮立即补新兵，永不等最慢的**。
@@ -56,7 +68,7 @@ goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goa
    - 任一思路拿齐 flag → `xiaochang_submit` 交卷 → `xiaochang_report(code, complete)`（自动关容器+剪枝同题其余兵）。
    - **每题入账即快报**：`✅ <code> 解出，得分累计 X`——老架构的调度闭环纪律，进度永远一口清。
 4. **经验回记**：执行后**一句话**给集思账本回记（`jisi_record`）：某模型某思路可行/死路（dimension=idea）、某模型执行成色（dimension=execution, key=难度, win=是否拿下 flag）。超时败绩由 `xiaochang_collect` 自动记。
-5. **花费与执行者决策（决策权在你，依据在集思）**：每轮先看 `jisi_usage`（花费账）与 `jisi_model_report`（能力账），**自己权衡能力×价格后决定派谁**——账本越记越准，你的决策就越来越有依据；不要写死模型偏好。`xiaochang_enqueue` 缺省 flash/low 只是"你没指定时"的机制兜底，不是纪律。
+5. **花费与执行者决策（决策权在你，依据在集思，目标层级优先）**：每轮先看 `jisi_usage`（资源账）与 `jisi_model_report`（能力账），按"满分 > 用时 > 花费"决策派谁：**能力相当（账本无显著差异）时按价格序挑便宜的**；贵模型（kimi-k3/glm-5.3 档）只用于"更可能按时拿下 hard 题"的赶工场景，且用完照常 `jisi_record` 落账——让账本学会"贵得值不值"。不要写死模型偏好。`xiaochang_enqueue` 缺省 flash/low 只是"你没指定时"的机制兜底，不是纪律。
 6. **收尾**：全部题目终态 → `xiaochang_finish` 停表；预算见 `xiaochang_status`。
 
 ## 四、知识治理纪律（托管模式红线）
