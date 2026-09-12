@@ -456,7 +456,7 @@ function apply(ctx) {
     parameters: {
       baseURL: { type: "string", description: "BENCHMARK_BASE_URL (defaults to env)." },
       benchmarkToken: { type: "string", description: "BENCHMARK_TOKEN (defaults to env)." },
-      runBearerToken: { type: "string", description: "Platform session Bearer token for early finish (stop the ranking clock)." },
+      runBearerToken: { type: "string", description: "Platform session Bearer token for early finish (stop the ranking clock). Falls back to env RUN_BEARER_TOKEN \u2014 but pass it explicitly when the order gives it (env fallback only saves you if omitted)." },
       runId: { type: "number", description: "Platform run id." },
       concurrency: { type: "number", description: "Campaign slots. Default 999 (no artificial threshold; backpressure = CPU/RAM/provider limits only)." },
       budgetMinutes: { type: "number", description: "Wall-clock budget. Default 330." },
@@ -493,7 +493,10 @@ function apply(ctx) {
       const s = {
         baseURL,
         benchmarkToken,
-        runBearerToken: args.runBearerToken,
+        // run 11 实锤：开战令写"工具会从进程环境读取"，但旧实现 runBearerToken 无 env 回退，
+        // agent 省略传参 → finish 静默跳过平台停表 → 排名钟空转。补 env 回退（launch 脚本
+        // 导出 RUN_BEARER_TOKEN；沙箱只挡 agent 的 bash 视图，插件进程 env 可见）。
+        runBearerToken: args.runBearerToken ?? env.RUN_BEARER_TOKEN,
         runId: args.runId,
         concurrency: args.concurrency ?? 999,
         budgetMs: (args.budgetMinutes ?? 330) * 6e4,
@@ -885,18 +888,25 @@ ${text}`;
       const final = await s.adapter.listChallenges();
       const score = s.adapter.scoreOf(final);
       const allTerminal = final.every((ch) => ch.is_completed || ["failed", "skipped"].includes(s.progress.get(ch.unique_code)?.state ?? ""));
-      if (allTerminal && s.runBearerToken !== void 0 && s.runId !== void 0) {
+      let clock;
+      if (s.runBearerToken === void 0 || s.runId === void 0) {
+        clock = "\u26A0\uFE0F \u5E73\u53F0\u505C\u8868\u672A\u6267\u884C\uFF08\u6392\u540D\u949F\u4ECD\u5728\u8D70\uFF09\uFF1A\u7F3A runBearerToken/runId\u3002\u8BF7\u8865\u8C03 xiaochang_setup \u4F20\u5165 runId+runBearerToken\uFF08\u6216 env RUN_BEARER_TOKEN\uFF09\u540E\u91CD\u8BD5 xiaochang_finish";
+      } else if (!allTerminal) {
+        clock = "\u2139\uFE0F \u5B58\u5728\u975E\u7EC8\u6001\u9898\uFF0C\u672A\u8C03\u5E73\u53F0\u505C\u8868";
+      } else {
         try {
           const res = await fetch(`${s.baseURL}/api/v1/runs/${s.runId}/finish`, {
             method: "POST",
             headers: { authorization: `Bearer ${s.runBearerToken}` }
           });
           if (!res.ok) throw new Error(`finish ${res.status}`);
+          clock = "\u2705 \u5E73\u53F0\u505C\u8868\u5DF2\u786E\u8BA4\uFF08HTTP 200\uFF09";
         } catch (error) {
-          console.error(`xiaochang: finishRun failed: ${String(error)}`);
+          clock = `\u26A0\uFE0F \u5E73\u53F0\u505C\u8868\u8C03\u7528\u5931\u8D25\uFF1A${String(error)} \u2014\u2014 \u6392\u540D\u949F\u4ECD\u5728\u8D70\uFF0C\u8BF7\u91CD\u8BD5 xiaochang_finish`;
         }
       }
-      return `xiaochang_finish: score=${score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ", ALL TERMINAL" : ""})`;
+      return `xiaochang_finish: score=${score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ", ALL TERMINAL" : ""})
+\u6392\u540D\u949F\uFF1A${clock}`;
     }
   }));
 }

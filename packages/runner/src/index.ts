@@ -246,7 +246,7 @@ export function apply(ctx: Context): void {
     parameters: {
       baseURL: { type: 'string', description: 'BENCHMARK_BASE_URL (defaults to env).' },
       benchmarkToken: { type: 'string', description: 'BENCHMARK_TOKEN (defaults to env).' },
-      runBearerToken: { type: 'string', description: 'Platform session Bearer token for early finish (stop the ranking clock).' },
+      runBearerToken: { type: 'string', description: 'Platform session Bearer token for early finish (stop the ranking clock). Falls back to env RUN_BEARER_TOKEN — but pass it explicitly when the order gives it (env fallback only saves you if omitted).' },
       runId: { type: 'number', description: 'Platform run id.' },
       concurrency: { type: 'number', description: 'Campaign slots. Default 999 (no artificial threshold; backpressure = CPU/RAM/provider limits only).' },
       budgetMinutes: { type: 'number', description: 'Wall-clock budget. Default 330.' },
@@ -286,7 +286,10 @@ export function apply(ctx: Context): void {
       const s: CampaignState = {
         baseURL,
         benchmarkToken,
-        runBearerToken: args.runBearerToken,
+        // run 11 实锤：开战令写"工具会从进程环境读取"，但旧实现 runBearerToken 无 env 回退，
+        // agent 省略传参 → finish 静默跳过平台停表 → 排名钟空转。补 env 回退（launch 脚本
+        // 导出 RUN_BEARER_TOKEN；沙箱只挡 agent 的 bash 视图，插件进程 env 可见）。
+        runBearerToken: args.runBearerToken ?? env.RUN_BEARER_TOKEN,
         runId: args.runId,
         concurrency: args.concurrency ?? 999,
         budgetMs: (args.budgetMinutes ?? 330) * 60_000,
@@ -701,18 +704,27 @@ export function apply(ctx: Context): void {
       const final = await s.adapter.listChallenges()
       const score = s.adapter.scoreOf(final)
       const allTerminal = final.every(ch => ch.is_completed || ['failed', 'skipped'].includes(s.progress.get(ch.unique_code)?.state ?? ''))
-      if (allTerminal && s.runBearerToken !== undefined && s.runId !== undefined) {
+      // run 11 实锤（F28）：旧实现平台停表失败/缺参时静默吞掉、工具仍返回成功，
+      // agent 误报 "clock stopped"，排名钟空转 ~5 分钟靠值守方补调才停。
+      // 新规：停表结果必须在返回值里大声报告——绝不静默成功，也绝不在没停表时报停表。
+      let clock: string
+      if (s.runBearerToken === undefined || s.runId === undefined) {
+        clock = '⚠️ 平台停表未执行（排名钟仍在走）：缺 runBearerToken/runId。请补调 xiaochang_setup 传入 runId+runBearerToken（或 env RUN_BEARER_TOKEN）后重试 xiaochang_finish'
+      } else if (!allTerminal) {
+        clock = 'ℹ️ 存在非终态题，未调平台停表'
+      } else {
         try {
           const res = await fetch(`${s.baseURL}/api/v1/runs/${s.runId}/finish`, {
             method: 'POST',
             headers: { authorization: `Bearer ${s.runBearerToken}` },
           })
           if (!res.ok) throw new Error(`finish ${res.status}`)
+          clock = '✅ 平台停表已确认（HTTP 200）'
         } catch (error) {
-          console.error(`xiaochang: finishRun failed: ${String(error)}`)
+          clock = `⚠️ 平台停表调用失败：${String(error)} —— 排名钟仍在走，请重试 xiaochang_finish`
         }
       }
-      return `xiaochang_finish: score=${score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ', ALL TERMINAL' : ''})`
+      return `xiaochang_finish: score=${score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ', ALL TERMINAL' : ''})\n排名钟：${clock}`
     },
   }))
 }
