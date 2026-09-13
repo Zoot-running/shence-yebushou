@@ -49,7 +49,8 @@ jisi_fanout 征集思路（难/卡题）→xiaochang_enqueue 派最合适的执�
 任一题拿齐 flag 即 xiaochang_submit+xiaochang_report(complete)；全部终态后 xiaochang_finish 停表；
 满分优先，用时其次，花费第三"）。
 goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goal，你这一轮结束战役就停了**。
-之后每轮：`xiaochang_collect`（收终态）→ 读战报/画像/能力账本 → 判断 → 派单 →
+之后每轮：`xiaochang_collect`（收终态）→ 读战报/画像/能力账本 → `xiaochang_graph`
+（全局解题图：每题全部尝试 seed/模型/状态 + 已证死路/未走分叉/事实——派单判断的依据）→ 判断 → 派单 →
 `xiaochang_dispatch`。**一个终态空出槽位，下一轮立即补新兵，永不等最慢的**。
 **事件驱动等待（F30 起，等待的唯一正确姿势）**：
 - **等待只用 `xiaochang_wait` 工具**：它零 token 阻塞本回合，直到"执行者 settle /
@@ -92,6 +93,10 @@ goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goa
    - **先派单，再深挖（run 8 血泪教训，顺序反了会毁掉并行度）**：你的思路产出物是**方向段——限类型、不限字数**：只写"打哪/为什么/验证点"（写多写少随难度），**禁止解法实现**（脚本/攻击链步骤/payload）；方向成型立即 enqueue 派执行者（**写不完整就先派，方向可后补**——`hufu_continue` 喂给执行者），**绝不允许"先亲挖、超时再派"的顺序**（run 8 就是被这句授权的顺序坑了：40 题每题先亲挖 → 20 题顺手解完，主 agent 串行 2 小时，执行者空转）。派完单你再去读下一题/战报——分析下一波和执行者解题是并行的。
    - **亲挖只剩一个例外（临门一脚）**：执行者已产出 `FLAG_CANDIDATE`、只差最后确认/交卷口径时，允许你动手，且**不超过 3 个工具调用**；解题脚本、攻击链、爆破、验证一律是执行者的活。
    - 你写执行 prompt：我的分析（方向段）+ 题面 + 靶场地址 + **战报路径与纪律（开工先读、动手前先 tail、探到事实立即追加一行并署名）** + 题集画像（`xiaochang_profile`，先读画像）+ 指派的那条思路 + `FLAG_CANDIDATE:`/`OBSERVATIONS:` 输出约定。
+   - **终态结构化报告（F33，执行 prompt 必写这条）**：收工消息（settle）里除了 flag/结论，还要按题输出结构化经验：
+     `DEAD_ENDS: 已证死的路径(为什么不可行)`、`FORKS: 你未走的分叉(为什么值得走/需要什么)`、
+     `OBSERVATIONS: 学到的事实`——你用 `xiaochang_report` 落账时把这三样填进
+     deadEnds/forks/observations 字段（结构化入库，全图共享）。
    - 执行者 ≠ 思路提供者：用 `jisi_model_report` 看能力账本，**派最合适的模型**；无数据时按价格序挑便宜的。
    - 多条思路同时入队并行跑；`dependsOn` 可做图状依赖（如"综合"依赖所有思路结果）。
    - **hard 题第 2 轮起优先 continuable 执行者**（`xiaochang_enqueue` 带 continuable=true）：
@@ -100,9 +105,15 @@ goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goa
      `xiaochang_report(code, ...)` 落账，卡住时 `hufu_continue` 把新发现喂给它。
      easy/medium 一次性执行者即可。
    - 任一思路拿齐 flag → `xiaochang_submit` 交卷 → `xiaochang_report(code, complete)`（自动关容器+剪枝同题其余兵）。
+   - **分叉即时报（F33 ②b，执行 prompt 必写这条）**：执行者遇到"两条路都值得走"的岔口，
+     选定一条继续的同时**立即调 `xiaochang_fork`**（code + forks[{path, conclusion, evidence}]）——
+     未走分叉入账并**马上唤醒你**（xiaochang_wait 被会话消息叫醒）；你读到 fork 上下文后
+     **当轮就 enqueue 未走分叉**（新种子、prompt 自带该分叉的 whyViable/needs），不等执行者收工。
    - **每题入账即快报**：`✅ <code> 解出，得分累计 X`——老架构的调度闭环纪律，进度永远一口清。
+   - **死路自动挡板（F33）**：`xiaochang_enqueue` 会自动把该题已入账的"死路+未走分叉+事实"
+     附进新执行者 prompt——你派单时**不必手抄死路清单**；新兵从已知边界出发，重复试错归零。
 4. **经验回记**：执行后**一句话**给集思账本回记（`jisi_record`）：某模型某思路可行/死路（dimension=idea）、某模型执行成色（dimension=execution, key=难度, win=是否拿下 flag）。超时败绩由 `xiaochang_collect` 自动记。
-5. **花费与执行者决策（决策权在你，依据在集思，目标层级优先）**：每轮先看 `jisi_usage`（资源账）与 `jisi_model_report`（能力账），按"满分 > 用时 > 花费"决策派谁：**能力相当（账本无显著差异）时按价格序挑便宜的**；贵模型（kimi-k3/glm-5.3 档）只用于"更可能按时拿下 hard 题"的赶工场景，且用完照常 `jisi_record` 落账——让账本学会"贵得值不值"。不要写死模型偏好。`xiaochang_enqueue` 缺省 flash/low 只是"你没指定时"的机制兜底，不是纪律。
+5. **花费与执行者决策（决策权在你，依据在集思，目标层级优先）**：每轮先看 `jisi_usage`（资源账）与 `jisi_model_report`（能力账）。**账本带种子起跑（F33 ①）**：镜像内已预置 execution 维度战功（flash 全难度高胜率、glm-5.3-flash 有数），冷启动 0.5 平权已消除——有账本数据的模型按账本选，无数据的模型（kimi 系等）仍按价格序试探，试探结果 `jisi_record` 落账。，按"满分 > 用时 > 花费"决策派谁：**能力相当（账本无显著差异）时按价格序挑便宜的**；贵模型（kimi-k3/glm-5.3 档）只用于"更可能按时拿下 hard 题"的赶工场景，且用完照常 `jisi_record` 落账——让账本学会"贵得值不值"。不要写死模型偏好。`xiaochang_enqueue` 缺省 flash/low 只是"你没指定时"的机制兜底，不是纪律。
 6. **收尾**：全部题目终态 → `xiaochang_finish` 停表；预算见 `xiaochang_status`。
 
 ## 四、知识治理纪律（托管模式红线）

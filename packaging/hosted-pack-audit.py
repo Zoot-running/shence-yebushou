@@ -78,11 +78,49 @@ def scan_file(full_path: str, rel_path: str, violations: list) -> None:
             violations.append({"file": rel_path, "rule": rule["name"], "sample": m.group(0)[:80]})
 
 
+def validate_seed(full_path: str, rel: str) -> list:
+    """F33 ① 种子结构校验: 只允许 models[].dimensions.execution(规则 6 审计豁免的边界)。"""
+    try:
+        with open(full_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        return [{"file": rel, "rule": "seed-invalid-json", "sample": str(exc)[:80]}]
+    if not isinstance(data, dict) or not isinstance(data.get("models"), dict):
+        return [{"file": rel, "rule": "seed-bad-structure", "sample": "missing models object"}]
+    violations = []
+    for name, m in data["models"].items():
+        dims = (m or {}).get("dimensions") if isinstance(m, dict) else None
+        if not isinstance(dims, dict):
+            violations.append({"file": rel, "rule": "seed-bad-structure", "sample": f"{name}: no dimensions"})
+            continue
+        extra = set(dims) - {"execution"}
+        if extra:
+            violations.append({"file": rel, "rule": "seed-forbidden-dimension", "sample": f"{name}: {sorted(extra)}"})
+    return violations
+
+
 def scan_tree(root: str) -> list:
     violations: list = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for d in list(dirnames):
+            if d == "storages":
+                # F33 ① 例外: storages 只允许 jisi-model-ledger.seed.json(结构校验), 其余全阻断。
+                storages_dir = os.path.join(dirpath, d)
+                try:
+                    entries = os.listdir(storages_dir)
+                except OSError:
+                    entries = []
+                for sfn in entries:
+                    sp = os.path.join(storages_dir, sfn)
+                    srel = os.path.relpath(sp, root).replace(os.sep, "/")
+                    if os.path.isfile(sp) and sfn == "jisi-model-ledger.seed.json":
+                        violations.extend(validate_seed(sp, srel))
+                        scan_file(sp, srel, violations)
+                    else:
+                        violations.append({"file": srel, "rule": "denied-path", "sample": f"storages/{sfn}"})
+                dirnames.remove(d)
+                continue
             if any(p in d for p in PATH_DENY):
                 violations.append(
                     {"file": os.path.join(dirpath, d), "rule": "denied-path", "sample": d}
@@ -93,6 +131,10 @@ def scan_tree(root: str) -> list:
             rel = os.path.relpath(full, root)
             if any(p in rel.replace(os.sep, "/") for p in PATH_DENY):
                 violations.append({"file": rel.replace(os.sep, "/"), "rule": "denied-path", "sample": rel})
+                continue
+            if fn == "jisi-model-ledger.seed.json":
+                violations.extend(validate_seed(full, rel.replace(os.sep, "/")))
+                scan_file(full, rel.replace(os.sep, "/"), violations)
                 continue
             if any(rx.match(fn) for rx in FILENAME_DENY):
                 violations.append({"file": rel.replace(os.sep, "/"), "rule": "denied-filename", "sample": fn})
@@ -108,6 +150,13 @@ SELF_TEST_FIXTURES = {
     "bad/keys.txt": "sk-abcdefghijklmnopqrst",
     "bad/hosted-priors.md": "机制先验内容",
     "bad/run9-order.txt": "BENCHMARK_TOKEN=69c960a7-ca0f-467e-9fbf-76591e164b92",
+    "good/storages/jisi-model-ledger.seed.json": json.dumps(
+        {"models": {"m1": {"dimensions": {"execution": {"easy": {"attempts": 3, "wins": 3}}}}}}
+    ),
+    "bad2/storages/jisi-model-ledger.seed.json": json.dumps(
+        {"models": {"m1": {"dimensions": {"execution": {}, "idea": {"x": {"attempts": 1, "wins": 1}}}}}}
+    ),
+    "bad2/storages/other.json": "should be denied",
 }
 
 
@@ -127,6 +176,8 @@ def self_test() -> int:
             ("bad/keys.txt", "api-key-sk"),
             ("bad/hosted-priors.md", "denied-path"),
             ("bad/run9-order.txt", "denied-filename"),
+            ("bad2/storages/jisi-model-ledger.seed.json", "seed-forbidden-dimension"),
+            ("bad2/storages/other.json", "denied-path"),
         }
         if want <= got:
             print(f"self-test PASS ({len(violations)} violations)")
