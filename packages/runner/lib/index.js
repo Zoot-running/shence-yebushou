@@ -924,11 +924,13 @@ ${text}`;
   }));
   register(defineTool({
     name: "xiaochang_finish",
-    description: "Close all open containers, stop the ranking clock via the platform finish endpoint (when all challenges are terminal or you decide to end), and return the final platform score.",
-    parameters: {},
+    description: "Close all open containers, stop the ranking clock via the platform finish endpoint (when all challenges are terminal or you decide to end), and return the final platform score. force=true writes the hosted-guard marker even when not all-terminal (verification/early-stop runs only \u2014 the formal campaign must reach all-terminal).",
+    parameters: {
+      force: { type: "boolean", description: "Write the guard stand-down marker even if not all-terminal. For verification/emergency runs only." }
+    },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
-    async execute() {
+    async execute(args) {
       const s = requireState();
       for (const ch of s.challenges.values()) {
         if (ch.container_status === "available" || ch.container_status === "pending") {
@@ -945,7 +947,7 @@ ${text}`;
       const score = s.adapter.scoreOf(final);
       const allTerminal = final.every((ch) => ch.is_completed || ["failed", "skipped"].includes(s.progress.get(ch.unique_code)?.state ?? ""));
       let guardMarker = "";
-      if (allTerminal) {
+      if (allTerminal || args.force === true) {
         try {
           const markerPath = process.env.GUARD_MARKER ?? join2(process.cwd(), ".campaign-finished");
           writeFileSync(markerPath, JSON.stringify({ at: Date.now(), score: score.score, max: score.max, completed: score.completed }));

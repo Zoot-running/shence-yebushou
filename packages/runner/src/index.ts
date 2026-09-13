@@ -734,11 +734,13 @@ export function apply(ctx: Context): void {
   register(defineTool({
     name: 'xiaochang_finish',
     description:
-      'Close all open containers, stop the ranking clock via the platform finish endpoint (when all challenges are terminal or you decide to end), and return the final platform score.',
-    parameters: {},
+      'Close all open containers, stop the ranking clock via the platform finish endpoint (when all challenges are terminal or you decide to end), and return the final platform score. force=true writes the hosted-guard marker even when not all-terminal (verification/early-stop runs only — the formal campaign must reach all-terminal).',
+    parameters: {
+      force: { type: 'boolean', description: 'Write the guard stand-down marker even if not all-terminal. For verification/emergency runs only.' },
+    },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute() {
+    async execute(args: { force?: boolean }) {
       const s = requireState()
       for (const ch of s.challenges.values()) {
         if (ch.container_status === 'available' || ch.container_status === 'pending') {
@@ -755,7 +757,7 @@ export function apply(ctx: Context): void {
       // F30 托管守卫标记：全终态才算战役完成——hosted-guard 见到标记才 standing down
       // （没打完的局, driver 怎么退都会被 guard 重拉; 停表条款由此机制化）。
       let guardMarker = ''
-      if (allTerminal) {
+      if (allTerminal || args.force === true) {
         try {
           const markerPath = process.env.GUARD_MARKER ?? join(process.cwd(), '.campaign-finished')
           writeFileSync(markerPath, JSON.stringify({ at: Date.now(), score: score.score, max: score.max, completed: score.completed }))
