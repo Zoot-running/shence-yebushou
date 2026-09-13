@@ -1,5 +1,5 @@
 // src/index.ts
-import { existsSync, mkdirSync as mkdirSync2, readFileSync, readdirSync as readdirSync2, statSync as statSync2, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, mkdirSync as mkdirSync2, readFileSync, readdirSync as readdirSync2, renameSync as renameSync2, statSync as statSync2, writeFileSync, appendFileSync } from "node:fs";
 import { join as join2 } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -451,14 +451,54 @@ function apply(ctx) {
     if (campaign === void 0) throw new Error("xiaochang: not set up \u2014 call xiaochang_setup first");
     return campaign;
   };
-  function knowledgeOfCode(code) {
-    if (campaign === void 0) return [];
+  const forkInboxDir = () => join2(process.env.DSH_HOME ?? ".", "storages", "xiaochang-fork-inbox");
+  function readForkInbox(code) {
+    const p = join2(forkInboxDir(), `${code}.jsonl`);
+    if (!existsSync(p)) return [];
     const out = [];
-    for (const v of campaign.ledger.views()) {
-      if (codeOf(v.item.id) !== code) continue;
-      const k = campaign.knowledgeOf?.(v.item.id) ?? [];
-      out.push(...k);
+    for (const line of readFileSync(p, "utf8").split("\n")) {
+      if (line.trim() === "") continue;
+      try {
+        out.push(JSON.parse(line));
+      } catch {
+      }
     }
+    return out;
+  }
+  function writeForkInbox(code, entries) {
+    mkdirSync2(forkInboxDir(), { recursive: true });
+    const p = join2(forkInboxDir(), `${code}.jsonl`);
+    appendFileSync(p, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    return p;
+  }
+  function absorbForkInbox(code) {
+    const p = join2(forkInboxDir(), `${code}.jsonl`);
+    if (!existsSync(p)) return;
+    const entries = readForkInbox(code);
+    if (entries.length > 0) {
+      for (const v of campaign?.ledger.views() ?? []) {
+        if (codeOf(v.item.id) !== code) continue;
+        try {
+          holder.recordKnowledge?.(campaignId ?? "", v.item.id, entries);
+        } catch {
+        }
+      }
+    }
+    try {
+      renameSync2(p, `${p}.absorbed-${Date.now()}`);
+    } catch {
+    }
+  }
+  function knowledgeOfCode(code) {
+    const out = [];
+    if (campaign !== void 0) {
+      for (const v of campaign.ledger.views()) {
+        if (codeOf(v.item.id) !== code) continue;
+        const k = campaign.knowledgeOf?.(v.item.id) ?? [];
+        out.push(...k);
+      }
+    }
+    out.push(...readForkInbox(code));
     return out;
   }
   function recordKnowledgeOnCode(code, entries) {
@@ -916,20 +956,25 @@ ${text}`;
     async execute(args) {
       if (args.forks.length === 0) return "xiaochang_fork: no forks given";
       const entries = args.forks.map((f) => ({ kind: "fork", path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: "fork", at: Date.now() }));
-      let recorded = false;
+      const lines = entries.map((f) => `- \u{1F500} ${f.path}${f.conclusion !== void 0 ? " \u2192 " + f.conclusion : ""}${f.evidence !== void 0 ? " (\u8BC1\u636E: " + f.evidence + ")" : ""}`);
+      let inbox = "";
       try {
-        recordKnowledgeOnCode(args.code, entries);
-        recorded = true;
+        inbox = writeForkInbox(args.code, entries);
       } catch {
       }
-      const lines = entries.map((f) => `- \u{1F500} ${f.path}${f.conclusion !== void 0 ? " \u2192 " + f.conclusion : ""}${f.evidence !== void 0 ? " (\u8BC1\u636E: " + f.evidence + ")" : ""}`);
-      const notified = parentAgent !== void 0;
-      parentAgent?.followup(createUserMessage({
-        content: [{ type: "text", text: `\u{1F500} \u5206\u53C9\u5373\u65F6\u62A5(\u6267\u884C\u8005 ${args.code}): \u53D1\u73B0 ${entries.length} \u6761\u672A\u8D70\u5206\u53C9, \u5DF2\u5165\u8D26(\u5168\u5C40\u89E3\u9898\u56FE)\u3002\u7531\u4F60(\u4E3B agent)\u51B3\u5B9A\u662F\u5426 jisi_fanout_bulk / xiaochang_enqueue \u589E\u5175\u3002
+      try {
+        recordKnowledgeOnCode(args.code, entries);
+      } catch {
+      }
+      const sameProcess = parentAgent !== void 0 && campaign !== void 0;
+      if (sameProcess) {
+        parentAgent?.followup(createUserMessage({
+          content: [{ type: "text", text: `\u{1F500} \u5206\u53C9\u5373\u65F6\u62A5(${args.code}): \u53D1\u73B0 ${entries.length} \u6761\u672A\u8D70\u5206\u53C9, \u5DF2\u5165\u8D26+\u4FE1\u7BB1\u3002\u7531\u4F60(\u4E3B agent)\u51B3\u5B9A\u662F\u5426 jisi_fanout_bulk / xiaochang_enqueue \u589E\u5175\u3002
 ${lines.join("\n")}` }],
-        source: { kind: "user" }
-      }));
-      return `fork ${recorded ? "\u5DF2\u5165\u8D26" : "\u5165\u8D26\u5931\u8D25(\u4EC5\u901A\u77E5)"}${notified ? "\u5E76\u5DF2\u5524\u9192\u4E3B agent" : "(\u4E3B agent \u672A\u5728\u672C\u8FDB\u7A0B \u2014 \u4EC5\u901A\u77E5)"}:
+          source: { kind: "user" }
+        }));
+      }
+      return `fork ${inbox !== "" ? "\u5DF2\u5199\u5165\u5206\u53C9\u4FE1\u7BB1(" + inbox + "), \u4E3B agent \u7684 xiaochang_wait \u4F1A\u88AB\u5524\u9192\u5E76\u5728\u8BFB\u56FE\u65F6\u5438\u6536" : "\u4FE1\u7BB1\u5199\u5165\u5931\u8D25"}${sameProcess ? "; \u540C\u8FDB\u7A0B\u5DF2\u76F4\u63A5\u5165\u8D26\u5E76\u5524\u9192" : ""}:
 ${lines.join("\n")}`;
     }
   }));
@@ -943,6 +988,13 @@ ${lines.join("\n")}`;
     isConcurrencySafe: () => true,
     async execute(args) {
       const s = requireState();
+      const codes = args.code !== void 0 ? [args.code] : [...new Set(c().ledger.views().map((v) => codeOf(v.item.id)))];
+      for (const code of codes) {
+        try {
+          absorbForkInbox(code);
+        } catch {
+        }
+      }
       const views = c().ledger.views().filter((v) => args.code === void 0 || codeOf(v.item.id) === args.code);
       if (views.length === 0) return `xiaochang_graph: no ledger items${args.code !== void 0 ? ` for ${args.code}` : ""}`;
       const rows = [];
@@ -985,7 +1037,7 @@ ${lines.join("\n")}`;
   }));
   register(defineTool({
     name: "xiaochang_wait",
-    description: "Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, or (d) the timeout. This is THE way to wait \u2014 never bash sleep for waiting. Returns what woke it.",
+    description: "Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, (d) a fork lands in the fork inbox (executor xiaochang_fork), or (e) the timeout. This is THE way to wait \u2014 never bash sleep for waiting. Returns what woke it.",
     parameters: {
       timeoutSeconds: { type: "number", description: "Max wait seconds (default 300, clamp 5..900)." }
     },
@@ -1021,11 +1073,28 @@ ${lines.join("\n")}`;
         const sv = setInterval(() => {
           if (agent !== void 0 && agent.session.seq > seqBefore) done("xiaochang_wait: session message arrived");
         }, 2e3);
+        const inboxDir = forkInboxDir();
+        const inboxSnap = () => {
+          try {
+            if (!existsSync(inboxDir)) return "";
+            return readdirSync2(inboxDir).filter((f) => f.endsWith(".jsonl")).map((f) => {
+              const st = statSync2(join2(inboxDir, f));
+              return `${f}:${st.mtimeMs}:${st.size}`;
+            }).join("|");
+          } catch {
+            return "";
+          }
+        };
+        const inboxBefore = inboxSnap();
+        const fv = setInterval(() => {
+          if (inboxSnap() !== inboxBefore) done("xiaochang_wait: fork inbox changed \u2014 read xiaochang_graph and dispatch the untaken branches");
+        }, 2e3);
         const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1e3)}s, no event`), timeoutMs);
         cleanup = () => {
           unsub();
           clearInterval(iv);
           clearInterval(sv);
+          clearInterval(fv);
           clearTimeout(to);
         };
       });

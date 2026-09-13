@@ -247,15 +247,52 @@ export function apply(ctx: Context): void {
 
   // ── F33 知识账本 helpers（apply 闭包内——campaign/campaignId/holder 都在这层作用域）──
   type KnowledgeIn = { kind: string; path: string; conclusion?: string; evidence?: string; by?: string; at?: number }
-  /** 把该 code 的全部 item 知识聚合(跨尝试累积)。 */
-  function knowledgeOfCode(code: string): KnowledgeIn[] {
-    if (campaign === undefined) return []
+  // ── F33 ②b 分叉信箱: 执行者跨会话上报的可靠通道(盘文件, 主 agent 的
+  //    xiaochang_wait 轮询该目录变化唤醒; 主 agent 读图时吸收进账本并归档)。
+  //    设计缘由(run 17891 实锤): 执行者会话与主会话不在同一插件实例——
+  //    in-memory campaign/parentAgent.followup 均不可达主 agent;
+  //    而盘文件是本沙箱唯一跨会话/跨进程都可靠的信道(settle 走主进程 await)。
+  const forkInboxDir = (): string => join(process.env.DSH_HOME ?? '.', 'storages', 'xiaochang-fork-inbox')
+  function readForkInbox(code: string): KnowledgeIn[] {
+    const p = join(forkInboxDir(), `${code}.jsonl`)
+    if (!existsSync(p)) return []
     const out: KnowledgeIn[] = []
-    for (const v of campaign.ledger.views()) {
-      if (codeOf(v.item.id) !== code) continue
-      const k = campaign.knowledgeOf?.(v.item.id) ?? []
-      out.push(...k as KnowledgeIn[])
+    for (const line of readFileSync(p, 'utf8').split('\n')) {
+      if (line.trim() === '') continue
+      try { out.push(JSON.parse(line) as KnowledgeIn) } catch { /* 坏行跳过 */ }
     }
+    return out
+  }
+  function writeForkInbox(code: string, entries: KnowledgeIn[]): string {
+    mkdirSync(forkInboxDir(), { recursive: true })
+    const p = join(forkInboxDir(), `${code}.jsonl`)
+    appendFileSync(p, entries.map(e => JSON.stringify(e)).join('\n') + '\n')
+    return p
+  }
+  /** 主 agent 侧: 信箱条目并入知识账本(幂等)并归档文件。 */
+  function absorbForkInbox(code: string): void {
+    const p = join(forkInboxDir(), `${code}.jsonl`)
+    if (!existsSync(p)) return
+    const entries = readForkInbox(code)
+    if (entries.length > 0) {
+      for (const v of campaign?.ledger.views() ?? []) {
+        if (codeOf(v.item.id) !== code) continue
+        try { holder.recordKnowledge?.(campaignId ?? '', v.item.id, entries) } catch { /* 吸收失败不阻断 */ }
+      }
+    }
+    try { renameSync(p, `${p}.absorbed-${Date.now()}`) } catch { /* 归档失败不阻断 */ }
+  }
+  /** 把该 code 的全部 item 知识聚合(跨尝试累积)+ 盘上未吸收的分叉信箱。 */
+  function knowledgeOfCode(code: string): KnowledgeIn[] {
+    const out: KnowledgeIn[] = []
+    if (campaign !== undefined) {
+      for (const v of campaign.ledger.views()) {
+        if (codeOf(v.item.id) !== code) continue
+        const k = campaign.knowledgeOf?.(v.item.id) ?? []
+        out.push(...k as KnowledgeIn[])
+      }
+    }
+    out.push(...readForkInbox(code))
     return out
   }
   /** 把知识写入该 code 的全部已有 item。 */
@@ -736,15 +773,22 @@ export function apply(ctx: Context): void {
     async execute(args: { code: string; forks: Array<{ path: string; conclusion?: string; evidence?: string }> }) {
       if (args.forks.length === 0) return 'xiaochang_fork: no forks given'
       const entries: KnowledgeIn[] = args.forks.map(f => ({ kind: 'fork', path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: 'fork', at: Date.now() }))
-      let recorded = false
-      try { recordKnowledgeOnCode(args.code, entries); recorded = true } catch { /* 入账失败仍要唤醒 */ }
       const lines = entries.map(f => `- 🔀 ${f.path}${f.conclusion !== undefined ? ' → ' + f.conclusion : ''}${f.evidence !== undefined ? ' (证据: ' + f.evidence + ')' : ''}`)
-      const notified = parentAgent !== undefined
-      parentAgent?.followup(createUserMessage({
-        content: [{ type: 'text', text: `🔀 分叉即时报(执行者 ${args.code}): 发现 ${entries.length} 条未走分叉, 已入账(全局解题图)。由你(主 agent)决定是否 jisi_fanout_bulk / xiaochang_enqueue 增兵。\n${lines.join('\n')}` }],
-        source: { kind: 'user' },
-      }))
-      return `fork ${recorded ? '已入账' : '入账失败(仅通知)'}${notified ? '并已唤醒主 agent' : '(主 agent 未在本进程 — 仅通知)'}:\n${lines.join('\n')}`
+      // 可靠通道: 写盘分叉信箱——主 agent 的 xiaochang_wait 轮询到变化即唤醒(跨会话/跨进程)。
+      let inbox = ''
+      try { inbox = writeForkInbox(args.code, entries) } catch { /* 信箱写失败 */ }
+      // 同进程直接入账(主 agent 自调 fork 时生效; 执行者会话里 campaign 不存在则为 no-op)。
+      try { recordKnowledgeOnCode(args.code, entries) } catch { /* 入账失败不阻断 */ }
+      // followup 仅同进程可达(执行者会话里 parentAgent 不是主 agent, 跨进程不可达——
+      // 不做虚假承诺; 真正唤醒靠上面的信箱+wait 轮询)。
+      const sameProcess = parentAgent !== undefined && campaign !== undefined
+      if (sameProcess) {
+        parentAgent?.followup(createUserMessage({
+          content: [{ type: 'text', text: `🔀 分叉即时报(${args.code}): 发现 ${entries.length} 条未走分叉, 已入账+信箱。由你(主 agent)决定是否 jisi_fanout_bulk / xiaochang_enqueue 增兵。\n${lines.join('\n')}` }],
+          source: { kind: 'user' },
+        }))
+      }
+      return `fork ${inbox !== '' ? '已写入分叉信箱(' + inbox + '), 主 agent 的 xiaochang_wait 会被唤醒并在读图时吸收' : '信箱写入失败'}${sameProcess ? '; 同进程已直接入账并唤醒' : ''}:\n${lines.join('\n')}`
     },
   }))
 
@@ -759,6 +803,9 @@ export function apply(ctx: Context): void {
     isConcurrencySafe: () => true,
     async execute(args: { code?: string }) {
       const s = requireState()
+      // F33: 读图即吸收——先把盘上分叉信箱并入账本(幂等归档), 图永远是全局最新。
+      const codes = args.code !== undefined ? [args.code] : [...new Set(c().ledger.views().map(v => codeOf(v.item.id)))]
+      for (const code of codes) { try { absorbForkInbox(code) } catch { /* 吸收失败不阻断 */ } }
       const views = c().ledger.views().filter(v => args.code === undefined || codeOf(v.item.id) === args.code)
       if (views.length === 0) return `xiaochang_graph: no ledger items${args.code !== undefined ? ` for ${args.code}` : ''}`
       const rows: string[] = []
@@ -803,7 +850,7 @@ export function apply(ctx: Context): void {
   register(defineTool({
     name: 'xiaochang_wait',
     description:
-      'Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, or (d) the timeout. This is THE way to wait — never bash sleep for waiting. Returns what woke it.',
+      'Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, (d) a fork lands in the fork inbox (executor xiaochang_fork), or (e) the timeout. This is THE way to wait — never bash sleep for waiting. Returns what woke it.',
     parameters: {
       timeoutSeconds: { type: 'number', description: 'Max wait seconds (default 300, clamp 5..900).' },
     },
@@ -834,9 +881,21 @@ export function apply(ctx: Context): void {
         // ③ 会话新消息（continuable settle 通知等）
         const seqBefore = agent?.session.seq ?? 0
         const sv = setInterval(() => { if (agent !== undefined && agent.session.seq > seqBefore) done('xiaochang_wait: session message arrived') }, 2000)
+        // ⑤ F33 分叉信箱: 执行者 xiaochang_fork 写盘 → 立即唤醒(跨会话可靠通道)
+        const inboxDir = forkInboxDir()
+        const inboxSnap = (): string => {
+          try {
+            if (!existsSync(inboxDir)) return ''
+            return readdirSync(inboxDir).filter(f => f.endsWith('.jsonl'))
+              .map(f => { const st = statSync(join(inboxDir, f)); return `${f}:${st.mtimeMs}:${st.size}` })
+              .join('|')
+          } catch { return '' }
+        }
+        const inboxBefore = inboxSnap()
+        const fv = setInterval(() => { if (inboxSnap() !== inboxBefore) done('xiaochang_wait: fork inbox changed — read xiaochang_graph and dispatch the untaken branches') }, 2000)
         // ④ 超时
         const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1000)}s, no event`), timeoutMs)
-        cleanup = () => { unsub(); clearInterval(iv); clearInterval(sv); clearTimeout(to) }
+        cleanup = () => { unsub(); clearInterval(iv); clearInterval(sv); clearInterval(fv); clearTimeout(to) }
       })
     },
   }))
