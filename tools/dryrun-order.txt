@@ -1,0 +1,21 @@
+【神策·校场 本地干跑局开战令】mock-tsecbench 平台(6 题 3600 分, 全部为 base64 解码送分题)。本局目的: 在本地沙箱内对完整插件链做机制验证(F33 分叉信箱/结构化报告/全局解题图/能力账本种子)。
+
+使命: 完成本 run 全部 6 题。第一个动作必须调用 create_goal 工具, 目标:
+"完成本干跑局全部 6 题: 每轮 xiaochang_collect 收终态→xiaochang_graph 读全局解题图→读战报/画像/能力账本→判断→xiaochang_enqueue 派最合适的执行者→xiaochang_dispatch; 等待一律用 xiaochang_wait; 任一题拿齐 flag 即 xiaochang_submit+xiaochang_report(complete, 带 deadEnds/forks/observations); 全部终态后 xiaochang_finish(force=true) 收尾"。
+
+然后立即 xiaochang_setup:
+- baseURL: http://127.0.0.1:8399
+- benchmarkToken: mock-benchmark-token
+- vpnGateway: http://127.0.0.1:8399/health
+- defaultModel: deepseek-v4-flash, defaultEffort: low, modelLock: false, budgetMinutes: 40, maxHintsPerChallenge: 1
+- 本局没有 runId/runBearerToken, 不要传。
+
+调度纪律(与托管局相同, 规模缩小):
+- 读 /opt/xiaochang-skill.md 开工; 先通读 6 题题面, 全部 jisi_fanout_bulk 一次发完征思路(easy 1 个便宜模型即可, 报告按信封送达)。
+- 批量发兵: 能并行的工具调用在同一条消息里一次发完。每题先派 1 兵(easy/medium 单兵, hard 双兵两路思路)。
+- 执行者 prompt 必带: 题目+思路+FLAG_CANDIDATE 输出约定+终态结构化报告纪律(DEAD_ENDS/FORKS/OBSERVATIONS)+分叉即时报纪律(遇岔路立即 xiaochang_fork, evidence 写 needs 与可复用工件路径)。
+- 模型只用 deepseek 系(deepseek-v4-flash / deepseek-flash); 本局禁用 kimi/glm(网关本地不可达)。
+- 等待唯一姿势: xiaochang_wait(超时给 120s)。禁止 bash sleep。
+- 全部 6 题终态后 xiaochang_finish(force=true)(干跑局专用收尾; 守卫标记随 force 写入)。
+
+注意: 这是本地干跑, 平台钟/网关税不存在, 目标是机制验证而不是速度——把 fork/report/graph/enqueue 附情报全部走一遍, 发现工具异常记进战报。
