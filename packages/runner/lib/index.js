@@ -476,11 +476,21 @@ function apply(ctx) {
     if (!existsSync(p)) return;
     const entries = readForkInbox(code);
     if (entries.length > 0) {
+      const seen = /* @__PURE__ */ new Set();
       for (const v of campaign?.ledger.views() ?? []) {
         if (codeOf(v.item.id) !== code) continue;
-        try {
-          holder.recordKnowledge?.(campaignId ?? "", v.item.id, entries);
-        } catch {
+        for (const k of campaign?.knowledgeOf?.(v.item.id) ?? []) {
+          seen.add(`${k.path}#${k.at ?? 0}`);
+        }
+      }
+      const fresh = entries.filter((e) => !seen.has(`${e.path}#${e.at ?? 0}`));
+      if (fresh.length > 0) {
+        for (const v of campaign?.ledger.views() ?? []) {
+          if (codeOf(v.item.id) !== code) continue;
+          try {
+            holder.recordKnowledge?.(campaignId ?? "", v.item.id, fresh);
+          } catch {
+          }
         }
       }
     }

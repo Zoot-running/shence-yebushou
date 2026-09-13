@@ -269,15 +269,25 @@ export function apply(ctx: Context): void {
     appendFileSync(p, entries.map(e => JSON.stringify(e)).join('\n') + '\n')
     return p
   }
-  /** 主 agent 侧: 信箱条目并入知识账本(幂等)并归档文件。 */
+  /** 主 agent 侧: 信箱条目并入知识账本(去重幂等)并归档文件。 */
   function absorbForkInbox(code: string): void {
     const p = join(forkInboxDir(), `${code}.jsonl`)
     if (!existsSync(p)) return
     const entries = readForkInbox(code)
     if (entries.length > 0) {
+      const seen = new Set<string>()
       for (const v of campaign?.ledger.views() ?? []) {
         if (codeOf(v.item.id) !== code) continue
-        try { holder.recordKnowledge?.(campaignId ?? '', v.item.id, entries) } catch { /* 吸收失败不阻断 */ }
+        for (const k of campaign?.knowledgeOf?.(v.item.id) ?? []) {
+          seen.add(`${(k as KnowledgeIn).path}#${(k as KnowledgeIn).at ?? 0}`)
+        }
+      }
+      const fresh = entries.filter(e => !seen.has(`${e.path}#${e.at ?? 0}`))
+      if (fresh.length > 0) {
+        for (const v of campaign?.ledger.views() ?? []) {
+          if (codeOf(v.item.id) !== code) continue
+          try { holder.recordKnowledge?.(campaignId ?? '', v.item.id, fresh) } catch { /* 吸收失败不阻断 */ }
+        }
       }
     }
     try { renameSync(p, `${p}.absorbed-${Date.now()}`) } catch { /* 归档失败不阻断 */ }
