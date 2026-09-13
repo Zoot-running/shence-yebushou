@@ -2,6 +2,7 @@
 import { existsSync, mkdirSync as mkdirSync2, readFileSync, readdirSync as readdirSync2, statSync as statSync2, writeFileSync, appendFileSync } from "node:fs";
 import { join as join2 } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
+import { createUserMessage } from "@deepseek-ai/dsh-llm";
 
 // ../../src/hint-ledger.ts
 var HintLedger = class _HintLedger {
@@ -334,6 +335,33 @@ function tierOf(difficulty) {
   if (difficulty === "hard") return 2;
   return 3;
 }
+function knowledgeOfCode(code) {
+  if (campaign === void 0) return [];
+  const out = [];
+  for (const v of campaign.ledger.views()) {
+    if (codeOf(v.item.id) !== code) continue;
+    const k = campaign.knowledgeOf?.(v.item.id) ?? [];
+    out.push(...k);
+  }
+  return out;
+}
+function recordKnowledgeOnCode(code, entries) {
+  if (campaign === void 0 || campaignId === void 0) return;
+  for (const v of campaign.ledger.views()) {
+    if (codeOf(v.item.id) !== code) continue;
+    holder.recordKnowledge?.(campaignId, v.item.id, entries);
+  }
+}
+function renderKnowledge(code) {
+  const ks = knowledgeOfCode(code);
+  if (ks.length === 0) return "";
+  const lines = ["\u5DF2\u77E5\u60C5\u62A5(\u81EA\u52A8\u9644\u5E26, \u524D\u5E8F\u6267\u884C\u8005\u6C89\u6DC0)"];
+  for (const k of ks) {
+    const tag = k.kind === "dead-end" ? "\u274C\u6B7B\u8DEF" : k.kind === "fork" ? "\u{1F500}\u672A\u8D70\u5206\u53C9" : "\u{1F4CC}\u4E8B\u5B9E";
+    lines.push(`- [${tag}] ${k.path}${k.conclusion !== void 0 ? " \u2192 " + k.conclusion : ""}${k.evidence !== void 0 ? " (\u8BC1\u636E: " + k.evidence + ")" : ""}`);
+  }
+  return lines.join("\n");
+}
 function nodeFetch() {
   return async (url, init = {}) => {
     const res = await fetch(url, {
@@ -383,8 +411,8 @@ function openContainers(s) {
   }
   return open;
 }
-function openCount(campaign) {
-  return campaign.ledger.views().filter((v) => v.state === "dispatched" || v.state === "help" || v.state === "stalled").length;
+function openCount(campaign2) {
+  return campaign2.ledger.views().filter((v) => v.state === "dispatched" || v.state === "help" || v.state === "stalled").length;
 }
 function walk(dir) {
   const out = [];
@@ -437,17 +465,18 @@ function scanLegacyCwd(cwd, startedAt) {
 }
 function apply(ctx) {
   const jisi = ctx.get?.("jisi");
-  const holder = ctx.hufu;
-  let campaign;
-  let campaignId;
+  const holder2 = ctx.hufu;
+  let campaign2;
+  let campaignId2;
+  let parentAgent;
   heartbeatTimer = setInterval(() => {
     const home = process.env.DSH_HOME ?? ".";
     audit(join2(home, "storages", "xiaochang-run-audit.jsonl"), { type: "heartbeat", at: Date.now() });
   }, 12e4);
   heartbeatTimer.unref?.();
   const c = () => {
-    if (campaign === void 0) throw new Error("xiaochang: not set up \u2014 call xiaochang_setup first");
-    return campaign;
+    if (campaign2 === void 0) throw new Error("xiaochang: not set up \u2014 call xiaochang_setup first");
+    return campaign2;
   };
   const register = (tool) => ctx.tools.register(tool);
   register(defineTool({
@@ -474,6 +503,7 @@ function apply(ctx) {
     async execute(args, exec) {
       const agent = exec.agent;
       if (agent === void 0) throw new Error("xiaochang_setup requires a calling agent");
+      parentAgent = agent;
       const env = process.env;
       const baseURL = args.baseURL ?? env.BENCHMARK_BASE_URL;
       const benchmarkToken = args.benchmarkToken ?? env.BENCHMARK_TOKEN;
@@ -540,18 +570,18 @@ function apply(ctx) {
       }
       const fresh = await s.adapter.listChallenges();
       for (const ch of fresh) s.challenges.set(ch.unique_code, ch);
-      if (campaign === void 0) {
-        const created = holder.createCampaign(agent, {
+      if (campaign2 === void 0) {
+        const created = holder2.createCampaign(agent, {
           concurrency: s.concurrency,
           stallAfterMs: s.roundTimeoutMs + 10 * 6e4,
           heartbeatMs: 15 * 6e4,
           budgetMs: s.budgetMs
         }, [], { id: stableId, boardNamespace: `${args.runId ?? "pending"}` });
-        campaign = created.campaign;
-        campaignId = created.id;
+        campaign2 = created.campaign;
+        campaignId2 = created.id;
       }
       persistProgress(s);
-      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}`;
+      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}, campaign=${campaignId2 ?? stableId}, swept=${swept}`;
     }
   }));
   register(defineTool({
@@ -711,6 +741,8 @@ boardPath=${c().boardPath(args.code)}`;
       const s = requireState();
       const ch = s.challenges.get(args.code);
       if (ch === void 0) return `xiaochang_enqueue: unknown challenge ${args.code}`;
+      const prior = renderKnowledge(args.code);
+      const label = prior !== "" ? args.prompt + "\n\n" + prior : args.prompt;
       const seq = s.progress.get(args.code)?.rounds ?? 0;
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`;
       const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy);
@@ -722,7 +754,7 @@ boardPath=${c().boardPath(args.code)}`;
       }
       c().add({
         id: itemId,
-        label: args.prompt,
+        label,
         model: executor.model,
         reasoningEffort: executor.effort,
         ...args.dependsOn !== void 0 && args.dependsOn.length > 0 ? { dependsOn: args.dependsOn } : {},
@@ -799,13 +831,22 @@ ${detail.slice(0, 6e3)}`);
     parameters: {
       code: { type: "string", required: true },
       verdict: { type: "string", required: true, description: "complete | failed | skipped" },
-      reason: { type: "string", description: "Short reason (logged)." }
+      reason: { type: "string", description: "Short reason (logged)." },
+      deadEnds: { type: "array", description: "[{path, conclusion, evidence}] proven-infeasible paths." },
+      forks: { type: "array", description: "[{path, conclusion, evidence}] untaken branches worth dispatching." },
+      observations: { type: "array", description: "[{path, conclusion}] facts learned." }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
     async execute(args) {
       const s = requireState();
       const verdict = args.verdict === "complete" ? "complete" : args.verdict === "failed" ? "failed" : "skipped";
+      const entries = [
+        ...(args.deadEnds ?? []).map((e) => ({ kind: "dead-end", path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: "report", at: Date.now() })),
+        ...(args.forks ?? []).map((e) => ({ kind: "fork", path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: "report", at: Date.now() })),
+        ...(args.observations ?? []).map((e) => ({ kind: "observation", path: e.path, conclusion: e.conclusion, by: "report", at: Date.now() }))
+      ];
+      if (entries.length > 0) recordKnowledgeOnCode(args.code, entries);
       try {
         await s.adapter.close(args.code);
       } catch {
@@ -854,6 +895,59 @@ ${text}`;
     }
   }));
   register(defineTool({
+    name: "xiaochang_fork",
+    description: "F33 fork alarm: you (executor) found untaken promising branches or hard-won evidence \u2014 record them as fork knowledge AND wake the main agent immediately (followup, zero wait). The main agent alone decides whether to dispatch (single scheduler).",
+    parameters: {
+      code: { type: "string", required: true },
+      forks: { type: "array", required: true, description: "[{path, conclusion, evidence}] untaken branches worth dispatching." }
+    },
+    output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      if (args.forks.length === 0) return "xiaochang_fork: no forks given";
+      const entries = args.forks.map((f) => ({ kind: "fork", path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: "fork", at: Date.now() }));
+      recordKnowledgeOnCode(args.code, entries);
+      const lines = entries.map((f) => `- \u{1F500} ${f.path}${f.conclusion !== void 0 ? " \u2192 " + f.conclusion : ""}${f.evidence !== void 0 ? " (\u8BC1\u636E: " + f.evidence + ")" : ""}`);
+      const notified = parentAgent !== void 0;
+      parentAgent?.followup(createUserMessage({
+        content: [{ type: "text", text: `\u{1F500} \u5206\u53C9\u5373\u65F6\u62A5(\u6267\u884C\u8005 ${args.code}): \u53D1\u73B0 ${entries.length} \u6761\u672A\u8D70\u5206\u53C9, \u5DF2\u5165\u8D26(\u5168\u5C40\u89E3\u9898\u56FE)\u3002\u7531\u4F60(\u4E3B agent)\u51B3\u5B9A\u662F\u5426 jisi_fanout_bulk / xiaochang_enqueue \u589E\u5175\u3002
+${lines.join("\n")}` }],
+        source: { kind: "user" }
+      }));
+      return `fork \u5DF2\u5165\u8D26${notified ? "\u5E76\u5DF2\u5524\u9192\u4E3B agent" : "(\u4E3B agent \u672A\u5728\u672C\u8FDB\u7A0B \u2014 \u4EC5\u5165\u8D26)"}:
+${lines.join("\n")}`;
+    }
+  }));
+  register(defineTool({
+    name: "xiaochang_graph",
+    description: "F33 global solving graph: per-challenge view of every attempt (seed/model/state/terminal detail) plus accumulated knowledge (dead-ends/forks/observations). This is the main agent's situational picture \u2014 read it before every dispatch decision.",
+    parameters: {
+      code: { type: "string", description: "One challenge code; omit for the full graph." }
+    },
+    output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const s = requireState();
+      const views = c().ledger.views().filter((v) => args.code === void 0 || codeOf(v.item.id) === args.code);
+      if (views.length === 0) return `xiaochang_graph: no ledger items${args.code !== void 0 ? ` for ${args.code}` : ""}`;
+      const rows = [];
+      for (const v of views) {
+        const code = codeOf(v.item.id);
+        const p = s.progress.get(code);
+        const kindTag = { done: "\u2705", failed: "\u274C", blocked: "\u26D4", superseded: "\u267B\uFE0F" }[v.state] ?? { queued: "\u23F3", dispatched: "\u{1F3C3}", help: "\u{1F64F}", stalled: "\u{1F40C}" }[v.state] ?? "\xB7";
+        rows.push(`${kindTag} ${v.item.id} [${v.state}] seed=${v.seed} model=${v.item.model ?? s.executorPolicy.defaultModel} effort=${v.item.reasoningEffort ?? s.executorPolicy.defaultEffort}${p !== void 0 && p.flags.length > 0 ? ` flags=${p.flags.length}` : ""}${v.terminalDetail !== void 0 ? `
+  \u7EC8\u6001: ${v.terminalDetail.slice(0, 400)}` : ""}`);
+        const ks = campaign2?.knowledgeOf?.(v.item.id) ?? [];
+        for (const k of ks) {
+          const tag = k.kind === "dead-end" ? "\u274C\u6B7B\u8DEF" : k.kind === "fork" ? "\u{1F500}\u672A\u8D70\u5206\u53C9" : "\u{1F4CC}\u4E8B\u5B9E";
+          rows.push(`     [${tag}] ${k.path}${k.conclusion !== void 0 ? " \u2192 " + k.conclusion : ""}${k.evidence !== void 0 ? " (\u8BC1\u636E: " + k.evidence + ")" : ""}${k.by !== void 0 ? ` \u2014 by ${k.by}` : ""}`);
+        }
+        if (p !== void 0) rows.push(`   progress: ${p.state} reason=${p.reason ?? "-"} containerClosed=${p.containerClosed}`);
+      }
+      return rows.join("\n");
+    }
+  }));
+  register(defineTool({
     name: "xiaochang_status",
     description: "Campaign status: ledger summary, per-challenge progress, budget remaining, open containers.",
     parameters: {},
@@ -887,7 +981,7 @@ ${text}`;
       const agent = exec.agent;
       const ledgerSnap = () => {
         try {
-          return JSON.stringify(campaign?.ledger.views().map((v) => [v.item.id, v.state, v.terminalDetail ?? "", v.lastProgressAt ?? 0]));
+          return JSON.stringify(campaign2?.ledger.views().map((v) => [v.item.id, v.state, v.terminalDetail ?? "", v.lastProgressAt ?? 0]));
         } catch {
           return "";
         }
@@ -902,7 +996,7 @@ ${text}`;
           cleanup();
           resolve(why);
         };
-        const unsub = campaignId !== void 0 && holder.onSettle !== void 0 ? holder.onSettle(campaignId, (ev) => done(`xiaochang_wait: ${ev.itemId} settled (${ev.status})${ev.text !== "" ? ": " + ev.text.slice(0, 200) : ""}`)) : () => {
+        const unsub = campaignId2 !== void 0 && holder2.onSettle !== void 0 ? holder2.onSettle(campaignId2, (ev) => done(`xiaochang_wait: ${ev.itemId} settled (${ev.status})${ev.text !== "" ? ": " + ev.text.slice(0, 200) : ""}`)) : () => {
         };
         const before = ledgerSnap();
         const iv = setInterval(() => {
@@ -942,7 +1036,7 @@ ${text}`;
         s.progress.update(ch.unique_code, { containerClosed: true });
       }
       persistProgress(s);
-      if (campaignId !== void 0) holder.finish?.(campaignId);
+      if (campaignId2 !== void 0) holder2.finish?.(campaignId2);
       const final = await s.adapter.listChallenges();
       const score = s.adapter.scoreOf(final);
       const allTerminal = final.every((ch) => ch.is_completed || ["failed", "skipped"].includes(s.progress.get(ch.unique_code)?.state ?? ""));
