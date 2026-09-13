@@ -9,7 +9,7 @@ MOCK_PORT="${MOCK_PORT:-8399}"
 STORAGES="${DRYRUN_STORAGES:-/tmp/dryrun-storages}"
 IMAGE="${DRYRUN_IMAGE:-shence-hosted:v17-formal}"
 
-rm -rf "$STORAGES"; mkdir -p "$STORAGES"
+sudo rm -rf "$STORAGES"; mkdir -p "$STORAGES"
 # 挂载会遮住镜像内 storages——先把种子账本复制进挂载点(模拟镜像布局, 验证 ①)
 cp /tmp/hosted-build/home/storages/jisi-model-ledger.seed.json "$STORAGES/"
 node "$REPO/tools/mock-tsecbench.mjs" "$MOCK_PORT" > /tmp/dryrun-mock.log 2>&1 &
