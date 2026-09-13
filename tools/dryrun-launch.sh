@@ -10,6 +10,8 @@ STORAGES="${DRYRUN_STORAGES:-/tmp/dryrun-storages}"
 IMAGE="${DRYRUN_IMAGE:-shence-hosted:v17-formal}"
 
 rm -rf "$STORAGES"; mkdir -p "$STORAGES"
+# 挂载会遮住镜像内 storages——先把种子账本复制进挂载点(模拟镜像布局, 验证 ①)
+cp /tmp/hosted-build/home/storages/jisi-model-ledger.seed.json "$STORAGES/"
 node "$REPO/tools/mock-tsecbench.mjs" "$MOCK_PORT" > /tmp/dryrun-mock.log 2>&1 &
 MOCK_PID=$!
 trap 'kill $MOCK_PID 2>/dev/null || true' EXIT
@@ -35,8 +37,10 @@ timeout 3300 docker run --rm --network host \
 echo "── 干跑证据 ──"
 echo "[分叉信箱]"
 ls -la "$STORAGES/xiaochang-fork-inbox/" 2>/dev/null || echo "  (无信箱目录)"
-echo "[知识账本快照中的 fork/dead-end 条目]"
-grep -o '"kind":"fork"' "$STORAGES"/hufu-campaigns/*.json 2>/dev/null | wc -l | xargs echo "  fork 条目数:"
-grep -o '"kind":"dead-end"' "$STORAGES"/hufu-campaigns/*.json 2>/dev/null | wc -l | xargs echo "  dead-end 条目数:"
+echo "[知识账本快照中的 fork/dead-end 条目(终态后归档于 archive/)]"
+SNAP=$(ls "$STORAGES"/hufu-campaigns/*.json "$STORAGES"/hufu-campaigns/archive/*.json 2>/dev/null | head -1)
+grep -o '"kind":"fork"' "$SNAP" 2>/dev/null | wc -l | xargs echo "  fork 条目数:" || true
+grep -o '"kind":"dead-end"' "$SNAP" 2>/dev/null | wc -l | xargs echo "  dead-end 条目数:" || true
+grep -o '"kind":"observation"' "$SNAP" 2>/dev/null | wc -l | xargs echo "  observation 条目数:" || true
 echo "[driver 尾行]"
 tail -3 /tmp/dryrun-driver.log 2>/dev/null || true
