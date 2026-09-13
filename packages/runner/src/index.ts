@@ -58,6 +58,7 @@ interface HufuLike {
   nextQueued(): unknown[]
   dispatchNext(): Promise<unknown>
   report(itemId: string, kind: 'done' | 'failed' | 'blocked', detail?: string): void
+  onSettle?(listener: (event: { itemId: string; status: string; text: string }) => void): () => void
   cancel(itemId: string, reason: string): void
   boardPath(group: string): string
   isComplete(): boolean
@@ -70,6 +71,7 @@ interface HufuLike {
 interface HufuHolderLike {
   createCampaign(p: unknown, c: object, items: unknown[], opts?: { id?: string }): { id: string; campaign: HufuLike }
   finish?(id: string): void
+  onSettle?(id: string, listener: (event: { itemId: string; status: string; text: string }) => void): () => void
 }
 
 /** 集思服务面（能力账本；fanout 由主 agent 经 jisi_fanout 工具调用）。 */
@@ -283,6 +285,11 @@ export function apply(ctx: Context): void {
         const first = lines.length > 0 ? (JSON.parse(lines[0]!) as { at: number }).at : undefined
         if (first !== undefined) startedAt = first
       }
+      // F30：setup 清旧守卫标记（防止上一进程残留标记误导 hosted-guard standing down）。
+      try {
+        const markerPath = process.env.GUARD_MARKER ?? join(process.cwd(), '.campaign-finished')
+        if (existsSync(markerPath)) { const fs = await import('node:fs'); fs.unlinkSync(markerPath) }
+      } catch { /* 忽略 */ }
       const s: CampaignState = {
         baseURL,
         benchmarkToken,
@@ -684,6 +691,47 @@ export function apply(ctx: Context): void {
   }))
 
   register(defineTool({
+    name: 'xiaochang_wait',
+    description:
+      'Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, or (d) the timeout. This is THE way to wait — never bash sleep for waiting. Returns what woke it.',
+    parameters: {
+      timeoutSeconds: { type: 'number', description: 'Max wait seconds (default 300, clamp 5..900).' },
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => true,
+    async execute(args: { timeoutSeconds?: number }, exec) {
+      const timeoutMs = Math.min(Math.max(args.timeoutSeconds ?? 300, 5), 900) * 1000
+      const agent = exec.agent
+      const ledgerSnap = (): string => {
+        try { return JSON.stringify(campaign?.ledger.views().map(v => [v.item.id, v.state, v.terminalDetail ?? '', v.lastProgressAt ?? 0])) } catch { return '' }
+      }
+      return await new Promise<string>((resolve) => {
+        let settled = false
+        let cleanup = (): void => {}
+        const done = (why: string): void => {
+          if (settled) return
+          settled = true
+          cleanup()
+          resolve(why)
+        }
+        // ① 虎符 settle 事件（一次性执行者结算）
+        const unsub = campaignId !== undefined && holder.onSettle !== undefined
+          ? holder.onSettle(campaignId, ev => done(`xiaochang_wait: ${ev.itemId} settled (${ev.status})${ev.text !== '' ? ': ' + ev.text.slice(0, 200) : ''}`))
+          : (): void => {}
+        // ② 账本轮询兜底（超时判失败/主 agent 自己 report 等）
+        const before = ledgerSnap()
+        const iv = setInterval(() => { if (ledgerSnap() !== before) done('xiaochang_wait: campaign ledger changed') }, 2000)
+        // ③ 会话新消息（continuable settle 通知等）
+        const seqBefore = agent?.session.seq ?? 0
+        const sv = setInterval(() => { if (agent !== undefined && agent.session.seq > seqBefore) done('xiaochang_wait: session message arrived') }, 2000)
+        // ④ 超时
+        const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1000)}s, no event`), timeoutMs)
+        cleanup = () => { unsub(); clearInterval(iv); clearInterval(sv); clearTimeout(to) }
+      })
+    },
+  }))
+
+  register(defineTool({
     name: 'xiaochang_finish',
     description:
       'Close all open containers, stop the ranking clock via the platform finish endpoint (when all challenges are terminal or you decide to end), and return the final platform score.',
@@ -704,6 +752,16 @@ export function apply(ctx: Context): void {
       const final = await s.adapter.listChallenges()
       const score = s.adapter.scoreOf(final)
       const allTerminal = final.every(ch => ch.is_completed || ['failed', 'skipped'].includes(s.progress.get(ch.unique_code)?.state ?? ''))
+      // F30 托管守卫标记：全终态才算战役完成——hosted-guard 见到标记才 standing down
+      // （没打完的局, driver 怎么退都会被 guard 重拉; 停表条款由此机制化）。
+      let guardMarker = ''
+      if (allTerminal) {
+        try {
+          const markerPath = process.env.GUARD_MARKER ?? join(process.cwd(), '.campaign-finished')
+          writeFileSync(markerPath, JSON.stringify({ at: Date.now(), score: score.score, max: score.max, completed: score.completed }))
+          guardMarker = `\n守卫标记已写（${markerPath}）——进程退出后沙箱结束、平台判局终。`
+        } catch { /* 标记失败不影响收尾 */ }
+      }
       // run 11 实锤（F28）：旧实现平台停表失败/缺参时静默吞掉、工具仍返回成功，
       // agent 误报 "clock stopped"，排名钟空转 ~5 分钟靠值守方补调才停。
       // 新规：停表结果必须在返回值里大声报告——绝不静默成功，也绝不在没停表时报停表。
@@ -724,7 +782,7 @@ export function apply(ctx: Context): void {
           clock = `⚠️ 平台停表调用失败：${String(error)} —— 排名钟仍在走，请重试 xiaochang_finish`
         }
       }
-      return `xiaochang_finish: score=${score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ', ALL TERMINAL' : ''})\n排名钟：${clock}`
+      return `xiaochang_finish: score=${score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ', ALL TERMINAL' : ''})\n排名钟：${clock}${guardMarker}`
     },
   }))
 }

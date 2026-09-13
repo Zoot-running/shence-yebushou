@@ -490,6 +490,14 @@ function apply(ctx) {
         const first = lines.length > 0 ? JSON.parse(lines[0]).at : void 0;
         if (first !== void 0) startedAt = first;
       }
+      try {
+        const markerPath = process.env.GUARD_MARKER ?? join2(process.cwd(), ".campaign-finished");
+        if (existsSync(markerPath)) {
+          const fs = await import("node:fs");
+          fs.unlinkSync(markerPath);
+        }
+      } catch {
+      }
       const s = {
         baseURL,
         benchmarkToken,
@@ -867,6 +875,54 @@ ${text}`;
     }
   }));
   register(defineTool({
+    name: "xiaochang_wait",
+    description: "Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, or (d) the timeout. This is THE way to wait \u2014 never bash sleep for waiting. Returns what woke it.",
+    parameters: {
+      timeoutSeconds: { type: "number", description: "Max wait seconds (default 300, clamp 5..900)." }
+    },
+    output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      const timeoutMs = Math.min(Math.max(args.timeoutSeconds ?? 300, 5), 900) * 1e3;
+      const agent = exec.agent;
+      const ledgerSnap = () => {
+        try {
+          return JSON.stringify(campaign?.ledger.views().map((v) => [v.item.id, v.state, v.terminalDetail ?? "", v.lastProgressAt ?? 0]));
+        } catch {
+          return "";
+        }
+      };
+      return await new Promise((resolve) => {
+        let settled = false;
+        let cleanup = () => {
+        };
+        const done = (why) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(why);
+        };
+        const unsub = campaignId !== void 0 && holder.onSettle !== void 0 ? holder.onSettle(campaignId, (ev) => done(`xiaochang_wait: ${ev.itemId} settled (${ev.status})${ev.text !== "" ? ": " + ev.text.slice(0, 200) : ""}`)) : () => {
+        };
+        const before = ledgerSnap();
+        const iv = setInterval(() => {
+          if (ledgerSnap() !== before) done("xiaochang_wait: campaign ledger changed");
+        }, 2e3);
+        const seqBefore = agent?.session.seq ?? 0;
+        const sv = setInterval(() => {
+          if (agent !== void 0 && agent.session.seq > seqBefore) done("xiaochang_wait: session message arrived");
+        }, 2e3);
+        const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1e3)}s, no event`), timeoutMs);
+        cleanup = () => {
+          unsub();
+          clearInterval(iv);
+          clearInterval(sv);
+          clearTimeout(to);
+        };
+      });
+    }
+  }));
+  register(defineTool({
     name: "xiaochang_finish",
     description: "Close all open containers, stop the ranking clock via the platform finish endpoint (when all challenges are terminal or you decide to end), and return the final platform score.",
     parameters: {},
@@ -888,6 +944,16 @@ ${text}`;
       const final = await s.adapter.listChallenges();
       const score = s.adapter.scoreOf(final);
       const allTerminal = final.every((ch) => ch.is_completed || ["failed", "skipped"].includes(s.progress.get(ch.unique_code)?.state ?? ""));
+      let guardMarker = "";
+      if (allTerminal) {
+        try {
+          const markerPath = process.env.GUARD_MARKER ?? join2(process.cwd(), ".campaign-finished");
+          writeFileSync(markerPath, JSON.stringify({ at: Date.now(), score: score.score, max: score.max, completed: score.completed }));
+          guardMarker = `
+\u5B88\u536B\u6807\u8BB0\u5DF2\u5199\uFF08${markerPath}\uFF09\u2014\u2014\u8FDB\u7A0B\u9000\u51FA\u540E\u6C99\u7BB1\u7ED3\u675F\u3001\u5E73\u53F0\u5224\u5C40\u7EC8\u3002`;
+        } catch {
+        }
+      }
       let clock;
       if (s.runBearerToken === void 0 || s.runId === void 0) {
         clock = "\u26A0\uFE0F \u5E73\u53F0\u505C\u8868\u672A\u6267\u884C\uFF08\u6392\u540D\u949F\u4ECD\u5728\u8D70\uFF09\uFF1A\u7F3A runBearerToken/runId\u3002\u8BF7\u8865\u8C03 xiaochang_setup \u4F20\u5165 runId+runBearerToken\uFF08\u6216 env RUN_BEARER_TOKEN\uFF09\u540E\u91CD\u8BD5 xiaochang_finish";
@@ -906,7 +972,7 @@ ${text}`;
         }
       }
       return `xiaochang_finish: score=${score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ", ALL TERMINAL" : ""})
-\u6392\u540D\u949F\uFF1A${clock}`;
+\u6392\u540D\u949F\uFF1A${clock}${guardMarker}`;
     }
   }));
 }
