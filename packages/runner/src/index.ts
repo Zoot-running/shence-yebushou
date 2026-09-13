@@ -37,37 +37,6 @@ function tierOf(difficulty: string): number {
   return 3
 }
 
-type KnowledgeIn = { kind: string; path: string; conclusion?: string; evidence?: string; by?: string; at?: number }
-/** 把该 code 的全部 item 知识聚合(跨尝试累积)。 */
-function knowledgeOfCode(code: string): KnowledgeIn[] {
-  if (campaign === undefined) return []
-  const out: KnowledgeIn[] = []
-  for (const v of campaign.ledger.views()) {
-    if (codeOf(v.item.id) !== code) continue
-    const k = campaign.knowledgeOf?.(v.item.id) ?? []
-    out.push(...k as KnowledgeIn[])
-  }
-  return out
-}
-/** 把知识写入该 code 的全部已有 item。 */
-function recordKnowledgeOnCode(code: string, entries: KnowledgeIn[]): void {
-  if (campaign === undefined || campaignId === undefined) return
-  for (const v of campaign.ledger.views()) {
-    if (codeOf(v.item.id) !== code) continue
-    holder.recordKnowledge?.(campaignId, v.item.id, entries)
-  }
-}
-function renderKnowledge(code: string): string {
-  const ks = knowledgeOfCode(code)
-  if (ks.length === 0) return ''
-  const lines = ['已知情报(自动附带, 前序执行者沉淀)']
-  for (const k of ks) {
-    const tag = k.kind === 'dead-end' ? '❌死路' : k.kind === 'fork' ? '🔀未走分叉' : '📌事实'
-    lines.push(`- [${tag}] ${k.path}${k.conclusion !== undefined ? ' → ' + k.conclusion : ''}${k.evidence !== undefined ? ' (证据: ' + k.evidence + ')' : ''}`)
-  }
-  return lines.join('\n')
-}
-
 function nodeFetch(): FetchLike {
   return async (url, init = {}) => {
     const res = await fetch(url, {
@@ -274,6 +243,38 @@ export function apply(ctx: Context): void {
   const c = (): HufuLike => {
     if (campaign === undefined) throw new Error('xiaochang: not set up — call xiaochang_setup first')
     return campaign
+  }
+
+  // ── F33 知识账本 helpers（apply 闭包内——campaign/campaignId/holder 都在这层作用域）──
+  type KnowledgeIn = { kind: string; path: string; conclusion?: string; evidence?: string; by?: string; at?: number }
+  /** 把该 code 的全部 item 知识聚合(跨尝试累积)。 */
+  function knowledgeOfCode(code: string): KnowledgeIn[] {
+    if (campaign === undefined) return []
+    const out: KnowledgeIn[] = []
+    for (const v of campaign.ledger.views()) {
+      if (codeOf(v.item.id) !== code) continue
+      const k = campaign.knowledgeOf?.(v.item.id) ?? []
+      out.push(...k as KnowledgeIn[])
+    }
+    return out
+  }
+  /** 把知识写入该 code 的全部已有 item。 */
+  function recordKnowledgeOnCode(code: string, entries: KnowledgeIn[]): void {
+    if (campaign === undefined || campaignId === undefined) return
+    for (const v of campaign.ledger.views()) {
+      if (codeOf(v.item.id) !== code) continue
+      try { holder.recordKnowledge?.(campaignId, v.item.id, entries) } catch { /* 知识落账失败不阻断调度 */ }
+    }
+  }
+  function renderKnowledge(code: string): string {
+    const ks = knowledgeOfCode(code)
+    if (ks.length === 0) return ''
+    const lines = ['已知情报(自动附带, 前序执行者沉淀)']
+    for (const k of ks) {
+      const tag = k.kind === 'dead-end' ? '❌死路' : k.kind === 'fork' ? '🔀未走分叉' : '📌事实'
+      lines.push(`- [${tag}] ${k.path}${k.conclusion !== undefined ? ' → ' + k.conclusion : ''}${k.evidence !== undefined ? ' (证据: ' + k.evidence + ')' : ''}`)
+    }
+    return lines.join('\n')
   }
   const register = (tool: object): void => ctx.tools.register(tool as never)
 
@@ -555,7 +556,9 @@ export function apply(ctx: Context): void {
       const ch = s.challenges.get(args.code)
       if (ch === undefined) return `xiaochang_enqueue: unknown challenge ${args.code}`
       // F33: 派单自动携带该题已知情报(死路/未走分叉/事实)——任何种子/模型都从已知边界出发。
-      const prior = renderKnowledge(args.code)
+      // 知识读取失败绝不阻断派单(调度 > 记账)。
+      let prior = ''
+      try { prior = renderKnowledge(args.code) } catch { /* 附情报失败: 按无知识派单 */ }
       const label = prior !== '' ? args.prompt + '\n\n' + prior : args.prompt
       const seq = s.progress.get(args.code)?.rounds ?? 0
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`
@@ -668,13 +671,13 @@ export function apply(ctx: Context): void {
     async execute(args: { code: string; verdict: string; reason?: string; deadEnds?: Array<{ path: string; conclusion?: string; evidence?: string }>; forks?: Array<{ path: string; conclusion?: string; evidence?: string }>; observations?: Array<{ path: string; conclusion?: string }> }) {
       const s = requireState()
       const verdict = args.verdict === 'complete' ? 'complete' as const : args.verdict === 'failed' ? 'failed' as const : 'skipped' as const
-      // F33: 结构化经验落账(全局解题图)
+      // F33: 结构化经验落账(全局解题图)——记账失败绝不阻断 verdict 主线(关容器/剪枝/落盘)。
       const entries: KnowledgeIn[] = [
         ...(args.deadEnds ?? []).map(e => ({ kind: 'dead-end', path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: 'report', at: Date.now() })),
         ...(args.forks ?? []).map(e => ({ kind: 'fork', path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: 'report', at: Date.now() })),
         ...(args.observations ?? []).map(e => ({ kind: 'observation', path: e.path, conclusion: e.conclusion, by: 'report', at: Date.now() })),
       ]
-      if (entries.length > 0) recordKnowledgeOnCode(args.code, entries)
+      try { if (entries.length > 0) recordKnowledgeOnCode(args.code, entries) } catch { /* 落账失败不阻断 */ }
       try { await s.adapter.close(args.code) } catch { /* 平台侧已关 */ }
       s.progress.update(args.code, { state: verdict, reason: args.reason, containerClosed: true })
       for (const v of c().ledger.views()) {
@@ -733,14 +736,15 @@ export function apply(ctx: Context): void {
     async execute(args: { code: string; forks: Array<{ path: string; conclusion?: string; evidence?: string }> }) {
       if (args.forks.length === 0) return 'xiaochang_fork: no forks given'
       const entries: KnowledgeIn[] = args.forks.map(f => ({ kind: 'fork', path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: 'fork', at: Date.now() }))
-      recordKnowledgeOnCode(args.code, entries)
+      let recorded = false
+      try { recordKnowledgeOnCode(args.code, entries); recorded = true } catch { /* 入账失败仍要唤醒 */ }
       const lines = entries.map(f => `- 🔀 ${f.path}${f.conclusion !== undefined ? ' → ' + f.conclusion : ''}${f.evidence !== undefined ? ' (证据: ' + f.evidence + ')' : ''}`)
       const notified = parentAgent !== undefined
       parentAgent?.followup(createUserMessage({
         content: [{ type: 'text', text: `🔀 分叉即时报(执行者 ${args.code}): 发现 ${entries.length} 条未走分叉, 已入账(全局解题图)。由你(主 agent)决定是否 jisi_fanout_bulk / xiaochang_enqueue 增兵。\n${lines.join('\n')}` }],
         source: { kind: 'user' },
       }))
-      return `fork 已入账${notified ? '并已唤醒主 agent' : '(主 agent 未在本进程 — 仅入账)'}:\n${lines.join('\n')}`
+      return `fork ${recorded ? '已入账' : '入账失败(仅通知)'}${notified ? '并已唤醒主 agent' : '(主 agent 未在本进程 — 仅通知)'}:\n${lines.join('\n')}`
     },
   }))
 
