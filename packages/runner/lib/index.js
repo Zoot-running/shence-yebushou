@@ -808,6 +808,9 @@ boardPath=${c().boardPath(args.code)}`;
         if (!listed.some((m) => m.id === executor.model)) {
           return `xiaochang_enqueue: model ${executor.model} is not in the registered model catalog (jisi listModels) \u2014 pick a listed model`;
         }
+        if (await jisi.isModelQuarantined?.(executor.model)) {
+          return `xiaochang_enqueue: model ${executor.model} \u6240\u5C5E provider \u4F59\u989D\u5DF2\u67AF\u7AED(\u9694\u79BB\u4E2D)\u2014\u2014\u6362\u6A21\u578B; \u5E76\u628A"provider \u4F59\u989D\u4E0D\u8DB3"\u5199\u8FDB\u6218\u62A5/\u6700\u7EC8\u6D88\u606F\u63D0\u793A\u7528\u6237\u5145\u503C`;
+        }
       }
       c().add({
         id: itemId,

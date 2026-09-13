@@ -86,6 +86,8 @@ interface JisiLike {
   }
   /** 模型目录（含 provider 归属）；enqueue 用其校验模型可派。 */
   listModels(): Promise<Array<{ id: string; provider: string }>>
+  /** F35: 模型所属 provider 是否余额枯竭隔离(来自集思 sidecar)。 */
+  isModelQuarantined?(model: string): Promise<boolean>
 }
 
 interface SetupArgs {
@@ -617,6 +619,10 @@ export function apply(ctx: Context): void {
         const listed = await jisi.listModels()
         if (!listed.some(m => m.id === executor.model)) {
           return `xiaochang_enqueue: model ${executor.model} is not in the registered model catalog (jisi listModels) — pick a listed model`
+        }
+        // F35: 余额枯竭隔离——不让派单把 token 砸进没钱的口袋(会在 spawn 层无声失败)。
+        if (await jisi.isModelQuarantined?.(executor.model)) {
+          return `xiaochang_enqueue: model ${executor.model} 所属 provider 余额已枯竭(隔离中)——换模型; 并把"provider 余额不足"写进战报/最终消息提示用户充值`
         }
       }
       c().add({
