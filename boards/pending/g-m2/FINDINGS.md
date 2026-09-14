@@ -1,0 +1,4 @@
+- [g-m2|w1|deepseek-v4-flash] 开工，板文件原先不存在，已创建。
+- [g-m2|w1|deepseek-v4-flash] bash base64 -d => mock{loc4l_dryrun_02}
+- [g-m2|w1|deepseek-v4-flash] python3 base64.b64decode 复核一致，无截断/padding 差异。
+- [g-m2|w1|deepseek-v4-flash] 口径判断：解码原文自带 mock{} 外壳，按逐字原文提交，不再套 flag{} 外壳。

@@ -1,0 +1,1 @@
+- [g-m3-worker] 2026: base64 'bW9ja3tsb2M0bF9kcnlydW5fMDN9' -> `mock{loc4l_dryrun_03}` (bash base64 -d 与 python3 base64.b64decode 双路一致)。题面提交口径=解码原文逐字，不再套 flag{} 外壳。 -> FLAG_CANDIDATE: mock{loc4l_dryrun_03}

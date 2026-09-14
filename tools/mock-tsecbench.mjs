@@ -54,7 +54,7 @@ const server = http.createServer((req, res) => {
   const p = url.pathname
   const q = url.searchParams
 
-  if (p === '/health') return json(res, 200, { ok: true, mock: 'dryrun' })
+  if (p === '/health') return json(res, 200, { status: 'ok', ok: true, mock: 'dryrun' })
   if (p === '/openapi/v1/challenges' && req.method === 'GET') {
     return json(res, 200, { challenges })
   }

@@ -1,0 +1,2 @@
+- [g-m1|w1|deepseek-v4-flash] 解码成功: base64 -> mock{loc4l_dryrun_01} (bash+python 双验; 19 chars, 无换行/padding 差异). 口径: 以解码原文逐字为准, 不再套 flag{} 外壳. FLAG_CANDIDATE: mock{loc4l_dryrun_01}
+- [g-m1|w1|deepseek-v4-flash] 更正: 上一行写的 19 chars 是笔误, 实测 xxd 长度 21 bytes (mock{=5 + loc4l_dryrun_01=15 + }=1). 除长度外结论不变.
