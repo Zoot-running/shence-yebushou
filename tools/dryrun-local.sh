@@ -12,6 +12,12 @@ trap 'kill $MOCK_PID 2>/dev/null || true' EXIT
 sleep 1
 curl -sf "http://127.0.0.1:$MOCK_PORT/health" >/dev/null || { echo "mock not up"; exit 1; }
 DSK="$(grep -oE 'sk-[A-Za-z0-9]+' "$REPO/../.secrets/api-keys.md" | head -1)"
+# 关键: dev profile 的 file: 安装是"拷贝"——每次干跑前必须重装四个插件, 否则跑的是旧 lib(2026-09-14 实锤)。
+for spec in "$REPO/packages/runner" "$REPO/../shence-jisi" "$REPO/../shence-hufu" "$REPO/../shence-dsh-compat"; do
+  pkg="$(node -e "console.log(require('$spec/package.json').name)")"
+  DSH_HOME="$DEV_HOME" node "$DSH_BIN" plugin --profile headless rm "$pkg" > /dev/null 2>&1 || true
+  DSH_HOME="$DEV_HOME" node "$DSH_BIN" plugin --profile headless add "file:$spec" > /dev/null 2>&1
+done
 # 清理上次干跑残留(dev home 的 storages)
 sudo rm -rf "$DEV_HOME/storages/xiaochang-fork-inbox" "$DEV_HOME/storages/hufu-campaigns"
 # 关键: driver 必须在专用 workdir 跑——runner 的 pre-run sweep 会清扫 cwd 的"旧工件",
