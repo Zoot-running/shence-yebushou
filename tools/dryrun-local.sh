@@ -22,7 +22,7 @@ cd "$WORK"
 DSH_HOME="$DEV_HOME" DEEPSEEK_BASE_URL=https://api.deepseek.com DEEPSEEK_API_KEY="$DSK" \
   timeout 3300 node "$DSH_BIN" --profile headless "$(cat "$REPO/tools/dryrun-order.txt")" > /tmp/dryrun-driver.log 2>&1 || true
 echo "── 干跑证据(dev home storages) ──"
-SNAP=$(ls "$DEV_HOME/storages/hufu-campaigns/"*.json "$DEV_HOME/storages/hufu-campaigns/archive/"*.json 2>/dev/null | head -1)
+SNAP=$(find "$DEV_HOME/storages/hufu-campaigns" -name "*.json" 2>/dev/null | head -1)
 echo "[分叉信箱]"; ls "$DEV_HOME/storages/xiaochang-fork-inbox/" 2>/dev/null | head -8 || echo "  (无)"
 echo "[知识账本条目]"
 grep -o '"kind":"fork"' "$SNAP" 2>/dev/null | wc -l | xargs echo "  fork:" || true
