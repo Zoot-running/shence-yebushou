@@ -54,8 +54,9 @@ const json = (res, code, body) => {
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`)
-  const auth = req.headers.authorization
-  if (url.pathname !== '/health' && auth !== `Bearer ${TOKEN}`) {
+  // 真实平台约定: adapter 发 BENCHMARK_TOKEN 头(非 Authorization)——干跑代理 hack 的根因。
+  const auth = req.headers['benchmark_token'] ?? req.headers.authorization
+  if (url.pathname !== '/health' && auth !== TOKEN && auth !== `Bearer ${TOKEN}`) {
     return json(res, 401, { detail: 'unauthorized' })
   }
   const p = url.pathname
