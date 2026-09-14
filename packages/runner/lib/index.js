@@ -143,6 +143,8 @@ var TsecbenchAdapter = class {
     this.config = config;
     this.fetch = fetch2;
   }
+  config;
+  fetch;
   headers(extra) {
     return { BENCHMARK_TOKEN: this.config.benchmarkToken, "Content-Type": "application/json", ...extra };
   }
@@ -349,6 +351,25 @@ function nodeFetch() {
     };
   };
 }
+function classifyQtype(text) {
+  const t = text.toLowerCase();
+  if (/(web|http|ssrf|xss|sqli?|csrf|javascript|php|flask|django|server|登录|接口|上传|rce.*web)/.test(t)) return "web";
+  if (/(rsa|aes|crypto|密文|加密|解密|elliptic|ecc|hash|padding)/.test(t)) return "crypto";
+  if (/(pwn|overflow|shellcode|rop|ret2|heap|栈|溢出|binary|elf|got)/.test(t)) return "pwn";
+  if (/(reverse|reversing|反编译|汇编|disassemble|ida|ghidra|逆向)/.test(t)) return "rev";
+  if (/(forensic|取证|pcap|流量|内存|disk|文件系统)/.test(t)) return "forensics";
+  return "misc";
+}
+function difficultyPrior(score) {
+  return Math.min(100, Math.round(100 * (1 - Math.exp(-score / 600))));
+}
+function calibrateDifficulty(q) {
+  const k = 5;
+  const p0 = 1 - q.difficulty / 100;
+  const a = p0 * k + q.wins;
+  const b = (1 - p0) * k + q.fails;
+  return Math.round(100 * (1 - a / (a + b)));
+}
 var state;
 var heartbeatTimer;
 function requireState() {
@@ -359,6 +380,12 @@ function audit(path, line) {
   try {
     appendFileSync(path, `${JSON.stringify(line)}
 `);
+  } catch {
+  }
+}
+function persistV2(s) {
+  try {
+    writeFileSync(s.v2Path, JSON.stringify(s.v2));
   } catch {
   }
 }
@@ -603,6 +630,8 @@ function apply(ctx) {
         progress,
         profile: createProfile("tsecbench-set"),
         hintLedger: new HintLedger(),
+        v2: {},
+        v2Path: join2(home, "storages", `xiaochang-v2-${args.runId ?? "pending"}.json`),
         processed: /* @__PURE__ */ new Set(),
         challenges: /* @__PURE__ */ new Map(),
         executorPolicy: {
@@ -634,6 +663,25 @@ function apply(ctx) {
         campaignId = created.id;
       }
       persistProgress(s);
+      try {
+        if (existsSync(s.v2Path)) s.v2 = JSON.parse(readFileSync(s.v2Path, "utf8"));
+        for (const ch of fresh) {
+          if (s.v2[ch.unique_code] === void 0) {
+            s.v2[ch.unique_code] = {
+              qtype: classifyQtype(ch.description ?? ""),
+              difficulty: difficultyPrior(ch.total_score),
+              wins: 0,
+              fails: 0,
+              gaps: [],
+              triedModels: [],
+              ideaRound: 1,
+              deadIdeas: 0,
+              adopted: 0
+            };
+          }
+        }
+      } catch {
+      }
       return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}`;
     }
   }));
@@ -764,7 +812,10 @@ boardPath=${c().boardPath(args.code)}`;
     parameters: { code: { type: "string", required: true } },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args) {
+    async execute(args, exec) {
+      if (parentAgent !== void 0 && exec.agent !== parentAgent) {
+        return "xiaochang_hint: \u62D2\u7EDD\u2014\u2014hint \u662F\u4E3B agent \u4E13\u5C5E\u5355\u70B9(\u9632\u591A\u6267\u884C\u8005\u540C\u65F6\u770B\u4E71); \u9700\u8981\u63D0\u793A\u8BF7\u5411\u4E3B agent \u8BF7\u6C42";
+      }
       const s = requireState();
       const used = s.hintLedger.get(args.code)?.hints ?? 0;
       if (used >= s.maxHints) return "xiaochang_hint: hint cap reached";
@@ -799,7 +850,12 @@ boardPath=${c().boardPath(args.code)}`;
         prior = renderKnowledge(args.code);
       } catch {
       }
-      const label = prior !== "" ? args.prompt + "\n\n" + prior : args.prompt;
+      const vq = s.v2[args.code];
+      let gapsTxt = "";
+      if (vq !== void 0 && vq.gaps.length > 0) {
+        gapsTxt = "\n\n\u5DF2\u77E5\u4E0A\u4E0B\u6587\u7F3A\u53E3(\u524D\u5E8F\u6267\u884C\u8005\u53CD\u9988\u7F3A\u7684\u4FE1\u606F, \u82E5\u4F60\u80FD\u8865\u5219\u8865, \u4E0D\u80FD\u8865\u5219\u660E\u786E\u8BF4\u7F3A\u4EC0\u4E48):\n" + vq.gaps.slice(-5).map((g) => `- ${g}`).join("\n");
+      }
+      const label = prior + gapsTxt !== "" ? args.prompt + "\n\n" + prior + gapsTxt : args.prompt;
       const seq = s.progress.get(args.code)?.rounds ?? 0;
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`;
       const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy);
@@ -875,6 +931,17 @@ boardPath=${c().boardPath(args.code)}`;
         if (v.state === "failed" && detail.includes("round timeout") && v.item.model !== void 0) {
           jisi?.ledger.record(v.item.model, "execution", s.challenges.get(code)?.difficulty ?? "unknown", false);
         }
+        if (v.item.model !== void 0) {
+          const vq = s.v2[code] ?? { qtype: classifyQtype(s.challenges.get(code)?.description ?? ""), difficulty: difficultyPrior(s.challenges.get(code)?.total_score ?? 300), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 };
+          if (v.state === "done") {
+            jisi?.recordV2?.({ model: v.item.model, dimension: "execution", qtype: vq.qtype, difficulty: vq.difficulty, weight: Math.log(1 + vq.difficulty / 25), win: true, note: `${v.item.id} done` });
+          } else if (v.state === "failed" && detail.includes("round timeout")) {
+            jisi?.recordV2?.({ model: v.item.model, dimension: "execution", qtype: vq.qtype, difficulty: vq.difficulty, weight: Math.log(1 + 25 / vq.difficulty), win: false, attribution: "model-weak", note: `${v.item.id} round timeout` });
+          }
+          if (!vq.triedModels.includes(v.item.model)) vq.triedModels.push(v.item.model);
+          s.v2[code] = vq;
+          persistV2(s);
+        }
         for (const note of parseObservations(detail)) addFact(s.profile, { kind: "other", note });
         audit(s.auditPath, { type: "terminal", id: v.item.id, state: v.state, round, detail: detail.slice(0, 300) });
         rows.push(`--- ${v.item.id} [${v.state}] round=${round} code=${code}
@@ -894,13 +961,30 @@ ${detail.slice(0, 6e3)}`);
       reason: { type: "string", description: "Short reason (logged)." },
       deadEnds: { type: "array", description: "[{path, conclusion, evidence}] proven-infeasible paths." },
       forks: { type: "array", description: "[{path, conclusion, evidence}] untaken branches worth dispatching." },
-      observations: { type: "array", description: "[{path, conclusion}] facts learned." }
+      observations: { type: "array", description: "[{path, conclusion}] facts learned." },
+      why: { type: "string", description: "v2 \u5F52\u56E0(failed \u65F6\u5FC5\u586B): model-weak | approach-dead-end | context-insufficient | platform-issue. \u4E24\u7EA7\u5224\u5B9A: \u6267\u884C\u8005\u62A5\u544A\u63D0\u8BAE, \u4F60\u7EC8\u88C1." },
+      gaps: { type: "array", description: "v2 \u4E0A\u4E0B\u6587\u7F3A\u53E3(context-insufficient \u65F6): [\u7F3A\u4EC0\u4E48\u4FE1\u606F]. \u8FDB\u753B\u50CF contextGaps, \u4E0B\u6B21\u6D3E\u5355/\u4E8C\u6B21\u5F81\u96C6\u81EA\u52A8\u9644\u5E26." }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
     async execute(args) {
       const s = requireState();
       const verdict = args.verdict === "complete" ? "complete" : args.verdict === "failed" ? "failed" : "skipped";
+      const vq = s.v2[args.code] ?? { qtype: classifyQtype(s.challenges.get(args.code)?.description ?? ""), difficulty: difficultyPrior(s.challenges.get(args.code)?.total_score ?? 300), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 };
+      const why = args.why;
+      const win = verdict === "complete";
+      if (why !== "context-insufficient" && why !== "platform-issue") {
+        vq.wins += win ? 1 : 0;
+        vq.fails += win ? 0 : 1;
+        vq.difficulty = calibrateDifficulty(vq);
+        vq.lastVerdict = verdict;
+      }
+      if (args.gaps !== void 0 && args.gaps.length > 0) vq.gaps.push(...args.gaps);
+      s.v2[args.code] = vq;
+      persistV2(s);
+      if (jisi !== void 0) {
+        jisi.settleAdoptions?.(args.code, win, why);
+      }
       const entries = [
         ...(args.deadEnds ?? []).map((e) => ({ kind: "dead-end", path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: "report", at: Date.now() })),
         ...(args.forks ?? []).map((e) => ({ kind: "fork", path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: "report", at: Date.now() })),
@@ -955,6 +1039,64 @@ ${text}`;
     async execute() {
       const s = requireState();
       return render(s.profile);
+    }
+  }));
+  register(defineTool({
+    name: "xiaochang_refanout",
+    description: "V2 layer-3 R2 re-fanout: one call re-collects ideas for a stuck challenge WITH all prior context (R1 ideas alive+dead, dead-end list, context gaps, tried models) and ADDS models beyond the tried set (pick-ranked by idea fit, expensive models included when tried set is exhausted). Call it when xiaochang_status shows \u26A0\uFE0F upgrade suggestions, or when half the adopted ideas died.",
+    parameters: {
+      code: { type: "string", required: true }
+    },
+    output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      const s = requireState();
+      const ch = s.challenges.get(args.code);
+      if (ch === void 0) return `xiaochang_refanout: unknown challenge ${args.code}`;
+      const vq = s.v2[args.code] ?? { qtype: classifyQtype(ch.description ?? ""), difficulty: difficultyPrior(ch.total_score), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 };
+      const agent = exec.agent;
+      if (agent === void 0) return "xiaochang_refanout: requires a calling agent";
+      const dead = knowledgeOfCode(args.code).filter((k) => k.kind === "dead-end").map((k) => `- ${k.path}: ${k.conclusion ?? ""}`).join("\n") || "(\u65E0)";
+      const gaps = vq.gaps.length > 0 ? vq.gaps.map((g) => `- ${g}`).join("\n") : "(\u65E0)";
+      const tried = vq.triedModels.length > 0 ? vq.triedModels.join(", ") : "(\u65E0)";
+      const prompt = `[\u4E8C\u6B21\u601D\u8DEF\u5F81\u96C6 R${vq.ideaRound + 1}] \u9898\u76EE ${args.code}(${vq.qtype}, \u6821\u51C6\u96BE\u5EA6 ${vq.difficulty}/100)
+\u9898\u9762: ${(ch.description ?? "").slice(0, 1500)}
+
+\u5DF2\u77E5\u6B7B\u8DEF(\u524D\u5E8F\u601D\u8DEF\u5DF2\u8BC1\u4E0D\u53EF\u884C):
+${dead}
+
+\u4E0A\u4E0B\u6587\u7F3A\u53E3(\u524D\u5E8F\u6267\u884C\u8005\u53CD\u9988\u7F3A\u7684\u4FE1\u606F):
+${gaps}
+
+\u5DF2\u8BD5\u6A21\u578B: ${tried}
+\u5DF2\u91C7\u7528\u601D\u8DEF ${vq.adopted} \u6761, \u5DF2\u6B7B ${vq.deadIdeas} \u6761\u3002
+
+\u63D0\u95EE: \u5DF2\u77E5\u4EE5\u4E0A\u6B7B\u8DEF\u4E0E\u7F3A\u53E3\u4E4B\u540E, \u8FD8\u6709\u54EA\u4E9B**\u6CA1\u8BD5\u8FC7**\u7684\u65B9\u5411? \u4E0D\u8981\u91CD\u590D\u6B7B\u8DEF; \u6BCF\u6761\u7ED9: \u4E3A\u4EC0\u4E48\u53EF\u884C + \u9A8C\u8BC1\u70B9 + \u9700\u8981\u8865\u7684\u4E0A\u4E0B\u6587\u3002`;
+      let models = [];
+      if (jisi?.pickRank !== void 0) {
+        const ranked = await jisi.pickRank(vq.qtype, vq.difficulty, "idea");
+        const fresh = ranked.filter((r) => !vq.triedModels.includes(r.model)).map((r) => r.model);
+        models = fresh.length > 0 ? fresh.slice(0, 3) : ranked.slice(0, 3).map((r) => r.model);
+      }
+      if (models.length === 0) {
+        const listed = await jisi?.listModels();
+        models = (listed ?? []).map((m) => m.id).slice(0, 3);
+      }
+      if (jisi?.fanoutNotify !== void 0) {
+        const ticket = jisi.fanoutNotify(agent, { prompt }, models);
+        vq.ideaRound += 1;
+        vq.triedModels.push(...models.filter((m) => !vq.triedModels.includes(m)));
+        s.v2[args.code] = vq;
+        persistV2(s);
+        return `xiaochang_refanout: R${vq.ideaRound} \u5F81\u96C6\u5DF2\u53D1 (${models.join(", ")}, ticket ${ticket.id}).
+\u62A5\u544A\u6309 [fanout:${ticket.id}] \u4FE1\u5C01\u5230\u8FBE\u2014\u2014\u5230\u8FBE\u540E\u8BF7 jisi_adjudicate \u88C1\u51B3(adopted/not-adopted/pending), \u91C7\u7EB3\u5373\u6D3E\u5355\u3002
+
+\u53D1\u9001\u7684 prompt:
+${prompt.slice(0, 600)}...`;
+      }
+      return `xiaochang_refanout: jisi \u901A\u9053\u4E0D\u53EF\u7528\u3002\u8BF7\u7528 jisi_fanout(prompt \u89C1\u4E0B, models=${models.join(", ")} \u6216\u6309 jisi_pick ${vq.qtype}/${vq.difficulty} \u53D6)\u3002
+
+${prompt}`;
     }
   }));
   register(defineTool({
@@ -1039,12 +1181,24 @@ ${lines.join("\n")}`;
       const count = (fn) => views.filter(fn).length;
       const remaining = Math.max(0, s.startedAt + s.budgetMs - Date.now());
       const progress = s.progress.all().map((p) => `${p.code}:${p.state}${p.state === "complete" ? `(${p.flags.length} flags)` : ""}`).join(", ");
+      const escLines = [];
+      for (const [code, q] of Object.entries(s.v2)) {
+        const st = jisi?.adoptionStats?.(code) ?? { adopted: q.adopted, dead: q.deadIdeas };
+        if (st.adopted === 0) continue;
+        if (st.dead / st.adopted >= 0.5) {
+          escLines.push(`\u26A0\uFE0F ${code}: \u6B7B\u601D\u8DEF ${st.dead}/${st.adopted} \u226550% \u2192 \u5EFA\u8BAE xiaochang_refanout \u4E8C\u6B21\u5F81\u96C6(\u96BE\u5EA6${q.difficulty}, \u5DF2\u8BD5 ${q.triedModels.join(",") || "\u65E0"})`);
+        }
+      }
+      const escTxt = escLines.length > 0 ? `
+\u5347\u7EA7\u5EFA\u8BAE:
+${escLines.join("\n")}` : "";
       return [
         `campaign: open=${count((v) => v.state === "dispatched" || v.state === "help")} queued=${count((v) => v.state === "queued")} done=${count((v) => v.state === "done")} failed=${count((v) => v.state === "failed")} blocked=${count((v) => v.state === "blocked")}`,
         `budgetRemainingMin=${Math.round(remaining / 6e4)}`,
         `openContainers=${[...openContainers(s)].join(",") || "none"}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
-        `progress: ${progress}`
+        `progress: ${progress}`,
+        escTxt
       ].join("\n");
     }
   }));

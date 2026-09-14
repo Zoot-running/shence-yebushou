@@ -88,6 +88,16 @@ interface JisiLike {
   listModels(): Promise<Array<{ id: string; provider: string }>>
   /** F35: 模型所属 provider 是否余额枯竭隔离(来自集思 sidecar)。 */
   isModelQuarantined?(model: string): Promise<boolean>
+  /** v2: 加权入账(第 1 层)。 */
+  recordV2?(r: { model: string; dimension: 'execution' | 'idea'; qtype: string; difficulty: number; weight: number; win: boolean; attribution?: string; note?: string }): void
+  /** v2: 终局对账(采纳思路, 第 0 层)。 */
+  settleAdoptions?(code: string, win: boolean, attribution: string | undefined): void
+  /** v2: 契合度排名(第 2 层), 供 refanout 选模。 */
+  pickRank?(qtype: string, difficulty: number, dimension: 'execution' | 'idea'): Promise<Array<{ model: string; thompson: number; mean: number; n: number }>>
+  /** v2: fanout 发兵(notify 语义), 供 refanout 一键 R2。 */
+  fanoutNotify?(parent: unknown, work: { prompt: string }, models: string[], opts?: Record<string, unknown>): { id: string; models: string[] }
+  /** v2: 升级状态(采纳累计/已死)。 */
+  adoptionStats?(code: string): { adopted: number; dead: number }
 }
 
 interface SetupArgs {
@@ -110,6 +120,47 @@ interface SetupArgs {
   modelLock?: boolean
 }
 
+/** 每题 v2 状态(第 0/3 层)。 */
+interface V2Question {
+  qtype: string
+  /** 校准后难度(0-100)。 */
+  difficulty: number
+  wins: number
+  fails: number
+  gaps: string[]
+  triedModels: string[]
+  ideaRound: number
+  deadIdeas: number
+  adopted: number
+  lastVerdict?: string
+}
+type V2State = Record<string, V2Question>
+
+/** 题型粗分类(题面关键词启发式; misc 兜底)。 */
+function classifyQtype(text: string): string {
+  const t = text.toLowerCase()
+  if (/(web|http|ssrf|xss|sqli?|csrf|javascript|php|flask|django|server|登录|接口|上传|rce.*web)/.test(t)) return 'web'
+  if (/(rsa|aes|crypto|密文|加密|解密|elliptic|ecc|hash|padding)/.test(t)) return 'crypto'
+  if (/(pwn|overflow|shellcode|rop|ret2|heap|栈|溢出|binary|elf|got)/.test(t)) return 'pwn'
+  if (/(reverse|reversing|反编译|汇编|disassemble|ida|ghidra|逆向)/.test(t)) return 'rev'
+  if (/(forensic|取证|pcap|流量|内存|disk|文件系统)/.test(t)) return 'forensics'
+  return 'misc'
+}
+
+/** 难度先验映射(宿主层: 平台分 → 0-100)。 */
+function difficultyPrior(score: number): number {
+  return Math.min(100, Math.round(100 * (1 - Math.exp(-score / 600))))
+}
+
+/** 终局校准(贝叶斯, 归因门控在调用方)。 */
+function calibrateDifficulty(q: { difficulty: number; wins: number; fails: number }): number {
+  const k = 5
+  const p0 = 1 - q.difficulty / 100
+  const a = p0 * k + q.wins
+  const b = (1 - p0) * k + q.fails
+  return Math.round(100 * (1 - a / (a + b)))
+}
+
 interface CampaignState {
   baseURL: string
   benchmarkToken: string
@@ -129,6 +180,9 @@ interface CampaignState {
   progress: RunProgress
   profile: import('../../../src/profile.ts').OrgProfile
   hintLedger: HintLedger
+  /** v2 决策内核状态(第 0/3 层): 每题 qtype/难度/缺口/已试模型/思路轮/死思路数。 */
+  v2: V2State
+  v2Path: string
   processed: Set<string>
   challenges: Map<string, ChallengeInfo>
   executorPolicy: ExecutorPolicy
@@ -146,6 +200,10 @@ function audit(path: string, line: object): void {
   try {
     appendFileSync(path, `${JSON.stringify(line)}\n`)
   } catch { /* 审计失败不影响主流程 */ }
+}
+
+function persistV2(s: CampaignState): void {
+  try { writeFileSync(s.v2Path, JSON.stringify(s.v2)) } catch { /* 落盘失败不致命 */ }
 }
 
 function persistProgress(s: CampaignState): void {
@@ -400,6 +458,8 @@ export function apply(ctx: Context): void {
         progress,
         profile: createProfile('tsecbench-set'),
         hintLedger: new HintLedger(),
+        v2: {},
+        v2Path: join(home, 'storages', `xiaochang-v2-${args.runId ?? 'pending'}.json`),
         processed: new Set(),
         challenges: new Map(),
         executorPolicy: {
@@ -437,6 +497,18 @@ export function apply(ctx: Context): void {
         campaignId = created.id
       }
       persistProgress(s)
+      try {
+        if (existsSync(s.v2Path)) s.v2 = JSON.parse(readFileSync(s.v2Path, 'utf8')) as V2State
+        for (const ch of fresh) {
+          if (s.v2[ch.unique_code] === undefined) {
+            s.v2[ch.unique_code] = {
+              qtype: classifyQtype(ch.description ?? ''),
+              difficulty: difficultyPrior(ch.total_score),
+              wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0,
+            }
+          }
+        }
+      } catch { /* v2 状态损坏: 重建 */ }
       return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}`
     },
   }))
@@ -571,7 +643,11 @@ export function apply(ctx: Context): void {
     parameters: { code: { type: 'string', required: true } },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args: { code: string }) {
+    async execute(args: { code: string }, exec) {
+      // v2 第 3 层: hint 单点强制——只有主 agent(战役 setup 者)可调, 防多执行者同时看乱。
+      if (parentAgent !== undefined && exec.agent !== parentAgent) {
+        return 'xiaochang_hint: 拒绝——hint 是主 agent 专属单点(防多执行者同时看乱); 需要提示请向主 agent 请求'
+      }
       const s = requireState()
       const used = s.hintLedger.get(args.code)?.hints ?? 0
       if (used >= s.maxHints) return 'xiaochang_hint: hint cap reached'
@@ -608,7 +684,13 @@ export function apply(ctx: Context): void {
       // 知识读取失败绝不阻断派单(调度 > 记账)。
       let prior = ''
       try { prior = renderKnowledge(args.code) } catch { /* 附情报失败: 按无知识派单 */ }
-      const label = prior !== '' ? args.prompt + '\n\n' + prior : args.prompt
+      // v2: 上下文缺口自动附带(contextGaps)——缺啥补啥, 不罚模型只补题。
+      const vq = s.v2[args.code]
+      let gapsTxt = ''
+      if (vq !== undefined && vq.gaps.length > 0) {
+        gapsTxt = '\n\n已知上下文缺口(前序执行者反馈缺的信息, 若你能补则补, 不能补则明确说缺什么):\n' + vq.gaps.slice(-5).map(g => `- ${g}`).join('\n')
+      }
+      const label = (prior + gapsTxt) !== '' ? args.prompt + '\n\n' + prior + gapsTxt : args.prompt
       const seq = s.progress.get(args.code)?.rounds ?? 0
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`
       // 执行者模型/强度：主 agent 逐项覆盖优先，缺省兜底；模型锁定时强制缺省。
@@ -696,6 +778,18 @@ export function apply(ctx: Context): void {
         if (v.state === 'failed' && detail.includes('round timeout') && v.item.model !== undefined) {
           jisi?.ledger.record(v.item.model, 'execution', s.challenges.get(code)?.difficulty ?? 'unknown', false)
         }
+        // v2 执行成色(第 1 层): 终态胜 → +winWeight; 超时负 → model-weak −failWeight。
+        if (v.item.model !== undefined) {
+          const vq = s.v2[code] ?? { qtype: classifyQtype(s.challenges.get(code)?.description ?? ''), difficulty: difficultyPrior(s.challenges.get(code)?.total_score ?? 300), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 }
+          if (v.state === 'done') {
+            jisi?.recordV2?.({ model: v.item.model, dimension: 'execution', qtype: vq.qtype, difficulty: vq.difficulty, weight: Math.log(1 + vq.difficulty / 25), win: true, note: `${v.item.id} done` })
+          } else if (v.state === 'failed' && detail.includes('round timeout')) {
+            jisi?.recordV2?.({ model: v.item.model, dimension: 'execution', qtype: vq.qtype, difficulty: vq.difficulty, weight: Math.log(1 + 25 / vq.difficulty), win: false, attribution: 'model-weak', note: `${v.item.id} round timeout` })
+          }
+          if (!vq.triedModels.includes(v.item.model)) vq.triedModels.push(v.item.model)
+          s.v2[code] = vq
+          persistV2(s)
+        }
         // 画像积累：OBSERVATIONS 小节自动并入题集画像。
         for (const note of parseObservations(detail)) addFact(s.profile, { kind: 'other', note })
         audit(s.auditPath, { type: 'terminal', id: v.item.id, state: v.state, round, detail: detail.slice(0, 300) })
@@ -718,12 +812,31 @@ export function apply(ctx: Context): void {
       deadEnds: { type: 'array', description: '[{path, conclusion, evidence}] proven-infeasible paths.' },
       forks: { type: 'array', description: '[{path, conclusion, evidence}] untaken branches worth dispatching.' },
       observations: { type: 'array', description: '[{path, conclusion}] facts learned.' },
+      why: { type: 'string', description: 'v2 归因(failed 时必填): model-weak | approach-dead-end | context-insufficient | platform-issue. 两级判定: 执行者报告提议, 你终裁.' },
+      gaps: { type: 'array', description: 'v2 上下文缺口(context-insufficient 时): [缺什么信息]. 进画像 contextGaps, 下次派单/二次征集自动附带.' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args: { code: string; verdict: string; reason?: string; deadEnds?: Array<{ path: string; conclusion?: string; evidence?: string }>; forks?: Array<{ path: string; conclusion?: string; evidence?: string }>; observations?: Array<{ path: string; conclusion?: string }> }) {
+    async execute(args: { code: string; verdict: string; reason?: string; deadEnds?: Array<{ path: string; conclusion?: string; evidence?: string }>; forks?: Array<{ path: string; conclusion?: string; evidence?: string }>; observations?: Array<{ path: string; conclusion?: string }>; why?: string; gaps?: string[] }) {
       const s = requireState()
       const verdict = args.verdict === 'complete' ? 'complete' as const : args.verdict === 'failed' ? 'failed' as const : 'skipped' as const
+      // v2: 归因门控的难度校准 + 终局对账 + 加权入账。
+      const vq = s.v2[args.code] ?? { qtype: classifyQtype(s.challenges.get(args.code)?.description ?? ''), difficulty: difficultyPrior(s.challenges.get(args.code)?.total_score ?? 300), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 }
+      const why = args.why
+      const win = verdict === 'complete'
+      if (why !== 'context-insufficient' && why !== 'platform-issue') {
+        vq.wins += win ? 1 : 0
+        vq.fails += win ? 0 : 1
+        vq.difficulty = calibrateDifficulty(vq)
+        vq.lastVerdict = verdict
+      }
+      if (args.gaps !== undefined && args.gaps.length > 0) vq.gaps.push(...args.gaps)
+      s.v2[args.code] = vq
+      persistV2(s)
+      if (jisi !== undefined) {
+        // 终局对账: 采纳的思路, 题胜不加; 题败且归因 approach-dead-end → 罚思路模型(第 0 层)。
+        jisi.settleAdoptions?.(args.code, win, why)
+      }
       // F33: 结构化经验落账(全局解题图)——记账失败绝不阻断 verdict 主线(关容器/剪枝/落盘)。
       const entries: KnowledgeIn[] = [
         ...(args.deadEnds ?? []).map(e => ({ kind: 'dead-end', path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: 'report', at: Date.now() })),
@@ -772,6 +885,64 @@ export function apply(ctx: Context): void {
     async execute() {
       const s = requireState()
       return renderProfile(s.profile)
+    },
+  }))
+
+  // ── v2 第 3 层: R2 二次征集(上下文带入 + 加模型) ────────────────
+  register(defineTool({
+    name: 'xiaochang_refanout',
+    description:
+      'V2 layer-3 R2 re-fanout: one call re-collects ideas for a stuck challenge WITH all prior context (R1 ideas alive+dead, dead-end list, context gaps, tried models) and ADDS models beyond the tried set (pick-ranked by idea fit, expensive models included when tried set is exhausted). Call it when xiaochang_status shows ⚠️ upgrade suggestions, or when half the adopted ideas died.',
+    parameters: {
+      code: { type: 'string', required: true },
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args: { code: string }, exec) {
+      const s = requireState()
+      const ch = s.challenges.get(args.code)
+      if (ch === undefined) return `xiaochang_refanout: unknown challenge ${args.code}`
+      const vq = s.v2[args.code] ?? { qtype: classifyQtype(ch.description ?? ''), difficulty: difficultyPrior(ch.total_score), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 }
+      const agent = exec.agent
+      if (agent === undefined) return 'xiaochang_refanout: requires a calling agent'
+      // ① 拼装 R2 prompt: 题面+画像+死路+缺口+已试(R1 全部思路已在知识账本, 主 agent 裁决过的 adopted 也在)。
+      const dead = knowledgeOfCode(args.code).filter(k => k.kind === 'dead-end').map(k => `- ${k.path}: ${k.conclusion ?? ''}`).join('\n') || '(无)'
+      const gaps = vq.gaps.length > 0 ? vq.gaps.map(g => `- ${g}`).join('\n') : '(无)'
+      const tried = vq.triedModels.length > 0 ? vq.triedModels.join(', ') : '(无)'
+      const prompt = `[二次思路征集 R${vq.ideaRound + 1}] 题目 ${args.code}(${vq.qtype}, 校准难度 ${vq.difficulty}/100)
+题面: ${(ch.description ?? '').slice(0, 1500)}
+
+已知死路(前序思路已证不可行):
+${dead}
+
+上下文缺口(前序执行者反馈缺的信息):
+${gaps}
+
+已试模型: ${tried}
+已采用思路 ${vq.adopted} 条, 已死 ${vq.deadIdeas} 条。
+
+提问: 已知以上死路与缺口之后, 还有哪些**没试过**的方向? 不要重复死路; 每条给: 为什么可行 + 验证点 + 需要补的上下文。`
+      // ② 选模: 直接加模型——pick 排名里未试过的优先(增添信息), 全试过则连已试也不排除(全量兜底)。
+      let models: string[] = []
+      if (jisi?.pickRank !== undefined) {
+        const ranked = await jisi.pickRank(vq.qtype, vq.difficulty, 'idea')
+        const fresh = ranked.filter(r => !vq.triedModels.includes(r.model)).map(r => r.model)
+        models = fresh.length > 0 ? fresh.slice(0, 3) : ranked.slice(0, 3).map(r => r.model)
+      }
+      if (models.length === 0) {
+        const listed = await jisi?.listModels()
+        models = (listed ?? []).map(m => m.id).slice(0, 3)
+      }
+      // ③ 发兵(notify): 主 agent 收到信封后照常 jisi_adjudicate 裁决。
+      if (jisi?.fanoutNotify !== undefined) {
+        const ticket = jisi.fanoutNotify(agent, { prompt }, models)
+        vq.ideaRound += 1
+        vq.triedModels.push(...models.filter(m => !vq.triedModels.includes(m)))
+        s.v2[args.code] = vq
+        persistV2(s)
+        return `xiaochang_refanout: R${vq.ideaRound} 征集已发 (${models.join(', ')}, ticket ${ticket.id}).\n报告按 [fanout:${ticket.id}] 信封到达——到达后请 jisi_adjudicate 裁决(adopted/not-adopted/pending), 采纳即派单。\n\n发送的 prompt:\n${prompt.slice(0, 600)}...`
+      }
+      return `xiaochang_refanout: jisi 通道不可用。请用 jisi_fanout(prompt 见下, models=${models.join(', ')} 或按 jisi_pick ${vq.qtype}/${vq.difficulty} 取)。\n\n${prompt}`
     },
   }))
 
@@ -853,12 +1024,22 @@ export function apply(ctx: Context): void {
       const count = (fn: (v: { state: string }) => boolean): number => views.filter(fn).length
       const remaining = Math.max(0, s.startedAt + s.budgetMs - Date.now())
       const progress = s.progress.all().map(p => `${p.code}:${p.state}${p.state === 'complete' ? `(${p.flags.length} flags)` : ''}`).join(', ')
+      // v2 第 3 层: 升级状态机可见性(采纳/已死计数来自集思裁决账)。
+      const escLines: string[] = []
+      for (const [code, q] of Object.entries(s.v2)) {
+        const st = jisi?.adoptionStats?.(code) ?? { adopted: q.adopted, dead: q.deadIdeas }
+        if (st.adopted === 0) continue
+        if (st.dead / st.adopted >= 0.5) {
+          escLines.push(`⚠️ ${code}: 死思路 ${st.dead}/${st.adopted} ≥50% → 建议 xiaochang_refanout 二次征集(难度${q.difficulty}, 已试 ${q.triedModels.join(',') || '无'})`)
+        }
+      }
+      const escTxt = escLines.length > 0 ? `\n升级建议:\n${escLines.join('\n')}` : ''
       return [
         `campaign: open=${count(v => v.state === 'dispatched' || v.state === 'help')} queued=${count(v => v.state === 'queued')} done=${count(v => v.state === 'done')} failed=${count(v => v.state === 'failed')} blocked=${count(v => v.state === 'blocked')}`,
         `budgetRemainingMin=${Math.round(remaining / 60000)}`,
         `openContainers=${[...openContainers(s)].join(',') || 'none'}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
-        `progress: ${progress}`,
+        `progress: ${progress}`, escTxt,
       ].join('\n')
     },
   }))
