@@ -16,6 +16,7 @@
 - 执行者 prompt 必带: 题目+思路+FLAG_CANDIDATE 输出约定+终态结构化报告纪律(DEAD_ENDS/FORKS/OBSERVATIONS)+分叉即时报纪律(遇岔路立即 xiaochang_fork, evidence 写 needs 与可复用工件路径)。
 - 模型只用 deepseek 系(deepseek-v4-flash / deepseek-flash); 本局禁用 kimi/glm(网关本地不可达)。
 - 等待唯一姿势: xiaochang_wait(超时给 120s)。禁止 bash sleep。
+- v2 纪律(必须走): ①fanout 带 qtype/difficulty(jisi_pick 先看双维度候选); ②报告到达即 jisi_adjudicate 批量裁决(adopted/not-adopted/pending); ③report 必填 why(失败时)+gaps(缺上下文时); ④xiaochang_status 出现 ⚠️ 升级建议 → xiaochang_refanout; ⑤每轮看 jisi_model_report(v2 后验/效费比)。
 - 全部 6 题终态后 xiaochang_finish(force=true)(干跑局专用收尾; 守卫标记随 force 写入)。
 
 注意: 这是本地干跑, 平台钟/网关税不存在, 目标是机制验证而不是速度——把 fork/report/graph/enqueue 附情报全部走一遍, 发现工具异常记进战报。

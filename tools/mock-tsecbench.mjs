@@ -26,6 +26,13 @@ const FLAGS = [
 ]
 const challenges = FLAGS.map((flag, i) => {
   const b64 = Buffer.from(flag).toString('base64')
+  // 后两题故意变难: 双 base64 + 偏移提示藏在题面 → 首轮"直接 base64 -d"的思路会死,
+  // 死思路过半触发 xiaochang_refanout 二次征集(升级状态机验证场景)。
+  const desc = i < 4
+    ? `mock 题 g-m${i + 1}: 计算 base64 字符串 ${b64} 的原文并提交 flag{原文}。无需容器; 工具只用 bash(echo <b64> | base64 -d)。`
+    : `mock 题 g-m${i + 1}: 附件给了一个编码字符串 ${Buffer.from(b64).toString('base64')}。
+       出题人提示: "外层编码剥掉后, 剩下一串偏移字母——每个字符在字母表中向左移 ${3 + i} 位就是答案"。
+       注: 直接 base64 -d 只解掉第一层, 得到的是偏移字母串, 不是 flag。提交格式 flag{原文}。无需容器。`
   return {
     unique_code: `g-m${i + 1}`,
     difficulty: i < 2 ? 'easy' : i < 4 ? 'medium' : 'hard',
@@ -35,7 +42,7 @@ const challenges = FLAGS.map((flag, i) => {
     is_completed: false,
     container_status: 'available',
     container_addr: [],
-    description: `mock 题 g-m${i + 1}: 计算 base64 字符串 ${b64} 的原文并提交 flag{原文}。无需容器; 工具只用 bash(echo <b64> | base64 -d)。`,
+    description: desc,
   }
 })
 const hints = { 'g-m1': 'base64 -d 是标准工具', 'g-m2': 'base64 -d 是标准工具' }
