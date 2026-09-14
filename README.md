@@ -13,6 +13,27 @@
 
 - L0：15 项全绿（画像 6 + 适配器/hint 账本/治理 9）。
 
+## runner 插件（packages/runner）—— 校场编排器
+
+夜不收适配器 × 虎符战役 × 集思通道的宿主侧编排:
+
+- 平台六原语 + 容器槽位(3 上限)+ hint 经济学 + clean-room 门禁;
+- 虎符大兵团: enqueue/dispatch/collect, 终态 report 自动剪枝;
+- **F33 经验机制**: 终态结构化报告(deadEnds/forks/observations)→ 知识账本;
+  分叉即时报(xiaochang_fork → 盘上信箱 → 主 agent 唤醒); 全局解题图(xiaochang_graph);
+  派单自动附带死路/未走分叉/事实;
+- **v2 决策内核宿主侧**(设计 [shence-jisi/METHODOLOGY/JISI-V2-DESIGN.md](https://github.com/Zoot-running/shence-jisi/blob/main/METHODOLOGY/JISI-V2-DESIGN.md)):
+  - `xiaochang_report.why` 四归因(执行者提议 + 主 agent 终裁);
+  - 通用难度校准(宿主映射 + 终局 Beta + 归因门控)+ 题型粗分类;
+  - contextGaps 画像(缺口自动附进派单/二次征集);
+  - `xiaochang_refanout` R2 一键二次征集(题面+死路+缺口+已试模型, 加模型发兵);
+  - `xiaochang_status` ⚠️ 升级建议(死思路 ≥50%);
+  - hint 单点守卫(仅主 agent 可调);
+- 本地干跑台: `tools/mock-tsecbench.mjs` + `tools/dryrun-local.sh`(不碰 docker),
+  流程 = 讨论→改码→单测+干跑→上仓库→托管打包才进 docker。
+
 ## 理念
 
-不教 AI 做事；私知与可泛化经验物理隔离（local/ vs 技能本体）。
+不教 AI 做事；私知与可泛化经验物理隔离（local/ vs 技能本体）；
+满分 > 用时 > 花费(字典序)——赶工贵模型是正当花费。
+
