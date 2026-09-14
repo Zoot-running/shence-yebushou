@@ -1033,6 +1033,19 @@ ${gaps}
           escLines.push(`⚠️ ${code}: 死思路 ${st.dead}/${st.adopted} ≥50% → 建议 xiaochang_refanout 二次征集(难度${q.difficulty}, 已试 ${q.triedModels.join(',') || '无'})`)
         }
       }
+      const remaining = Math.max(0, s.startedAt + s.budgetMs - Date.now())
+      if (remaining <= 60 * 60_000) {
+        const hardUnsolved = Object.entries(s.v2).filter(([, q]) => q.difficulty >= 55 && q.lastVerdict !== 'complete' && (s.progress.get(q as unknown as string) ?? undefined) !== undefined).length
+        void hardUnsolved
+      }
+      // 末段赶工(第 3 层): 预算 ≤60min 且仍有 hard 未破 → 强制升级提示。
+      if (remaining <= 60 * 60_000) {
+        const hardOpen: string[] = []
+        for (const [code, q] of Object.entries(s.v2)) {
+          if (q.difficulty >= 55 && q.lastVerdict !== 'complete') hardOpen.push(code)
+        }
+        if (hardOpen.length > 0) escLines.push(`⏰ 末段赶工(≤60min): ${hardOpen.join(', ')} 未破 → 立即 xiaochang_refanout 全模型档(显式 kimi-k3/pro), 满分>用时>花费`)
+      }
       const escTxt = escLines.length > 0 ? `\n升级建议:\n${escLines.join('\n')}` : ''
       return [
         `campaign: open=${count(v => v.state === 'dispatched' || v.state === 'help')} queued=${count(v => v.state === 'queued')} done=${count(v => v.state === 'done')} failed=${count(v => v.state === 'failed')} blocked=${count(v => v.state === 'blocked')}`,
