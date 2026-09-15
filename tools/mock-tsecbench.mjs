@@ -31,7 +31,7 @@ function add(code, difficulty, score, flags, description, handler) {
   challenges.push({
     unique_code: code, difficulty, total_score: score, flag_count: flags.length,
     flags, correct_flag_count: 0, is_completed: false,
-    container_status: 'available', container_addr: [],
+    container_status: 'stopped', container_addr: [],
     description, handler,
   })
 }
@@ -164,7 +164,7 @@ function route(req, res) {
     const code = q.get('unique_code')
     const ch = challenges.find(c => c.unique_code === code)
     if (!ch) return json(res, 404, { detail: 'unknown challenge' })
-    ch.container_status = 'running'
+    ch.container_status = 'available'
     ch.container_addr = [`10.0.100.${20 + challenges.indexOf(ch)}`]
     return json(res, 200, { container_addr: ch.container_addr })
   }
@@ -189,7 +189,7 @@ function route(req, res) {
   if (p === '/openapi/v1/challenges/close' && req.method === 'POST') {
     const code = q.get('unique_code')
     const ch = challenges.find(c => c.unique_code === code)
-    if (ch) { ch.container_status = 'available'; ch.container_addr = [] }
+    if (ch) { ch.container_status = 'stopped'; ch.container_addr = [] }
     return json(res, 200, { closed: true })
   }
   if (p === '/openapi/v1/challenges/hint' && req.method === 'GET') {

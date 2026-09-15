@@ -110,3 +110,23 @@ enqueue 的 `prompt` 参数语义降级为**一句话指令**(思路/职责),机
 
 - **fork 终态抑制**:终态题的迟到 fork 回放会再次唤醒主 agent,凭空产生增兵冲动(干跑实锤:收尾后 b-02 的迟到 fork 又唤醒一次)——纪律靠模型自觉不够,应在 wait/fork 机制层抑制"progress 已终态"的唤醒。
 - mock 把所有题标 available 导致容器槽恒 3/3 满(不影响解题,仅统计噪声)。
+
+## v7.1 fork 终态抑制(2026-09-15, 定向验证局)
+
+- 机制: `xiaochang_fork` 同进程终态检查(不入信箱/不 followup, 只存档) + `xiaochang_wait` 信箱评估(终态题 fork 吸收归档不唤醒, 非终态题照常唤醒) + wait 入口评估(两次 wait 之间的写入不落盲区)。
+- **定向验证局(只打 g-m1 + 外部注入迟到 fork)抓到两个真 bug**:
+  1. wait 信箱评估缺 `existsSync(inboxDir)` 守卫: 信箱目录未创建时 readdirSync 抛 ENOENT → catch 保守返回 true → **每次 wait 都假唤醒"fork inbox changed"**(v7 全量干跑 8/8 能过全靠主 agent 无视假唤醒)。
+  2. `filteredFailedOf`(v6 遗留)在模块作用域引用 apply 闭包变量 `campaign` → **任何 item 入队后第一次 status 调用即 ReferenceError "campaign is not defined"**(此前干跑 status 只在入队前被调过, 蒙混过关)。修复: campaign 作为参数传入。
+- 验证口径: 注入迟到 fork 后 wait 必须静默归档(不唤醒、不派兵), status 入队后必须正常返回全量字段。
+
+## v7.1 追加修复(全量干跑复测轮)
+
+定向验证局后复测全量, 主 agent 战报又抓到三处(两处是 bug-on-bug 遮蔽):
+
+1. **coverageOf 未导入**: 攻击面覆盖计算从集思迁到夜不收时, runner 的 `import { coverageOf }` 漏加 → status 裁决循环里 ReferenceError。此前被 filteredFailedOf 的 ReferenceError 先抛遮住, 修完前者才暴露。修复: 补导入(esbuild 打包体积 79.3→84.8kb, 攻击面表进包)。
+2. **末段自动 R2 对已解题重复征集**: 只查 `lastVerdict !== 'complete'` 会漏掉归因门控(why=context-insufficient/platform-issue)没写 lastVerdict 的已解题。修复: 先查 progress 终态(complete/failed/skipped)直接跳过。
+3. **mock 容器生命周期失真**: 初始全部 `available` 且 close 仍置 `available` → openContainers 恒 8/3, "永不释放"。修复: 初始 `stopped`、start→`available`、close→`stopped`(与 openContainers 的 available|pending 判定对齐)。
+
+主 agent 另报"唤醒层抑制没生效"——复核结论: 该 fork 是 b-02 **未终态时**同进程 followup 发出(当时唤醒正确), 投递排队后被主 agent 在终态后读到, 属消息排序现象, 不是机制缺口;定向验证局已证明"写入时已终态 → 静默归档不唤醒"成立。终态在途兵标 blocked(虎符 cancel 语义)与排名钟未停(干跑无 runId)为预期行为, 不改。
+
+**v7.1 终局(三轮验证, 全绿)**: 定向验证局(外部注入迟到 fork → 静默归档+0 唤醒+status 全字段正常) + 全量干跑复测(8/8 4400/4400, "is not defined" 0 次, status 裁决循环实跑, 容器槽开合正常)。v7.2 候选(执行者建议, 待讨论): `xiaochang_fork` 增加 dead-end|untaken 语义位, 死路结论不再走 fork 信箱唤醒。

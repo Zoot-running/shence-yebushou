@@ -15,6 +15,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { HintLedger } from '../../../src/hint-ledger.ts'
 import { addFact, createProfile, parse as parseProfile, render as renderProfile } from '../../../src/profile.ts'
 import { TsecbenchAdapter, type ChallengeInfo, type FetchLike } from '../../../src/adapters/tsecbench.ts'
+import { coverageOf } from '../../../src/attack-surfaces.ts'
 import {
   RunProgress,
   appendKnowledgeSection,
@@ -212,6 +213,14 @@ function requireState(): CampaignState {
   return state
 }
 
+/** v7.1 终态抑制: progress 已终态(complete/failed/skipped) → 迟到 fork 只存档、不唤醒、不派兵。 */
+function progressTerminal(code: string): boolean {
+  try {
+    const p = state?.progress.get(code)
+    return p !== undefined && (p.state === 'complete' || p.state === 'failed' || p.state === 'skipped')
+  } catch { return false } // 执行者会话无 state: 终态判定留给主 agent 的 wait 侧
+}
+
 function audit(path: string, line: object): void {
   try {
     appendFileSync(path, `${JSON.stringify(line)}\n`)
@@ -230,7 +239,7 @@ function readOutageWindows(): Array<{ provider: string; from: number; to: number
 }
 
 /** v6: 该 code 的过滤失败计数——剔除故障窗口内与 provider 错误签名的失败(DS 故障夜实锤)。 */
-function filteredFailedOf(code: string): { failed: number; excluded: number; excludedReasons: string[] } {
+function filteredFailedOf(code: string, campaign: HufuLike | undefined): { failed: number; excluded: number; excludedReasons: string[] } {
   const windows = readOutageWindows()
   let failed = 0
   let excluded = 0
@@ -1096,7 +1105,7 @@ ${gaps}
   register(defineTool({
     name: 'xiaochang_fork',
     description:
-      'F33 fork alarm: you (executor) found untaken promising branches or hard-won evidence — record them as fork knowledge AND wake the main agent immediately (followup, zero wait). The main agent alone decides whether to dispatch (single scheduler).',
+      'F33 fork alarm: you (executor) found untaken promising branches or hard-won evidence — record them as fork knowledge AND wake the main agent immediately (followup, zero wait). The main agent alone decides whether to dispatch (single scheduler). v7.1: if the challenge is already terminal, the fork is archived as knowledge only — no inbox, no wake, no dispatch impulse.',
     parameters: {
       code: { type: 'string', required: true },
       forks: { type: 'array', required: true, description: '[{path, conclusion, evidence}] untaken branches worth dispatching.' },
@@ -1105,11 +1114,16 @@ ${gaps}
     isConcurrencySafe: () => true,
     async execute(args: { code: string; forks: Array<{ path: string; conclusion?: string; evidence?: string }> }) {
       if (args.forks.length === 0) return 'xiaochang_fork: no forks given'
+      // v7.1 终态抑制(同进程侧): 题已终态 → 不入信箱、不唤醒(防迟到分叉回放产生增兵冲动);
+      // 知识照常入账存档(战后复盘仍可用)。执行者会话里无 state, 抑制判定交给主 agent 的 wait 侧。
+      const terminalNow = progressTerminal(args.code)
       const entries: KnowledgeIn[] = args.forks.map(f => ({ kind: 'fork', path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: 'fork', at: Date.now() }))
       const lines = entries.map(f => `- 🔀 ${f.path}${f.conclusion !== undefined ? ' → ' + f.conclusion : ''}${f.evidence !== undefined ? ' (证据: ' + f.evidence + ')' : ''}`)
       // 可靠通道: 写盘分叉信箱——主 agent 的 xiaochang_wait 轮询到变化即唤醒(跨会话/跨进程)。
       let inbox = ''
-      try { inbox = writeForkInbox(args.code, entries) } catch { /* 信箱写失败 */ }
+      if (!terminalNow) {
+        try { inbox = writeForkInbox(args.code, entries) } catch { /* 信箱写失败 */ }
+      }
       // 同进程直接入账(主 agent 自调 fork 时生效; 执行者会话里 campaign 不存在则为 no-op)。
       try { recordKnowledgeOnCode(args.code, entries) } catch { /* 入账失败不阻断 */ }
       // v7: 同进程也直接追加知识账本文件 ④(跨会话的走信箱 → 主 agent absorb 时补写)。
@@ -1119,13 +1133,14 @@ ${gaps}
       // followup 仅同进程可达(执行者会话里 parentAgent 不是主 agent, 跨进程不可达——
       // 不做虚假承诺; 真正唤醒靠上面的信箱+wait 轮询)。
       const sameProcess = parentAgent !== undefined && campaign !== undefined
-      if (sameProcess) {
+      if (sameProcess && !terminalNow) {
         parentAgent?.followup(createUserMessage({
           content: [{ type: 'text', text: `🔀 分叉即时报(${args.code}): 发现 ${entries.length} 条未走分叉, 已入账+信箱。由你(主 agent)决定是否 jisi_fanout_bulk / xiaochang_enqueue 增兵。\n${lines.join('\n')}` }],
           source: { kind: 'user' },
         }))
       }
-      return `fork ${inbox !== '' ? '已写入分叉信箱(' + inbox + '), 主 agent 的 xiaochang_wait 会被唤醒并在读图时吸收' : '信箱写入失败'}${sameProcess ? '; 同进程已直接入账并唤醒' : ''}:\n${lines.join('\n')}`
+      const terminalNote = terminalNow ? '; 题已终态: 仅存档入账, 未写信箱/未唤醒(不派兵)' : ''
+      return `fork ${inbox !== '' ? '已写入分叉信箱(' + inbox + '), 主 agent 的 xiaochang_wait 会被唤醒并在读图时吸收' : '未写信箱(终态抑制或写入失败)'}${sameProcess && !terminalNow ? '; 同进程已直接入账并唤醒' : ''}${terminalNote}:\n${lines.join('\n')}`
     },
   }))
 
@@ -1215,7 +1230,7 @@ ${gaps}
       for (const [code, q] of Object.entries(s.v2)) {
         const p = s.progress.get(code)
         if (p === undefined || p.state === 'complete' || p.state === 'failed' || p.state === 'skipped') continue
-        const ff = filteredFailedOf(code)
+        const ff = filteredFailedOf(code, campaign)
         const views = (campaign?.ledger.views() ?? []).filter(v => codeOf(v.item.id) === code)
         const lastProgress = Math.max(0, ...views.map(v => v.lastProgressAt ?? 0))
         const noProgressMin = lastProgress > 0 ? Math.round((Date.now() - lastProgress) / 60000) : 0
@@ -1243,6 +1258,9 @@ ${gaps}
       if (remaining <= 60 * 60_000) {
         const hardOpen: string[] = []
         for (const [code, q] of Object.entries(s.v2)) {
+          // 进度已终态的题绝不重复征集(2026-09-15 干跑实锤: 只查 lastVerdict 会漏掉归因门控没写 lastVerdict 的已解题)。
+          const p = s.progress.get(code)
+          if (p !== undefined && (p.state === 'complete' || p.state === 'failed' || p.state === 'skipped')) continue
           if (q.difficulty >= 55 && q.lastVerdict !== 'complete') hardOpen.push(code)
         }
         for (const code of hardOpen.slice(0, 3)) {
@@ -1284,7 +1302,7 @@ ${gaps}
   register(defineTool({
     name: 'xiaochang_wait',
     description:
-      'Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, (d) a fork lands in the fork inbox (executor xiaochang_fork), or (e) the timeout. This is THE way to wait — never bash sleep for waiting. Returns what woke it.',
+      'Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, (d) a fork lands in the fork inbox for a NON-terminal challenge (executor xiaochang_fork; v7.1: late forks of already-terminal challenges are archived silently and do NOT wake you — no dispatch impulse for solved challenges), or (e) the timeout. This is THE way to wait — never bash sleep for waiting. Returns what woke it.',
     parameters: {
       timeoutSeconds: { type: 'number', description: 'Max wait seconds (default 300, clamp 5..900).' },
     },
@@ -1325,11 +1343,42 @@ ${gaps}
               .join('|')
           } catch { return '' }
         }
-        const inboxBefore = inboxSnap()
-        const fv = setInterval(() => { if (inboxSnap() !== inboxBefore) done('xiaochang_wait: fork inbox changed — read xiaochang_graph and dispatch the untaken branches') }, 2000)
+        // v7.1 终态抑制: 终态题的 fork 吸收归档(不唤醒); 返回是否存在**非终态**题的 fork。
+        const evaluateInbox = (): boolean => {
+          try {
+            if (!existsSync(inboxDir)) return false // 信箱尚未创建 = 无分叉(2026-09-15 定向验证实锤: 缺此判断时 ENOENT 走 catch→true, 每次 wait 都假唤醒)
+            let live = false
+            for (const f of readdirSync(inboxDir).filter(f => f.endsWith('.jsonl'))) {
+              const code = f.replace(/\.jsonl$/, '')
+              if (progressTerminal(code)) {
+                try { absorbForkInbox(code) } catch { /* 归档失败: 下次再试 */ }
+              } else {
+                live = true
+              }
+            }
+            return live
+          } catch { return true } // 真读盘错误: 保守唤醒
+        }
+        let inboxBefore = inboxSnap()
+        const fv = setInterval(() => {
+          if (inboxSnap() === inboxBefore) return
+          inboxBefore = inboxSnap()
+          if (state === undefined) {
+            // 执行者会话无 progress 语义: 沿用旧行为(变化即唤醒)
+            done('xiaochang_wait: fork inbox changed — read xiaochang_graph and dispatch the untaken branches')
+            return
+          }
+          // 主 agent: 终态题 fork 静默归档(不唤醒, 防迟到回放增兵冲动); 活跃题 fork 照常唤醒。
+          if (evaluateInbox()) done('xiaochang_wait: fork inbox changed — read xiaochang_graph and dispatch the untaken branches')
+        }, 2000)
         // ④ 超时
         const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1000)}s, no event`), timeoutMs)
         cleanup = () => { unsub(); clearInterval(iv); clearInterval(sv); clearInterval(fv); clearTimeout(to) }
+        // v7.1 wait 入口评估: 两次 wait 之间写入的 fork 不落盲区——终态题归档(不唤醒), 活跃题立即唤醒。
+        if (state !== undefined && evaluateInbox()) {
+          inboxBefore = inboxSnap()
+          done('xiaochang_wait: fork inbox changed — read xiaochang_graph and dispatch the untaken branches')
+        }
       })
     },
   }))

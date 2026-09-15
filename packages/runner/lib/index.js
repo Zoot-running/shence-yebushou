@@ -199,6 +199,76 @@ var TsecbenchAdapter = class {
   }
 };
 
+// ../../src/attack-surfaces.ts
+var ATTACK_SURFACES = {
+  web: [
+    { id: "recon", name: "\u4FA6\u5BDF/\u6307\u7EB9", keywords: ["recon", "\u6307\u7EB9", "banner", "\u76EE\u5F55", "dirsearch", "robots"] },
+    { id: "authn", name: "\u8BA4\u8BC1", keywords: ["login", "\u8BA4\u8BC1", "password", "\u5BC6\u7801", "jwt", "session", "cookie", "captcha", "otp"] },
+    { id: "sqli", name: "SQL \u6CE8\u5165", keywords: ["sqli", "sql injection", "\u6CE8\u5165", "select '", "union"] },
+    { id: "xss", name: "XSS", keywords: ["xss", "script", "\u8DE8\u7AD9"] },
+    { id: "ssrf", name: "SSRF", keywords: ["ssrf", "url=", "proxy", "fetch url"] },
+    { id: "idor", name: "IDOR/\u8D8A\u6743", keywords: ["idor", "\u8D8A\u6743", "id=", "uuid", "\u6C34\u5E73\u6743\u9650"] },
+    { id: "lfi", name: "\u6587\u4EF6\u5305\u542B/\u8BFB\u53D6", keywords: ["lfi", "rfi", "file=", "include", "path traversal", "\u76EE\u5F55\u7A7F\u8D8A", "file://"] },
+    { id: "upload", name: "\u6587\u4EF6\u4E0A\u4F20", keywords: ["upload", "\u4E0A\u4F20", "multipart"] },
+    { id: "rce", name: "\u547D\u4EE4/\u4EE3\u7801\u6267\u884C", keywords: ["rce", "exec", "command", "\u4EE3\u7801\u6267\u884C", "\u53CD\u5E8F\u5217\u5316", "deserial", "pickle", "eval"] },
+    { id: "ssrf-intra", name: "\u5185\u7F51\u6A2A\u5411", keywords: ["\u5185\u7F51", "\u6A2A\u5411", "ssrf \u5185\u7F51", "intranet", "redis", "\u4EE3\u7406"] },
+    { id: "crypto-weak", name: "\u5F31\u52A0\u5BC6/\u5F31\u5BC6\u94A5", keywords: ["\u5F31\u5BC6\u94A5", "\u786C\u7F16\u7801", "key leak", "weak crypto"] },
+    { id: "logic", name: "\u4E1A\u52A1\u903B\u8F91", keywords: ["\u903B\u8F91", "\u8D8A\u6743\u903B\u8F91", "race", "\u6761\u4EF6\u7ADE\u4E89", "\u6298\u6263"] }
+  ],
+  crypto: [
+    { id: "weak-param", name: "\u5F31\u53C2\u6570", keywords: ["n \u5C0F", "e=3", "\u5171\u6A21", "\u5C0F\u516C\u94A5", "factor", "yafu"] },
+    { id: "congruence", name: "\u540C\u4F59/CRT", keywords: ["crt", "\u540C\u4F59", "chinese remainder"] },
+    { id: "lattice", name: "\u683C\u653B\u51FB", keywords: ["lattice", "\u683C", "lll", "coppersmith", "hidden number"] },
+    { id: "algebra", name: "\u4EE3\u6570\u7ED3\u6784", keywords: ["groebner", "\u591A\u9879\u5F0F", "\u6709\u9650\u57DF", "galois"] },
+    { id: "padding", name: "Padding \u9884\u8A00\u673A", keywords: ["padding oracle", "bleichenbacher", "pkcs"] },
+    { id: "reuse", name: "\u5BC6\u94A5/\u968F\u673A\u6570\u91CD\u7528", keywords: ["nonce reuse", "\u968F\u673A\u6570", "stream", "\u540C\u4E00\u5BC6\u94A5"] },
+    { id: "side", name: "\u4FA7\u4FE1\u9053/\u6CC4\u9732", keywords: ["\u6CC4\u9732", "oracle", "crc", "\u566A\u58F0", "\u5019\u9009\u503C", "timing"] },
+    { id: "impl", name: "\u5B9E\u73B0\u7F3A\u9677", keywords: ["\u5B9E\u73B0", "\u8F6E\u6570", "\u81EA\u5B9E\u73B0", "\u81EA\u5B9A\u4E49"] }
+  ],
+  pwn: [
+    { id: "overflow", name: "\u6808\u6EA2\u51FA", keywords: ["overflow", "\u6808", "ret2", "rop", "buffer"] },
+    { id: "heap", name: "\u5806\u5229\u7528", keywords: ["heap", "\u5806", "tcache", "uaf", "double free"] },
+    { id: "fmt", name: "\u683C\u5F0F\u5316\u5B57\u7B26\u4E32", keywords: ["fmt", "format string", "\u683C\u5F0F\u5316"] },
+    { id: "logic-bug", name: "\u903B\u8F91\u6F0F\u6D1E", keywords: ["\u903B\u8F91", "integer", "\u8D8A\u754C", "off-by-one"] },
+    { id: "env", name: "\u73AF\u5883\u7ED5\u8FC7", keywords: ["canary", "pie", "aslr", "nx", "seccomp", "\u6C99\u7BB1"] }
+  ],
+  rev: [
+    { id: "static", name: "\u9759\u6001\u5206\u6790", keywords: ["ida", "ghidra", "\u53CD\u7F16\u8BD1", "disassemble", "strings"] },
+    { id: "dynamic", name: "\u52A8\u6001\u8C03\u8BD5", keywords: ["gdb", "\u8C03\u8BD5", "\u65AD\u70B9", "trace"] },
+    { id: "crypto-inner", name: "\u5185\u7F6E\u7B97\u6CD5\u8FD8\u539F", keywords: ["\u7B97\u6CD5", "\u5BC6\u94A5\u8C03\u5EA6", "\u8FD8\u539F", "check", "\u6821\u9A8C"] },
+    { id: "vm", name: "VM/\u89E3\u91CA\u5668", keywords: ["vm", "\u89E3\u91CA\u5668", "opcode", "\u865A\u62DF\u673A"] }
+  ],
+  forensics: [
+    { id: "fs", name: "\u6587\u4EF6\u7CFB\u7EDF/\u78C1\u76D8", keywords: ["\u78C1\u76D8", "\u955C\u50CF", "filesystem", "mft"] },
+    { id: "net", name: "\u6D41\u91CF\u5206\u6790", keywords: ["pcap", "\u6D41\u91CF", "wireshark", "\u534F\u8BAE"] },
+    { id: "mem", name: "\u5185\u5B58\u53D6\u8BC1", keywords: ["\u5185\u5B58", "volatility", "dump"] },
+    { id: "artifact", name: "\u5DE5\u4EF6\u89E3\u6790", keywords: ["\u65E5\u5FD7", "\u6D4F\u89C8\u5668", "\u6CE8\u518C\u8868", "artifact", "\u65F6\u95F4\u7EBF"] },
+    { id: "stego", name: "\u9690\u5199", keywords: ["stego", "\u9690\u5199", "lsb", "metadata", "exif"] }
+  ],
+  misc: [
+    { id: "generic", name: "\u901A\u7528\u7EBF\u7D22", keywords: ["\u7EBF\u7D22", "\u63D0\u793A", "\u7F16\u7801", "base64", "hex"] },
+    { id: "guess", name: "\u5BC6\u7801\u5B66\u6742\u9879", keywords: ["\u5BC6\u7801", "\u52A0\u5BC6", "\u89E3\u5BC6"] }
+  ]
+};
+function coverageOf(qtype, triedTexts) {
+  const surfaces = ATTACK_SURFACES[qtype] ?? [];
+  const covered = /* @__PURE__ */ new Set();
+  for (const text of triedTexts) {
+    const low = text.toLowerCase();
+    for (const s of surfaces) {
+      if (s.keywords.some((k) => low.includes(k))) covered.add(s.id);
+    }
+  }
+  const uncovered = surfaces.filter((s) => !covered.has(s.id)).map((s) => `${s.id}(${s.name})`);
+  return {
+    qtype,
+    total: surfaces.length,
+    covered: covered.size,
+    uncovered,
+    ratio: surfaces.length === 0 ? 1 : covered.size / surfaces.length
+  };
+}
+
 // src/orchestrator.ts
 import { mkdirSync, readdirSync, renameSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -465,6 +535,14 @@ function requireState() {
   if (state === void 0) throw new Error("xiaochang: not set up \u2014 call xiaochang_setup first");
   return state;
 }
+function progressTerminal(code) {
+  try {
+    const p = state?.progress.get(code);
+    return p !== void 0 && (p.state === "complete" || p.state === "failed" || p.state === "skipped");
+  } catch {
+    return false;
+  }
+}
 function audit(path, line) {
   try {
     appendFileSync(path, `${JSON.stringify(line)}
@@ -487,7 +565,7 @@ function readOutageWindows() {
     return [];
   }
 }
-function filteredFailedOf(code) {
+function filteredFailedOf(code, campaign) {
   const windows = readOutageWindows();
   let failed = 0;
   let excluded = 0;
@@ -538,8 +616,8 @@ function openContainers(s) {
   }
   return open;
 }
-function openCount(campaign2) {
-  return campaign2.ledger.views().filter((v) => v.state === "dispatched" || v.state === "help" || v.state === "stalled").length;
+function openCount(campaign) {
+  return campaign.ledger.views().filter((v) => v.state === "dispatched" || v.state === "help" || v.state === "stalled").length;
 }
 function walk(dir) {
   const out = [];
@@ -593,7 +671,7 @@ function scanLegacyCwd(cwd, startedAt) {
 function apply(ctx) {
   const jisi = ctx.get?.("jisi");
   const holder = ctx.hufu;
-  let campaign2;
+  let campaign;
   let campaignId;
   let parentAgent;
   heartbeatTimer = setInterval(() => {
@@ -602,8 +680,8 @@ function apply(ctx) {
   }, 12e4);
   heartbeatTimer.unref?.();
   const c = () => {
-    if (campaign2 === void 0) throw new Error("xiaochang: not set up \u2014 call xiaochang_setup first");
-    return campaign2;
+    if (campaign === void 0) throw new Error("xiaochang: not set up \u2014 call xiaochang_setup first");
+    return campaign;
   };
   const forkInboxDir = () => join2(process.env.DSH_HOME ?? ".", "storages", "xiaochang-fork-inbox");
   function readForkInbox(code) {
@@ -631,15 +709,15 @@ function apply(ctx) {
     const entries = readForkInbox(code);
     if (entries.length > 0) {
       const seen = /* @__PURE__ */ new Set();
-      for (const v of campaign2?.ledger.views() ?? []) {
+      for (const v of campaign?.ledger.views() ?? []) {
         if (codeOf(v.item.id) !== code) continue;
-        for (const k of campaign2?.knowledgeOf?.(v.item.id) ?? []) {
+        for (const k of campaign?.knowledgeOf?.(v.item.id) ?? []) {
           seen.add(`${k.path}#${k.at ?? 0}`);
         }
       }
       const fresh = entries.filter((e) => !seen.has(`${e.path}#${e.at ?? 0}`));
       if (fresh.length > 0) {
-        for (const v of campaign2?.ledger.views() ?? []) {
+        for (const v of campaign?.ledger.views() ?? []) {
           if (codeOf(v.item.id) !== code) continue;
           try {
             holder.recordKnowledge?.(campaignId ?? "", v.item.id, fresh);
@@ -659,10 +737,10 @@ function apply(ctx) {
   }
   function knowledgeOfCode(code) {
     const out = [];
-    if (campaign2 !== void 0) {
-      for (const v of campaign2.ledger.views()) {
+    if (campaign !== void 0) {
+      for (const v of campaign.ledger.views()) {
         if (codeOf(v.item.id) !== code) continue;
-        const k = campaign2.knowledgeOf?.(v.item.id) ?? [];
+        const k = campaign.knowledgeOf?.(v.item.id) ?? [];
         out.push(...k);
       }
     }
@@ -670,8 +748,8 @@ function apply(ctx) {
     return out;
   }
   function recordKnowledgeOnCode(code, entries) {
-    if (campaign2 === void 0 || campaignId === void 0) return;
-    for (const v of campaign2.ledger.views()) {
+    if (campaign === void 0 || campaignId === void 0) return;
+    for (const v of campaign.ledger.views()) {
       if (codeOf(v.item.id) !== code) continue;
       try {
         holder.recordKnowledge?.(campaignId, v.item.id, entries);
@@ -692,7 +770,7 @@ function apply(ctx) {
     return p;
   }
   function appendKnowledgeFile(code, section, entries) {
-    if (campaign2 === void 0) return;
+    if (campaign === void 0) return;
     const p = ensureKnowledgeFile(code);
     try {
       const text = readFileSync(p, "utf8");
@@ -702,7 +780,7 @@ function apply(ctx) {
     }
   }
   function replaceKnowledgeFile(code, section, entries) {
-    if (campaign2 === void 0) return;
+    if (campaign === void 0) return;
     const p = ensureKnowledgeFile(code);
     try {
       writeFileSync(p, replaceKnowledgeSection(readFileSync(p, "utf8"), section, entries));
@@ -710,7 +788,7 @@ function apply(ctx) {
     }
   }
   function syncKnowledgeFileFromLedger(code) {
-    if (campaign2 === void 0) return;
+    if (campaign === void 0) return;
     const buckets = { dead: [], artifacts: [], forks: [] };
     for (const k of knowledgeOfCode(code)) {
       const text = `${k.path}${k.conclusion !== void 0 ? " \u2192 " + k.conclusion : ""}${k.evidence !== void 0 ? " (\u8BC1\u636E: " + k.evidence + ")" : ""}`;
@@ -838,7 +916,7 @@ function apply(ctx) {
       }
       const fresh = await s.adapter.listChallenges();
       for (const ch of fresh) s.challenges.set(ch.unique_code, ch);
-      if (campaign2 === void 0) {
+      if (campaign === void 0) {
         const created = holder.createCampaign(agent, {
           concurrency: s.concurrency,
           stallAfterMs: s.roundTimeoutMs + 10 * 6e4,
@@ -847,7 +925,7 @@ function apply(ctx) {
           // v7 类闸: 容器题受平台容器上限(默认 3), 附件题全并行(继承全局 concurrency)。
           resourceLimits: { container: args.containerSlots ?? 3, local: s.concurrency }
         }, [], { id: stableId, boardNamespace: `${args.runId ?? "pending"}` });
-        campaign2 = created.campaign;
+        campaign = created.campaign;
         campaignId = created.id;
       }
       persistProgress(s);
@@ -1311,7 +1389,7 @@ ${prompt}`;
   }));
   register(defineTool({
     name: "xiaochang_fork",
-    description: "F33 fork alarm: you (executor) found untaken promising branches or hard-won evidence \u2014 record them as fork knowledge AND wake the main agent immediately (followup, zero wait). The main agent alone decides whether to dispatch (single scheduler).",
+    description: "F33 fork alarm: you (executor) found untaken promising branches or hard-won evidence \u2014 record them as fork knowledge AND wake the main agent immediately (followup, zero wait). The main agent alone decides whether to dispatch (single scheduler). v7.1: if the challenge is already terminal, the fork is archived as knowledge only \u2014 no inbox, no wake, no dispatch impulse.",
     parameters: {
       code: { type: "string", required: true },
       forks: { type: "array", required: true, description: "[{path, conclusion, evidence}] untaken branches worth dispatching." }
@@ -1320,12 +1398,15 @@ ${prompt}`;
     isConcurrencySafe: () => true,
     async execute(args) {
       if (args.forks.length === 0) return "xiaochang_fork: no forks given";
+      const terminalNow = progressTerminal(args.code);
       const entries = args.forks.map((f) => ({ kind: "fork", path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: "fork", at: Date.now() }));
       const lines = entries.map((f) => `- \u{1F500} ${f.path}${f.conclusion !== void 0 ? " \u2192 " + f.conclusion : ""}${f.evidence !== void 0 ? " (\u8BC1\u636E: " + f.evidence + ")" : ""}`);
       let inbox = "";
-      try {
-        inbox = writeForkInbox(args.code, entries);
-      } catch {
+      if (!terminalNow) {
+        try {
+          inbox = writeForkInbox(args.code, entries);
+        } catch {
+        }
       }
       try {
         recordKnowledgeOnCode(args.code, entries);
@@ -1335,15 +1416,16 @@ ${prompt}`;
         appendKnowledgeFile(args.code, "forks", entries.map((f) => `${f.path}${f.conclusion !== void 0 ? " \u2192 " + f.conclusion : ""}${f.evidence !== void 0 ? " (\u8BC1\u636E: " + f.evidence + ")" : ""}`));
       } catch {
       }
-      const sameProcess = parentAgent !== void 0 && campaign2 !== void 0;
-      if (sameProcess) {
+      const sameProcess = parentAgent !== void 0 && campaign !== void 0;
+      if (sameProcess && !terminalNow) {
         parentAgent?.followup(createUserMessage({
           content: [{ type: "text", text: `\u{1F500} \u5206\u53C9\u5373\u65F6\u62A5(${args.code}): \u53D1\u73B0 ${entries.length} \u6761\u672A\u8D70\u5206\u53C9, \u5DF2\u5165\u8D26+\u4FE1\u7BB1\u3002\u7531\u4F60(\u4E3B agent)\u51B3\u5B9A\u662F\u5426 jisi_fanout_bulk / xiaochang_enqueue \u589E\u5175\u3002
 ${lines.join("\n")}` }],
           source: { kind: "user" }
         }));
       }
-      return `fork ${inbox !== "" ? "\u5DF2\u5199\u5165\u5206\u53C9\u4FE1\u7BB1(" + inbox + "), \u4E3B agent \u7684 xiaochang_wait \u4F1A\u88AB\u5524\u9192\u5E76\u5728\u8BFB\u56FE\u65F6\u5438\u6536" : "\u4FE1\u7BB1\u5199\u5165\u5931\u8D25"}${sameProcess ? "; \u540C\u8FDB\u7A0B\u5DF2\u76F4\u63A5\u5165\u8D26\u5E76\u5524\u9192" : ""}:
+      const terminalNote = terminalNow ? "; \u9898\u5DF2\u7EC8\u6001: \u4EC5\u5B58\u6863\u5165\u8D26, \u672A\u5199\u4FE1\u7BB1/\u672A\u5524\u9192(\u4E0D\u6D3E\u5175)" : "";
+      return `fork ${inbox !== "" ? "\u5DF2\u5199\u5165\u5206\u53C9\u4FE1\u7BB1(" + inbox + "), \u4E3B agent \u7684 xiaochang_wait \u4F1A\u88AB\u5524\u9192\u5E76\u5728\u8BFB\u56FE\u65F6\u5438\u6536" : "\u672A\u5199\u4FE1\u7BB1(\u7EC8\u6001\u6291\u5236\u6216\u5199\u5165\u5931\u8D25)"}${sameProcess && !terminalNow ? "; \u540C\u8FDB\u7A0B\u5DF2\u76F4\u63A5\u5165\u8D26\u5E76\u5524\u9192" : ""}${terminalNote}:
 ${lines.join("\n")}`;
     }
   }));
@@ -1375,7 +1457,7 @@ ${lines.join("\n")}`;
         const kindTag = { done: "\u2705", failed: "\u274C", blocked: "\u26D4", superseded: "\u267B\uFE0F" }[v.state] ?? { queued: "\u23F3", dispatched: "\u{1F3C3}", help: "\u{1F64F}", stalled: "\u{1F40C}" }[v.state] ?? "\xB7";
         rows.push(`${kindTag} ${v.item.id} [${v.state}] seed=${v.seed} model=${v.item.model ?? s.executorPolicy.defaultModel} effort=${v.item.reasoningEffort ?? s.executorPolicy.defaultEffort}${p !== void 0 && p.flags.length > 0 ? ` flags=${p.flags.length}` : ""}${v.terminalDetail !== void 0 ? `
   \u7EC8\u6001: ${v.terminalDetail.slice(0, 400)}` : ""}`);
-        const ks = campaign2?.knowledgeOf?.(v.item.id) ?? [];
+        const ks = campaign?.knowledgeOf?.(v.item.id) ?? [];
         for (const k of ks) {
           const tag = k.kind === "dead-end" ? "\u274C\u6B7B\u8DEF" : k.kind === "fork" ? "\u{1F500}\u672A\u8D70\u5206\u53C9" : "\u{1F4CC}\u4E8B\u5B9E";
           rows.push(`     [${tag}] ${k.path}${k.conclusion !== void 0 ? " \u2192 " + k.conclusion : ""}${k.evidence !== void 0 ? " (\u8BC1\u636E: " + k.evidence + ")" : ""}${k.by !== void 0 ? ` \u2014 by ${k.by}` : ""}`);
@@ -1448,8 +1530,8 @@ ${lines.join("\n")}`;
       for (const [code, q] of Object.entries(s.v2)) {
         const p = s.progress.get(code);
         if (p === void 0 || p.state === "complete" || p.state === "failed" || p.state === "skipped") continue;
-        const ff = filteredFailedOf(code);
-        const views2 = (campaign2?.ledger.views() ?? []).filter((v) => codeOf(v.item.id) === code);
+        const ff = filteredFailedOf(code, campaign);
+        const views2 = (campaign?.ledger.views() ?? []).filter((v) => codeOf(v.item.id) === code);
         const lastProgress = Math.max(0, ...views2.map((v) => v.lastProgressAt ?? 0));
         const noProgressMin = lastProgress > 0 ? Math.round((Date.now() - lastProgress) / 6e4) : 0;
         const deadTexts = knowledgeOfCode(code).filter((k) => k.kind === "dead-end").map((k) => `${k.path} ${k.conclusion ?? ""}`);
@@ -1475,6 +1557,8 @@ ${lines.join("\n")}`;
       if (remaining <= 60 * 6e4) {
         const hardOpen = [];
         for (const [code, q] of Object.entries(s.v2)) {
+          const p = s.progress.get(code);
+          if (p !== void 0 && (p.state === "complete" || p.state === "failed" || p.state === "skipped")) continue;
           if (q.difficulty >= 55 && q.lastVerdict !== "complete") hardOpen.push(code);
         }
         for (const code of hardOpen.slice(0, 3)) {
@@ -1516,7 +1600,7 @@ ${escLines.join("\n")}` : "";
   }));
   register(defineTool({
     name: "xiaochang_wait",
-    description: "Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, (d) a fork lands in the fork inbox (executor xiaochang_fork), or (e) the timeout. This is THE way to wait \u2014 never bash sleep for waiting. Returns what woke it.",
+    description: "Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, (d) a fork lands in the fork inbox for a NON-terminal challenge (executor xiaochang_fork; v7.1: late forks of already-terminal challenges are archived silently and do NOT wake you \u2014 no dispatch impulse for solved challenges), or (e) the timeout. This is THE way to wait \u2014 never bash sleep for waiting. Returns what woke it.",
     parameters: {
       timeoutSeconds: { type: "number", description: "Max wait seconds (default 300, clamp 5..900)." }
     },
@@ -1527,7 +1611,7 @@ ${escLines.join("\n")}` : "";
       const agent = exec.agent;
       const ledgerSnap = () => {
         try {
-          return JSON.stringify(campaign2?.ledger.views().map((v) => [v.item.id, v.state, v.terminalDetail ?? "", v.lastProgressAt ?? 0]));
+          return JSON.stringify(campaign?.ledger.views().map((v) => [v.item.id, v.state, v.terminalDetail ?? "", v.lastProgressAt ?? 0]));
         } catch {
           return "";
         }
@@ -1564,9 +1648,35 @@ ${escLines.join("\n")}` : "";
             return "";
           }
         };
-        const inboxBefore = inboxSnap();
+        const evaluateInbox = () => {
+          try {
+            if (!existsSync(inboxDir)) return false;
+            let live = false;
+            for (const f of readdirSync2(inboxDir).filter((f2) => f2.endsWith(".jsonl"))) {
+              const code = f.replace(/\.jsonl$/, "");
+              if (progressTerminal(code)) {
+                try {
+                  absorbForkInbox(code);
+                } catch {
+                }
+              } else {
+                live = true;
+              }
+            }
+            return live;
+          } catch {
+            return true;
+          }
+        };
+        let inboxBefore = inboxSnap();
         const fv = setInterval(() => {
-          if (inboxSnap() !== inboxBefore) done("xiaochang_wait: fork inbox changed \u2014 read xiaochang_graph and dispatch the untaken branches");
+          if (inboxSnap() === inboxBefore) return;
+          inboxBefore = inboxSnap();
+          if (state === void 0) {
+            done("xiaochang_wait: fork inbox changed \u2014 read xiaochang_graph and dispatch the untaken branches");
+            return;
+          }
+          if (evaluateInbox()) done("xiaochang_wait: fork inbox changed \u2014 read xiaochang_graph and dispatch the untaken branches");
         }, 2e3);
         const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1e3)}s, no event`), timeoutMs);
         cleanup = () => {
@@ -1576,6 +1686,10 @@ ${escLines.join("\n")}` : "";
           clearInterval(fv);
           clearTimeout(to);
         };
+        if (state !== void 0 && evaluateInbox()) {
+          inboxBefore = inboxSnap();
+          done("xiaochang_wait: fork inbox changed \u2014 read xiaochang_graph and dispatch the untaken branches");
+        }
       });
     }
   }));
