@@ -404,7 +404,7 @@ function filteredFailedOf(code) {
   for (const v of campaign?.ledger.views() ?? []) {
     if (v.state !== "failed" || codeOf(v.item.id) !== code) continue;
     const detail = v.terminalDetail ?? "";
-    const provErr = /(TRANSPORT|MISSING_CREDENTIAL|429|503|rate limit|insufficient|余额|connection.*(fail|reset|timeout))/i.test(detail);
+    const provErr = /(TRANSPORT|MISSING_CREDENTIAL|rate limit|insufficient|余额|no API key)/i.test(detail);
     const inOutage = windows.some((w) => {
       const at = v.lastProgressAt ?? 0;
       return at >= w.from && (w.to === null || at <= w.to);
