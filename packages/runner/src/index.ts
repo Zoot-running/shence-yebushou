@@ -1033,11 +1033,6 @@ ${gaps}
           escLines.push(`⚠️ ${code}: 死思路 ${st.dead}/${st.adopted} ≥50% → 建议 xiaochang_refanout 二次征集(难度${q.difficulty}, 已试 ${q.triedModels.join(',') || '无'})`)
         }
       }
-      const remaining = Math.max(0, s.startedAt + s.budgetMs - Date.now())
-      if (remaining <= 60 * 60_000) {
-        const hardUnsolved = Object.entries(s.v2).filter(([, q]) => q.difficulty >= 55 && q.lastVerdict !== 'complete' && (s.progress.get(q as unknown as string) ?? undefined) !== undefined).length
-        void hardUnsolved
-      }
       // 末段赶工(第 3 层): 预算 ≤60min 且仍有 hard 未破 → 强制升级提示。
       if (remaining <= 60 * 60_000) {
         const hardOpen: string[] = []

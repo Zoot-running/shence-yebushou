@@ -143,8 +143,6 @@ var TsecbenchAdapter = class {
     this.config = config;
     this.fetch = fetch2;
   }
-  config;
-  fetch;
   headers(extra) {
     return { BENCHMARK_TOKEN: this.config.benchmarkToken, "Content-Type": "application/json", ...extra };
   }
@@ -1188,6 +1186,13 @@ ${lines.join("\n")}`;
         if (st.dead / st.adopted >= 0.5) {
           escLines.push(`\u26A0\uFE0F ${code}: \u6B7B\u601D\u8DEF ${st.dead}/${st.adopted} \u226550% \u2192 \u5EFA\u8BAE xiaochang_refanout \u4E8C\u6B21\u5F81\u96C6(\u96BE\u5EA6${q.difficulty}, \u5DF2\u8BD5 ${q.triedModels.join(",") || "\u65E0"})`);
         }
+      }
+      if (remaining <= 60 * 6e4) {
+        const hardOpen = [];
+        for (const [code, q] of Object.entries(s.v2)) {
+          if (q.difficulty >= 55 && q.lastVerdict !== "complete") hardOpen.push(code);
+        }
+        if (hardOpen.length > 0) escLines.push(`\u23F0 \u672B\u6BB5\u8D76\u5DE5(\u226460min): ${hardOpen.join(", ")} \u672A\u7834 \u2192 \u7ACB\u5373 xiaochang_refanout \u5168\u6A21\u578B\u6863(\u663E\u5F0F kimi-k3/pro), \u6EE1\u5206>\u7528\u65F6>\u82B1\u8D39`);
       }
       const escTxt = escLines.length > 0 ? `
 \u5347\u7EA7\u5EFA\u8BAE:
