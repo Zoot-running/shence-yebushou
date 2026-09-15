@@ -130,3 +130,18 @@ enqueue 的 `prompt` 参数语义降级为**一句话指令**(思路/职责),机
 主 agent 另报"唤醒层抑制没生效"——复核结论: 该 fork 是 b-02 **未终态时**同进程 followup 发出(当时唤醒正确), 投递排队后被主 agent 在终态后读到, 属消息排序现象, 不是机制缺口;定向验证局已证明"写入时已终态 → 静默归档不唤醒"成立。终态在途兵标 blocked(虎符 cancel 语义)与排名钟未停(干跑无 runId)为预期行为, 不改。
 
 **v7.1 终局(三轮验证, 全绿)**: 定向验证局(外部注入迟到 fork → 静默归档+0 唤醒+status 全字段正常) + 全量干跑复测(8/8 4400/4400, "is not defined" 0 次, status 裁决循环实跑, 容器槽开合正常)。v7.2 候选(执行者建议, 待讨论): `xiaochang_fork` 增加 dead-end|untaken 语义位, 死路结论不再走 fork 信箱唤醒。
+
+## v7.2 fork 语义位 status: untaken | dead-end(2026-09-15)
+
+- `xiaochang_fork` 每条 fork 增加显式 `status` 字段(缺省 untaken 向后兼容):
+  - `untaken`(未走分叉)→ ④ + 信箱 + 唤醒主 agent(v7.1 终态抑制照旧);
+  - `dead-end`(已证死路: 403/不可绕/已验证失败)→ **只进②不可行教训, 静默**: 不信箱/不唤醒/不进④——死路是教训不是增兵候选, 账本不再双写。
+- 定向验证局(g-m1 + 执行者显式上报两条): ② 只有死路样例, ④ 只有未走分叉样例; 账本 kind 各一条零双写; 注入的终态迟到 fork 仍静默归档(absorbed ×2), 收尾 wait 全程 timeout 无唤醒; status 全字段正常。
+- 全量干跑: 8/8 4400/4400 ALL TERMINAL(约 5 分钟, 历史最快), "is not defined" 0 次; 类闸 7 local/4 container(主 agent 正确使用 local 覆盖同题加兵); 8 题账本四节齐全。
+
+## v7.3 submit 主 agent 守卫(2026-09-16)
+
+- 起因: v7.2 全量干跑实锤 fanout 思路模型直接调 `xiaochang_submit` 交卷(平台回执被非主 agent 悄悄消费, 交卷路径不可审计)。
+- 机制: `xiaochang_submit` 加 hint 同款单点守卫——非主 agent 调用即拒绝并指路("执行者请把 flag 输出为 FLAG_CANDIDATE: <flag> 交给主 agent 提交"); 交卷唯一路径 = 主 agent, 平台判定串行可审计。缺省语义不变(临门一脚仍是主 agent 的 ≤3 工具调用)。
+- 定向验证局: 执行者按令先调 submit → 逐字拒绝回执("xiaochang_submit: 拒绝——submit 是主 agent 专属单点…我作为执行者无权"), 主 agent 交卷 correct=true/awarded 300; 同局复验 v7.2 双路由(死路静默②/分叉信箱④)与 v7.1 注入抑制(absorbed×2, 收尾 wait timeout 0 唤醒)。
+- 全量干跑: 8/8 4400/4400 hints 0 无判死, "is not defined" 0 次, 8 题账本四节齐全, 类闸 5 container/4 local。观察: b-02 本局被 R2 一击全清, dependsOn 链式拆项未实战(上轮已验)。

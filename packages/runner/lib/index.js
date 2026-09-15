@@ -1044,14 +1044,17 @@ boardPath=${c().boardPath(args.code)}`;
   }));
   register(defineTool({
     name: "xiaochang_submit",
-    description: "Submit a flag candidate. Returns the platform verdict (correct/awarded/cumulative/flag counts).",
+    description: "Submit a flag candidate (main agent ONLY \u2014 executors report FLAG_CANDIDATE to the main agent, who submits; single-point submission keeps the platform verdict path serialized). Returns the platform verdict (correct/awarded/cumulative/flag counts).",
     parameters: {
       code: { type: "string", required: true },
       flag: { type: "string", required: true, description: "Flag text (platform-annotated format, verbatim)." }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args) {
+    async execute(args, exec) {
+      if (parentAgent !== void 0 && exec.agent !== parentAgent) {
+        return "xiaochang_submit: \u62D2\u7EDD\u2014\u2014submit \u662F\u4E3B agent \u4E13\u5C5E\u5355\u70B9(\u4EA4\u5377\u8DEF\u5F84\u4E32\u884C\u53EF\u5BA1\u8BA1); \u6267\u884C\u8005\u8BF7\u628A flag \u8F93\u51FA\u4E3A FLAG_CANDIDATE: <flag> \u4EA4\u7ED9\u4E3B agent \u63D0\u4EA4";
+      }
       const s = requireState();
       try {
         const res = await s.adapter.submit(args.code, args.flag);
@@ -1389,44 +1392,67 @@ ${prompt}`;
   }));
   register(defineTool({
     name: "xiaochang_fork",
-    description: "F33 fork alarm: you (executor) found untaken promising branches or hard-won evidence \u2014 record them as fork knowledge AND wake the main agent immediately (followup, zero wait). The main agent alone decides whether to dispatch (single scheduler). v7.1: if the challenge is already terminal, the fork is archived as knowledge only \u2014 no inbox, no wake, no dispatch impulse.",
+    description: 'F33 fork alarm: you (executor) report branches with an explicit status \u2014 "untaken" (default): promising branch not taken, worth dispatching (goes to ledger \u2463 + inbox + wakes the main agent immediately); "dead-end": a path you PROVED infeasible (403/impossible/verified-fail) \u2014 archived silently to ledger \u2461 only, no inbox, no wake, no dispatch impulse. The main agent alone decides whether to dispatch. v7.1: untaken forks of already-terminal challenges are archived as knowledge only.',
     parameters: {
       code: { type: "string", required: true },
-      forks: { type: "array", required: true, description: "[{path, conclusion, evidence}] untaken branches worth dispatching." }
+      forks: { type: "array", required: true, description: '[{path, conclusion, evidence, status}] \u2014 status: "untaken" (default, \u672A\u8D70\u5206\u53C9\u2192\u2463+\u5524\u9192\u4E3B agent) | "dead-end" (\u5DF2\u8BC1\u6B7B\u8DEF\u2192\u53EA\u8FDB\u2461\u4E0D\u53EF\u884C\u6559\u8BAD, \u4E0D\u5524\u9192\u4E0D\u6D3E\u5175).' }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => true,
     async execute(args) {
       if (args.forks.length === 0) return "xiaochang_fork: no forks given";
+      const fmt = (f) => `${f.path}${f.conclusion !== void 0 ? " \u2192 " + f.conclusion : ""}${f.evidence !== void 0 ? " (\u8BC1\u636E: " + f.evidence + ")" : ""}`;
+      const deadEnds = args.forks.filter((f) => f.status === "dead-end");
+      const untaken = args.forks.filter((f) => f.status !== "dead-end");
+      const deadLines = deadEnds.map(fmt);
+      const forkLines = untaken.map(fmt);
+      if (deadEnds.length > 0) {
+        const de = deadEnds.map((f) => ({ kind: "dead-end", path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: "fork", at: Date.now() }));
+        try {
+          recordKnowledgeOnCode(args.code, de);
+        } catch {
+        }
+        try {
+          appendKnowledgeFile(args.code, "dead", deadLines);
+        } catch {
+        }
+      }
       const terminalNow = progressTerminal(args.code);
-      const entries = args.forks.map((f) => ({ kind: "fork", path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: "fork", at: Date.now() }));
-      const lines = entries.map((f) => `- \u{1F500} ${f.path}${f.conclusion !== void 0 ? " \u2192 " + f.conclusion : ""}${f.evidence !== void 0 ? " (\u8BC1\u636E: " + f.evidence + ")" : ""}`);
+      const entries = untaken.map((f) => ({ kind: "fork", path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: "fork", at: Date.now() }));
       let inbox = "";
-      if (!terminalNow) {
+      if (untaken.length > 0 && !terminalNow) {
         try {
           inbox = writeForkInbox(args.code, entries);
         } catch {
         }
       }
-      try {
-        recordKnowledgeOnCode(args.code, entries);
-      } catch {
-      }
-      try {
-        appendKnowledgeFile(args.code, "forks", entries.map((f) => `${f.path}${f.conclusion !== void 0 ? " \u2192 " + f.conclusion : ""}${f.evidence !== void 0 ? " (\u8BC1\u636E: " + f.evidence + ")" : ""}`));
-      } catch {
+      if (entries.length > 0) {
+        try {
+          recordKnowledgeOnCode(args.code, entries);
+        } catch {
+        }
+        try {
+          appendKnowledgeFile(args.code, "forks", forkLines);
+        } catch {
+        }
       }
       const sameProcess = parentAgent !== void 0 && campaign !== void 0;
-      if (sameProcess && !terminalNow) {
+      if (sameProcess && entries.length > 0 && !terminalNow) {
         parentAgent?.followup(createUserMessage({
           content: [{ type: "text", text: `\u{1F500} \u5206\u53C9\u5373\u65F6\u62A5(${args.code}): \u53D1\u73B0 ${entries.length} \u6761\u672A\u8D70\u5206\u53C9, \u5DF2\u5165\u8D26+\u4FE1\u7BB1\u3002\u7531\u4F60(\u4E3B agent)\u51B3\u5B9A\u662F\u5426 jisi_fanout_bulk / xiaochang_enqueue \u589E\u5175\u3002
-${lines.join("\n")}` }],
+${forkLines.map((l) => `- \u{1F500} ${l}`).join("\n")}` }],
           source: { kind: "user" }
         }));
       }
-      const terminalNote = terminalNow ? "; \u9898\u5DF2\u7EC8\u6001: \u4EC5\u5B58\u6863\u5165\u8D26, \u672A\u5199\u4FE1\u7BB1/\u672A\u5524\u9192(\u4E0D\u6D3E\u5175)" : "";
-      return `fork ${inbox !== "" ? "\u5DF2\u5199\u5165\u5206\u53C9\u4FE1\u7BB1(" + inbox + "), \u4E3B agent \u7684 xiaochang_wait \u4F1A\u88AB\u5524\u9192\u5E76\u5728\u8BFB\u56FE\u65F6\u5438\u6536" : "\u672A\u5199\u4FE1\u7BB1(\u7EC8\u6001\u6291\u5236\u6216\u5199\u5165\u5931\u8D25)"}${sameProcess && !terminalNow ? "; \u540C\u8FDB\u7A0B\u5DF2\u76F4\u63A5\u5165\u8D26\u5E76\u5524\u9192" : ""}${terminalNote}:
-${lines.join("\n")}`;
+      const parts = [];
+      if (deadEnds.length > 0) parts.push(`\u6B7B\u8DEF ${deadEnds.length} \u6761\u5DF2\u9759\u9ED8\u5165\u8D26\u2461(\u4E0D\u5524\u9192\u4E0D\u6D3E\u5175)`);
+      if (entries.length > 0) {
+        parts.push(inbox !== "" ? `\u672A\u8D70\u5206\u53C9 ${entries.length} \u6761\u5DF2\u5199\u4FE1\u7BB1(${inbox}), \u4E3B agent \u7684 xiaochang_wait \u4F1A\u88AB\u5524\u9192` : "\u672A\u8D70\u5206\u53C9: \u4FE1\u7BB1\u672A\u5199(\u7EC8\u6001\u6291\u5236\u6216\u5199\u5165\u5931\u8D25)");
+        if (sameProcess && !terminalNow) parts.push("\u540C\u8FDB\u7A0B\u5DF2\u76F4\u63A5\u5165\u8D26\u5E76\u5524\u9192");
+        if (terminalNow) parts.push("\u9898\u5DF2\u7EC8\u6001: \u4EC5\u5B58\u6863\u5165\u8D26, \u672A\u5199\u4FE1\u7BB1/\u672A\u5524\u9192(\u4E0D\u6D3E\u5175)");
+      }
+      return `fork ${parts.join("; ") || "nothing to record"}:
+${[...deadLines.map((l) => `- \u274C${l}`), ...forkLines.map((l) => `- \u{1F500}${l}`)].join("\n")}`;
     }
   }));
   register(defineTool({

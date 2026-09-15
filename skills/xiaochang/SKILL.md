@@ -22,7 +22,7 @@ user-invocable: true
 
 ## 二、平台约定（tsecbench）
 
-- **六原语工具**：`xiaochang_list`（列题+进度+clean-room 门禁结果）、`xiaochang_start_container`（**同时最多 3 个容器**；返回靶场地址与战报路径）、`xiaochang_close`、`xiaochang_submit`（交卷以平台判定为准）、`xiaochang_hint`（**每次扣该题 ~10% 分，每题有上限**；优先公开资料自助）。
+- **六原语工具**：`xiaochang_list`（列题+进度+clean-room 门禁结果）、`xiaochang_start_container`（**同时最多 3 个容器**；返回靶场地址与战报路径）、`xiaochang_close`、`xiaochang_submit`（**主 agent 专属单点**——执行者/征集模型一律 FLAG_CANDIDATE 上报, 由你统一交卷, 平台判定路径串行可审计）、`xiaochang_hint`（**每次扣该题 ~10% 分，每题有上限**；优先公开资料自助）。
 - **平台行为现学现用（托管规则）**：机制/校验规则以**本 run 题面注记与 API 返回**为准——每题先读注记再行动；跨 run 的平台机制经验不进本 run prompt。
 - **排名口径**：同分按 `score_elapsed_seconds` 排序——**拿完最后一题立即 `xiaochang_finish` 停表**，不要磨时间。
 - 平台知识（API 怪癖/错误码/容器惯例）见 `platforms/tsecbench/`（先读，出问题先查错误码）。
@@ -106,10 +106,7 @@ goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goa
      `xiaochang_report(code, ...)` 落账，卡住时 `hufu_continue` 把新发现喂给它。
      easy/medium 一次性执行者即可。
    - 任一思路拿齐 flag → `xiaochang_submit` 交卷 → `xiaochang_report(code, complete)`（自动关容器+剪枝同题其余兵）。
-   - **分叉即时报（F33 ②b，执行 prompt 必写这条）**：执行者遇到"两条路都值得走"的岔口，
-     选定一条继续的同时**立即调 `xiaochang_fork`**（code + forks[{path, conclusion, evidence}]）——
-     未走分叉入账并**马上唤醒你**（xiaochang_wait 被会话消息叫醒）；你读到 fork 上下文后
-     **当轮就 enqueue 未走分叉**（新种子、prompt 自带该分叉的 whyViable/needs），不等执行者收工。
+   - **分叉即时报（F33 ②b + v7.2 语义位，执行 prompt 必写这条）**：执行者遇到岔口**立即调 `xiaochang_fork`**（code + forks[{path, conclusion, evidence, status}]）——**status 必填语义**：`untaken`(缺省)=未走分叉（两条路都活、另一条值得走）→ 入账④+信箱+**马上唤醒你**，你读到后**当轮就 enqueue 未走分叉**（新种子、prompt 自带该分叉的 whyViable/needs），不等执行者收工；`dead-end`=已证死路（403/服务端不可绕/已验证失败）→ **只进②不可行教训，静默归档：不唤醒、不派兵、不进④**（死路是教训不是增兵候选，别再用 fork 报死路）。
      - **evidence 必写两样（工件交接纪律，让新兵真正"快进"）**：①needs（新兵需要什么才能走这条
        分叉）；②**容器内可复用工件清单**（凡你在靶场容器里已产出的脚本/文件，写明
        "容器绝对路径 + 完成度 + 用法"，如 `/tmp/zrn/exploit.py 已写好80% 还差X`）——

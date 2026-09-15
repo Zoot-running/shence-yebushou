@@ -738,14 +738,20 @@ export function apply(ctx: Context): void {
 
   register(defineTool({
     name: 'xiaochang_submit',
-    description: 'Submit a flag candidate. Returns the platform verdict (correct/awarded/cumulative/flag counts).',
+    description:
+      'Submit a flag candidate (main agent ONLY — executors report FLAG_CANDIDATE to the main agent, who submits; single-point submission keeps the platform verdict path serialized). Returns the platform verdict (correct/awarded/cumulative/flag counts).',
     parameters: {
       code: { type: 'string', required: true },
       flag: { type: 'string', required: true, description: 'Flag text (platform-annotated format, verbatim).' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args: { code: string; flag: string }) {
+    async execute(args: { code: string; flag: string }, exec) {
+      // v7.2: submit 主 agent 专属单点(2026-09-15 干跑实锤: fanout 思路模型直接交卷, 平台回执被悄悄吞掉)——
+      // 执行者/征集模型一律经 FLAG_CANDIDATE 上报, 由主 agent 统一交卷, 平台判定路径串行可审计。
+      if (parentAgent !== undefined && exec.agent !== parentAgent) {
+        return 'xiaochang_submit: 拒绝——submit 是主 agent 专属单点(交卷路径串行可审计); 执行者请把 flag 输出为 FLAG_CANDIDATE: <flag> 交给主 agent 提交'
+      }
       const s = requireState()
       try {
         const res = await s.adapter.submit(args.code, args.flag)
@@ -1105,42 +1111,54 @@ ${gaps}
   register(defineTool({
     name: 'xiaochang_fork',
     description:
-      'F33 fork alarm: you (executor) found untaken promising branches or hard-won evidence — record them as fork knowledge AND wake the main agent immediately (followup, zero wait). The main agent alone decides whether to dispatch (single scheduler). v7.1: if the challenge is already terminal, the fork is archived as knowledge only — no inbox, no wake, no dispatch impulse.',
+      'F33 fork alarm: you (executor) report branches with an explicit status — "untaken" (default): promising branch not taken, worth dispatching (goes to ledger ④ + inbox + wakes the main agent immediately); "dead-end": a path you PROVED infeasible (403/impossible/verified-fail) — archived silently to ledger ② only, no inbox, no wake, no dispatch impulse. The main agent alone decides whether to dispatch. v7.1: untaken forks of already-terminal challenges are archived as knowledge only.',
     parameters: {
       code: { type: 'string', required: true },
-      forks: { type: 'array', required: true, description: '[{path, conclusion, evidence}] untaken branches worth dispatching.' },
+      forks: { type: 'array', required: true, description: '[{path, conclusion, evidence, status}] — status: "untaken" (default, 未走分叉→④+唤醒主 agent) | "dead-end" (已证死路→只进②不可行教训, 不唤醒不派兵).' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => true,
-    async execute(args: { code: string; forks: Array<{ path: string; conclusion?: string; evidence?: string }> }) {
+    async execute(args: { code: string; forks: Array<{ path: string; conclusion?: string; evidence?: string; status?: 'untaken' | 'dead-end' }> }) {
       if (args.forks.length === 0) return 'xiaochang_fork: no forks given'
-      // v7.1 终态抑制(同进程侧): 题已终态 → 不入信箱、不唤醒(防迟到分叉回放产生增兵冲动);
-      // 知识照常入账存档(战后复盘仍可用)。执行者会话里无 state, 抑制判定交给主 agent 的 wait 侧。
+      const fmt = (f: { path: string; conclusion?: string; evidence?: string }): string => `${f.path}${f.conclusion !== undefined ? ' → ' + f.conclusion : ''}${f.evidence !== undefined ? ' (证据: ' + f.evidence + ')' : ''}`
+      const deadEnds = args.forks.filter(f => f.status === 'dead-end')
+      const untaken = args.forks.filter(f => f.status !== 'dead-end')
+      const deadLines = deadEnds.map(fmt)
+      const forkLines = untaken.map(fmt)
+      // v7.2 dead-end 语义位: 死路只进②不可行教训(静默)——不信箱/不唤醒/不进④, 账本不再双写。
+      if (deadEnds.length > 0) {
+        const de: KnowledgeIn[] = deadEnds.map(f => ({ kind: 'dead-end', path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: 'fork', at: Date.now() }))
+        try { recordKnowledgeOnCode(args.code, de) } catch { /* 入账失败不阻断 */ }
+        try { appendKnowledgeFile(args.code, 'dead', deadLines) } catch { /* 账本文件失败不阻断 */ }
+      }
+      // untaken: v7.1 终态抑制(同进程侧) + 信箱 + followup + ④。
       const terminalNow = progressTerminal(args.code)
-      const entries: KnowledgeIn[] = args.forks.map(f => ({ kind: 'fork', path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: 'fork', at: Date.now() }))
-      const lines = entries.map(f => `- 🔀 ${f.path}${f.conclusion !== undefined ? ' → ' + f.conclusion : ''}${f.evidence !== undefined ? ' (证据: ' + f.evidence + ')' : ''}`)
-      // 可靠通道: 写盘分叉信箱——主 agent 的 xiaochang_wait 轮询到变化即唤醒(跨会话/跨进程)。
+      const entries: KnowledgeIn[] = untaken.map(f => ({ kind: 'fork', path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: 'fork', at: Date.now() }))
       let inbox = ''
-      if (!terminalNow) {
+      if (untaken.length > 0 && !terminalNow) {
         try { inbox = writeForkInbox(args.code, entries) } catch { /* 信箱写失败 */ }
       }
-      // 同进程直接入账(主 agent 自调 fork 时生效; 执行者会话里 campaign 不存在则为 no-op)。
-      try { recordKnowledgeOnCode(args.code, entries) } catch { /* 入账失败不阻断 */ }
-      // v7: 同进程也直接追加知识账本文件 ④(跨会话的走信箱 → 主 agent absorb 时补写)。
-      try {
-        appendKnowledgeFile(args.code, 'forks', entries.map(f => `${f.path}${f.conclusion !== undefined ? ' → ' + f.conclusion : ''}${f.evidence !== undefined ? ' (证据: ' + f.evidence + ')' : ''}`))
-      } catch { /* 账本文件失败不阻断 */ }
+      if (entries.length > 0) {
+        try { recordKnowledgeOnCode(args.code, entries) } catch { /* 入账失败不阻断 */ }
+        try { appendKnowledgeFile(args.code, 'forks', forkLines) } catch { /* 账本文件失败不阻断 */ }
+      }
       // followup 仅同进程可达(执行者会话里 parentAgent 不是主 agent, 跨进程不可达——
-      // 不做虚假承诺; 真正唤醒靠上面的信箱+wait 轮询)。
+      // 真正唤醒靠上面的信箱+wait 轮询)。
       const sameProcess = parentAgent !== undefined && campaign !== undefined
-      if (sameProcess && !terminalNow) {
+      if (sameProcess && entries.length > 0 && !terminalNow) {
         parentAgent?.followup(createUserMessage({
-          content: [{ type: 'text', text: `🔀 分叉即时报(${args.code}): 发现 ${entries.length} 条未走分叉, 已入账+信箱。由你(主 agent)决定是否 jisi_fanout_bulk / xiaochang_enqueue 增兵。\n${lines.join('\n')}` }],
+          content: [{ type: 'text', text: `🔀 分叉即时报(${args.code}): 发现 ${entries.length} 条未走分叉, 已入账+信箱。由你(主 agent)决定是否 jisi_fanout_bulk / xiaochang_enqueue 增兵。\n${forkLines.map(l => `- 🔀 ${l}`).join('\n')}` }],
           source: { kind: 'user' },
         }))
       }
-      const terminalNote = terminalNow ? '; 题已终态: 仅存档入账, 未写信箱/未唤醒(不派兵)' : ''
-      return `fork ${inbox !== '' ? '已写入分叉信箱(' + inbox + '), 主 agent 的 xiaochang_wait 会被唤醒并在读图时吸收' : '未写信箱(终态抑制或写入失败)'}${sameProcess && !terminalNow ? '; 同进程已直接入账并唤醒' : ''}${terminalNote}:\n${lines.join('\n')}`
+      const parts: string[] = []
+      if (deadEnds.length > 0) parts.push(`死路 ${deadEnds.length} 条已静默入账②(不唤醒不派兵)`)
+      if (entries.length > 0) {
+        parts.push(inbox !== '' ? `未走分叉 ${entries.length} 条已写信箱(${inbox}), 主 agent 的 xiaochang_wait 会被唤醒` : '未走分叉: 信箱未写(终态抑制或写入失败)')
+        if (sameProcess && !terminalNow) parts.push('同进程已直接入账并唤醒')
+        if (terminalNow) parts.push('题已终态: 仅存档入账, 未写信箱/未唤醒(不派兵)')
+      }
+      return `fork ${parts.join('; ') || 'nothing to record'}:\n${[...deadLines.map(l => `- ❌${l}`), ...forkLines.map(l => `- 🔀${l}`)].join('\n')}`
     },
   }))
 
