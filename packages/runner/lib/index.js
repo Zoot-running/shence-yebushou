@@ -1,6 +1,6 @@
 // src/index.ts
 import { existsSync, mkdirSync as mkdirSync2, readFileSync, readdirSync as readdirSync2, renameSync as renameSync2, statSync as statSync2, writeFileSync, appendFileSync } from "node:fs";
-import { join as join2 } from "node:path";
+import { dirname, join as join2 } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 
@@ -325,6 +325,97 @@ var RunProgress = class _RunProgress {
     return JSON.stringify({ at: Date.now(), challenges: this.all() });
   }
 };
+function resourceClassOf(ch) {
+  const t = ch.description ?? "";
+  if (/(无需容器|纯附件|附件题|下载附件|attachment|静态文件|本地分析|离线求解|只用\s*(bash|shell|脚本))/i.test(t)) return "local";
+  return "container";
+}
+var KNOWLEDGE_SECTION_TITLES = [
+  "\u2460 \u9898\u6E90\u601D\u8DEF\u9AA8\u67B6",
+  "\u2461 \u4E0D\u53EF\u884C\u6559\u8BAD",
+  "\u2462 \u56DE\u6536\u5DE5\u4EF6",
+  "\u2463 \u672A\u8D70\u5206\u53C9"
+];
+function knowledgeSectionTitle(section) {
+  switch (section) {
+    case "skeleton":
+      return KNOWLEDGE_SECTION_TITLES[0];
+    case "dead":
+      return KNOWLEDGE_SECTION_TITLES[1];
+    case "artifacts":
+      return KNOWLEDGE_SECTION_TITLES[2];
+    case "forks":
+      return KNOWLEDGE_SECTION_TITLES[3];
+  }
+}
+function knowledgeSkeleton(code) {
+  return [
+    `# ${code} \u77E5\u8BC6\u8D26\u672C`,
+    "",
+    "> \u672C\u9898\u6C42\u89E3\u7684\u6301\u4E45\u8BB0\u5FC6: \u6267\u884C\u8005\u5F00\u5DE5\u7B2C\u4E00\u4EF6\u4E8B\u8BFB\u672C\u6587\u4EF6, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1\u3002",
+    "> \u2460 \u7531\u4E3B agent \u7EF4\u62A4(xiaochang_knowledge_put); \u2461\u2462\u2463 \u7531\u673A\u5236\u81EA\u52A8\u7D2F\u79EF(report/fork)\u3002",
+    "",
+    "## \u2460 \u9898\u6E90\u601D\u8DEF\u9AA8\u67B6",
+    "- (\u6682\u65E0)",
+    "",
+    "## \u2461 \u4E0D\u53EF\u884C\u6559\u8BAD",
+    "- (\u6682\u65E0)",
+    "",
+    "## \u2462 \u56DE\u6536\u5DE5\u4EF6",
+    "- (\u6682\u65E0)",
+    "",
+    "## \u2463 \u672A\u8D70\u5206\u53C9",
+    "- (\u6682\u65E0)",
+    ""
+  ].join("\n");
+}
+function sectionRange(lines, title) {
+  const start = lines.findIndex((l) => l.startsWith(`## ${title}`));
+  if (start < 0) return void 0;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (lines[i].startsWith("## ")) {
+      end = i;
+      break;
+    }
+  }
+  return [start, end];
+}
+function appendKnowledgeSection(fileText, section, entries) {
+  const title = knowledgeSectionTitle(section);
+  const lines = fileText.split("\n");
+  const range = sectionRange(lines, title);
+  const fresh = entries.filter((e) => e.trim() !== "" && !lines.includes(`- ${e}`));
+  if (fresh.length === 0) return fileText;
+  const body = fresh.map((e) => `- ${e}`);
+  if (range === void 0) {
+    const out2 = [...lines];
+    while (out2.length > 0 && out2[out2.length - 1] === "") out2.pop();
+    out2.push("", `## ${title}`, ...body, "");
+    return out2.join("\n");
+  }
+  const [start, end] = range;
+  const block = lines.slice(start, end);
+  const content = block.slice(1).filter((l) => l.trim() !== "");
+  const placeholder = content.length === 1 && content[0] === "- (\u6682\u65E0)";
+  const keep = placeholder ? [] : content;
+  const out = [...lines.slice(0, start + 1), ...keep, ...body, ...lines.slice(end)];
+  return out.join("\n");
+}
+function replaceKnowledgeSection(fileText, section, entries) {
+  const title = knowledgeSectionTitle(section);
+  const lines = fileText.split("\n");
+  const body = entries.map((e) => `- ${e}`);
+  const range = sectionRange(lines, title);
+  if (range === void 0) {
+    const out = [...lines];
+    while (out.length > 0 && out[out.length - 1] === "") out.pop();
+    out.push("", `## ${title}`, ...body, "");
+    return out.join("\n");
+  }
+  const [start, end] = range;
+  return [...lines.slice(0, start + 1), ...body, ...lines.slice(end)].join("\n");
+}
 
 // src/index.ts
 var name = "shence-xiaochang-runner";
@@ -555,6 +646,10 @@ function apply(ctx) {
           } catch {
           }
         }
+        try {
+          appendKnowledgeFile(code, "forks", fresh.map((k) => `${k.path}${k.conclusion !== void 0 ? " \u2192 " + k.conclusion : ""}${k.evidence !== void 0 ? " (\u8BC1\u636E: " + k.evidence + ")" : ""}`));
+        } catch {
+        }
       }
     }
     try {
@@ -584,15 +679,68 @@ function apply(ctx) {
       }
     }
   }
-  function renderKnowledge(code) {
-    const ks = knowledgeOfCode(code);
-    if (ks.length === 0) return "";
-    const lines = ["\u5DF2\u77E5\u60C5\u62A5(\u81EA\u52A8\u9644\u5E26, \u524D\u5E8F\u6267\u884C\u8005\u6C89\u6DC0)"];
-    for (const k of ks) {
-      const tag = k.kind === "dead-end" ? "\u274C\u6B7B\u8DEF" : k.kind === "fork" ? "\u{1F500}\u672A\u8D70\u5206\u53C9" : "\u{1F4CC}\u4E8B\u5B9E";
-      lines.push(`- [${tag}] ${k.path}${k.conclusion !== void 0 ? " \u2192 " + k.conclusion : ""}${k.evidence !== void 0 ? " (\u8BC1\u636E: " + k.evidence + ")" : ""}`);
+  const knowledgeFilePath = (code) => join2(dirname(c().boardPath(code)), "KNOWLEDGE.md");
+  function ensureKnowledgeFile(code) {
+    const p = knowledgeFilePath(code);
+    try {
+      if (!existsSync(p)) {
+        mkdirSync2(dirname(p), { recursive: true });
+        writeFileSync(p, knowledgeSkeleton(code));
+      }
+    } catch {
     }
-    return lines.join("\n");
+    return p;
+  }
+  function appendKnowledgeFile(code, section, entries) {
+    if (campaign2 === void 0) return;
+    const p = ensureKnowledgeFile(code);
+    try {
+      const text = readFileSync(p, "utf8");
+      const next = appendKnowledgeSection(text, section, entries);
+      if (next !== text) writeFileSync(p, next);
+    } catch {
+    }
+  }
+  function replaceKnowledgeFile(code, section, entries) {
+    if (campaign2 === void 0) return;
+    const p = ensureKnowledgeFile(code);
+    try {
+      writeFileSync(p, replaceKnowledgeSection(readFileSync(p, "utf8"), section, entries));
+    } catch {
+    }
+  }
+  function syncKnowledgeFileFromLedger(code) {
+    if (campaign2 === void 0) return;
+    const buckets = { dead: [], artifacts: [], forks: [] };
+    for (const k of knowledgeOfCode(code)) {
+      const text = `${k.path}${k.conclusion !== void 0 ? " \u2192 " + k.conclusion : ""}${k.evidence !== void 0 ? " (\u8BC1\u636E: " + k.evidence + ")" : ""}`;
+      if (k.kind === "dead-end") buckets.dead.push(text);
+      else if (k.kind === "fork") buckets.forks.push(text);
+      else buckets.artifacts.push(text);
+    }
+    for (const section of ["dead", "artifacts", "forks"]) {
+      if (buckets[section].length > 0) appendKnowledgeFile(code, section, buckets[section]);
+    }
+  }
+  function buildExecFrame(code, directive) {
+    const s = requireState();
+    const ch = s.challenges.get(code);
+    if (ch === void 0) return directive;
+    const cls = resourceClassOf(ch);
+    const addrs = ch.container_addr.length > 0 ? ch.container_addr.join(",") : cls === "local" ? "\u65E0\u9700\u5BB9\u5668(\u672C\u5730\u6C42\u89E3: bash/python \u76F4\u5F00)" : "\u5BB9\u5668\u672A\u5F00: \u8BF7\u4E3B agent xiaochang_start_container, \u6216\u4F60\u81EA\u884C\u8C03\u7528(\u5E73\u53F0\u540C\u65F6\u6700\u591A 3 \u4E2A\u5BB9\u5668)";
+    const kn = ensureKnowledgeFile(code);
+    return [
+      `\u3010\u6821\u573A\u6267\u884C\u4EE4 \xB7 ${code}\u3011(${cls === "local" ? "\u9644\u4EF6\u9898\xB7\u5168\u5E76\u884C" : "\u5BB9\u5668\u9898\xB73\u69FD\u8F6E\u6362"}, ${ch.difficulty}, ${ch.total_score}pts, ${ch.flag_count} flags)`,
+      `\u9898\u9762: ${(ch.description ?? "").slice(0, 1200)}`,
+      `\u5165\u53E3: ${addrs}`,
+      `\u5171\u4EAB\u6218\u62A5: ${c().boardPath(code)}`,
+      `\u77E5\u8BC6\u8D26\u672C(\u5F00\u5DE5\u5FC5\u8BFB): ${kn}`,
+      `\u753B\u50CF(\u5FEB\u901F\u8BFB): ${s.profilePath}`,
+      `\u4F60\u7684\u4EFB\u52A1: ${directive}`,
+      "\u7EAA\u5F8B: \u2460\u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1, \u4E0D\u91CD\u590D\u6B7B\u8DEF, \u4F18\u5148\u7528\u56DE\u6536\u5DE5\u4EF6;",
+      "      \u2461\u627E\u5230 flag \u7ACB\u5373\u8F93\u51FA FLAG_CANDIDATE: <flag>(\u4E3B agent \u8D1F\u8D23\u63D0\u4EA4);",
+      "      \u2462\u6B7B\u8DEF/\u65B0\u5206\u53C9\u8C03 xiaochang_fork \u4E0A\u62A5; \u7EC8\u6001\u524D\u628A\u6B7B\u8DEF\u539F\u56E0\u5199\u6E05\u3002"
+    ].join("\n");
   }
   const register = (tool) => ctx.tools.register(tool);
   register(defineTool({
@@ -612,7 +760,8 @@ function apply(ctx) {
       vpnGateway: { type: "string", description: "VPN gateway health URL. Default http://10.0.100.58." },
       defaultModel: { type: "string", description: "Executor default model when an item omits one. Default deepseek-v4-flash (you may set a per-run default that fits this run)." },
       defaultEffort: { type: "string", description: "Executor default reasoning effort. Default low." },
-      modelLock: { type: "boolean", description: "Lock: force ALL executors to defaultModel/defaultEffort, ignoring per-item overrides (user/parent-agent override). Default false (main agent may switch models per item)." }
+      modelLock: { type: "boolean", description: "Lock: force ALL executors to defaultModel/defaultEffort, ignoring per-item overrides (user/parent-agent override). Default false (main agent may switch models per item)." },
+      containerSlots: { type: "number", description: "v7 container-challenge concurrency slots (platform container cap). Default 3; attachment challenges are never constrained by this." }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
@@ -674,7 +823,8 @@ function apply(ctx) {
           defaultModel: args.defaultModel ?? "deepseek-v4-flash",
           defaultEffort: args.defaultEffort ?? "low",
           locked: args.modelLock ?? false
-        }
+        },
+        containerSlots: args.containerSlots ?? 3
       };
       try {
         if (existsSync(s.profilePath)) s.profile = parse(readFileSync(s.profilePath, "utf8"));
@@ -693,7 +843,9 @@ function apply(ctx) {
           concurrency: s.concurrency,
           stallAfterMs: s.roundTimeoutMs + 10 * 6e4,
           heartbeatMs: 15 * 6e4,
-          budgetMs: s.budgetMs
+          budgetMs: s.budgetMs,
+          // v7 类闸: 容器题受平台容器上限(默认 3), 附件题全并行(继承全局 concurrency)。
+          resourceLimits: { container: args.containerSlots ?? 3, local: s.concurrency }
         }, [], { id: stableId, boardNamespace: `${args.runId ?? "pending"}` });
         campaign2 = created.campaign;
         campaignId = created.id;
@@ -718,7 +870,7 @@ function apply(ctx) {
         }
       } catch {
       }
-      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}`;
+      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), containerSlots=${args.containerSlots ?? 3}, budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}`;
     }
   }));
   register(defineTool({
@@ -758,9 +910,11 @@ function apply(ctx) {
       const score = s.adapter.scoreOf(fresh);
       const rows = fresh.map((ch) => {
         const p = s.progress.get(ch.unique_code);
-        return `${ch.unique_code} [${ch.difficulty}] ${ch.total_score}pts flags=${ch.correct_flag_count}/${ch.flag_count} completed=${ch.is_completed} container=${ch.container_status} addrs=${ch.container_addr.join(",") || "-"} progress=${p?.state ?? "fresh"} | ${ch.description ?? ""}`;
+        const cls = resourceClassOf(ch);
+        return `${ch.unique_code} [${ch.difficulty}\xB7${cls === "local" ? "\u9644\u4EF6" : "\u5BB9\u5668"}] ${ch.total_score}pts flags=${ch.correct_flag_count}/${ch.flag_count} completed=${ch.is_completed} container=${ch.container_status} addrs=${ch.container_addr.join(",") || "-"} progress=${p?.state ?? "fresh"} | ${ch.description ?? ""}`;
       });
-      return `score=${score.score}/${score.max} (${score.completed}/${fresh.length})
+      const locals = fresh.filter((ch) => resourceClassOf(ch) === "local").length;
+      return `score=${score.score}/${score.max} (${score.completed}/${fresh.length}; \u9644\u4EF6\u9898 ${locals} \u4E2A\u5168\u5E76\u884C, \u5BB9\u5668\u9898 ${fresh.length - locals} \u4E2A\u53D7 ${s.containerSlots} \u69FD\u7EA6\u675F)
 
 ${rows.join("\n")}`;
     }
@@ -865,15 +1019,16 @@ boardPath=${c().boardPath(args.code)}`;
   }));
   register(defineTool({
     name: "xiaochang_enqueue",
-    description: "Enqueue one executor work item into the hufu campaign. You (the main agent) compose the prompt \u2014 include: challenge description, container addrs, the shared board path with read/append discipline, the org profile, the assigned approach (idea), and the FLAG_CANDIDATE output convention. Optional dependsOn makes it a DAG node (runs after dependencies reach a terminal state).",
+    description: "Enqueue one executor work item into the hufu campaign. v7 lean prompt: write ONLY the task directive (assigned idea/approach in one or two lines) \u2014 the mechanism wraps it with a fixed exec frame (challenge description, live container addrs, shared board path, per-challenge knowledge ledger path, org profile path, FLAG_CANDIDATE discipline). Executors read the knowledge ledger first (prior skeletons/dead-ends/artifacts/forks). resourceClass is auto-set by challenge type (attachment\u2192local full-parallel; container\u21923-slot rotation); override only when you know better. Optional dependsOn makes it a DAG node.",
     parameters: {
       code: { type: "string", required: true },
       round: { type: "number", required: true, description: "Round number (your own accounting)." },
-      prompt: { type: "string", required: true, description: "The full executor prompt." },
+      prompt: { type: "string", required: true, description: "The lean directive: the assigned approach/idea for this executor (1-3 lines). Do NOT paste the challenge description/addrs/board discipline \u2014 the frame injects those." },
       model: { type: "string", description: "Executor model. Default deepseek-v4-flash (cheap fast path; override for hard challenges)." },
       effort: { type: "string", description: "Reasoning effort (unsupported efforts are dropped per model)." },
       dependsOn: { type: "array", description: "Item ids this item waits for (DAG)." },
-      priority: { type: "number", description: "Priority score (higher first within difficulty tier)." }
+      priority: { type: "number", description: "Priority score (higher first within difficulty tier)." },
+      resourceClass: { type: "string", description: "Override the auto class: local (attachment-style, full parallel) or container (counts against the container slot cap). Auto by challenge type \u2014 override only when you know the container is already open or the type guess is wrong." }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
@@ -881,9 +1036,9 @@ boardPath=${c().boardPath(args.code)}`;
       const s = requireState();
       const ch = s.challenges.get(args.code);
       if (ch === void 0) return `xiaochang_enqueue: unknown challenge ${args.code}`;
-      let prior = "";
       try {
-        prior = renderKnowledge(args.code);
+        ensureKnowledgeFile(args.code);
+        syncKnowledgeFileFromLedger(args.code);
       } catch {
       }
       const vq = s.v2[args.code];
@@ -891,7 +1046,8 @@ boardPath=${c().boardPath(args.code)}`;
       if (vq !== void 0 && vq.gaps.length > 0) {
         gapsTxt = "\n\n\u5DF2\u77E5\u4E0A\u4E0B\u6587\u7F3A\u53E3(\u524D\u5E8F\u6267\u884C\u8005\u53CD\u9988\u7F3A\u7684\u4FE1\u606F, \u82E5\u4F60\u80FD\u8865\u5219\u8865, \u4E0D\u80FD\u8865\u5219\u660E\u786E\u8BF4\u7F3A\u4EC0\u4E48):\n" + vq.gaps.slice(-5).map((g) => `- ${g}`).join("\n");
       }
-      const label = prior + gapsTxt !== "" ? args.prompt + "\n\n" + prior + gapsTxt : args.prompt;
+      const cls = args.resourceClass ?? resourceClassOf(ch);
+      const label = buildExecFrame(args.code, args.prompt) + gapsTxt;
       const seq = s.progress.get(args.code)?.rounds ?? 0;
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`;
       const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy);
@@ -911,12 +1067,13 @@ boardPath=${c().boardPath(args.code)}`;
         reasoningEffort: executor.effort,
         ...args.dependsOn !== void 0 && args.dependsOn.length > 0 ? { dependsOn: args.dependsOn } : {},
         board: args.code,
+        resourceClass: cls,
         priority: { tier: tierOf(ch.difficulty), score: args.priority ?? ch.total_score }
       });
       s.progress.update(args.code, { difficulty: ch.difficulty, rounds: Math.max(s.progress.get(args.code)?.rounds ?? 0, args.round) });
       persistProgress(s);
-      audit(s.auditPath, { type: "enqueue", id: itemId, code: args.code, round: args.round, model: executor.model, effort: executor.effort });
-      return `enqueued ${itemId} (executor=${executor.model}/${executor.effort}${executor.overriddenByLock ? ", OVERRIDDEN BY MODEL LOCK" : ""})`;
+      audit(s.auditPath, { type: "enqueue", id: itemId, code: args.code, round: args.round, model: executor.model, effort: executor.effort, class: cls });
+      return `enqueued ${itemId} (class=${cls}, executor=${executor.model}/${executor.effort}${executor.overriddenByLock ? ", OVERRIDDEN BY MODEL LOCK" : ""})`;
     }
   }));
   register(defineTool({
@@ -928,8 +1085,9 @@ boardPath=${c().boardPath(args.code)}`;
     async execute() {
       const s = requireState();
       let count = 0;
-      while (c().freeSlots() > 0 && c().nextQueued().length > 0) {
-        await c().dispatchNext();
+      while (true) {
+        const dispatched = await c().dispatchNext();
+        if (dispatched === void 0) break;
         count += 1;
       }
       audit(s.auditPath, { type: "dispatch-round", count, open: openCount(c()) });
@@ -1030,6 +1188,14 @@ ${detail.slice(0, 6e3)}`);
         if (entries.length > 0) recordKnowledgeOnCode(args.code, entries);
       } catch {
       }
+      const line = (e) => `${e.path}${e.conclusion !== void 0 ? " \u2192 " + e.conclusion : ""}${e.evidence !== void 0 ? " (\u8BC1\u636E: " + e.evidence + ")" : ""}`;
+      try {
+        if ((args.deadEnds?.length ?? 0) > 0) appendKnowledgeFile(args.code, "dead", args.deadEnds.map(line));
+        if ((args.gaps?.length ?? 0) > 0) appendKnowledgeFile(args.code, "dead", args.gaps.map((g) => `\u7F3A\u53E3: ${g}`));
+        if ((args.observations?.length ?? 0) > 0) appendKnowledgeFile(args.code, "artifacts", args.observations.map(line));
+        if ((args.forks?.length ?? 0) > 0) appendKnowledgeFile(args.code, "forks", args.forks.map(line));
+      } catch {
+      }
       try {
         await s.adapter.close(args.code);
       } catch {
@@ -1086,6 +1252,7 @@ ${text}`;
     const tried = vq.triedModels.length > 0 ? vq.triedModels.join(", ") : "(\u65E0)";
     return `[\u4E8C\u6B21\u601D\u8DEF\u5F81\u96C6 R${vq.ideaRound + 1}] \u9898\u76EE ${code}(${vq.qtype}, \u6821\u51C6\u96BE\u5EA6 ${vq.difficulty}/100)
 \u9898\u9762: ${(ch?.description ?? "").slice(0, 1500)}
+\u77E5\u8BC6\u8D26\u672C(\u53EF\u9009\u8BFB, \u524D\u5E8F\u9AA8\u67B6/\u6B7B\u8DEF/\u5DE5\u4EF6/\u5206\u53C9): ${ensureKnowledgeFile(code)}
 
 \u5DF2\u77E5\u6B7B\u8DEF(\u524D\u5E8F\u601D\u8DEF\u5DF2\u8BC1\u4E0D\u53EF\u884C):
 ${dead}
@@ -1164,6 +1331,10 @@ ${prompt}`;
         recordKnowledgeOnCode(args.code, entries);
       } catch {
       }
+      try {
+        appendKnowledgeFile(args.code, "forks", entries.map((f) => `${f.path}${f.conclusion !== void 0 ? " \u2192 " + f.conclusion : ""}${f.evidence !== void 0 ? " (\u8BC1\u636E: " + f.evidence + ")" : ""}`));
+      } catch {
+      }
       const sameProcess = parentAgent !== void 0 && campaign2 !== void 0;
       if (sameProcess) {
         parentAgent?.followup(createUserMessage({
@@ -1195,6 +1366,8 @@ ${lines.join("\n")}`;
       }
       const views = c().ledger.views().filter((v) => args.code === void 0 || codeOf(v.item.id) === args.code);
       if (views.length === 0) return `xiaochang_graph: no ledger items${args.code !== void 0 ? ` for ${args.code}` : ""}`;
+      const header = args.code !== void 0 ? `knowledgeFile=${ensureKnowledgeFile(args.code)}
+` : "";
       const rows = [];
       for (const v of views) {
         const code = codeOf(v.item.id);
@@ -1209,7 +1382,53 @@ ${lines.join("\n")}`;
         }
         if (p !== void 0) rows.push(`   progress: ${p.state} reason=${p.reason ?? "-"} containerClosed=${p.containerClosed}`);
       }
-      return rows.join("\n");
+      return header + rows.join("\n");
+    }
+  }));
+  register(defineTool({
+    name: "xiaochang_knowledge_put",
+    description: "v7 per-challenge knowledge ledger write (main agent only): rewrite section \u2460 \u9898\u6E90\u601D\u8DEF\u9AA8\u67B6 (idea source + skeleton steps; the one section you own) and/or append \u2461\u4E0D\u53EF\u884C\u6559\u8BAD/\u2462\u56DE\u6536\u5DE5\u4EF6/\u2463\u672A\u8D70\u5206\u53C9. The file is auto-accumulated by mechanism for \u2461\u2462\u2463 (report/fork) \u2014 call this mainly to maintain \u2460 and to add your own lessons. Executors read this file at work start; retries continue from the frontier instead of re-identifying.",
+    parameters: {
+      code: { type: "string", required: true },
+      skeleton: { type: "array", description: "\u2460 \u9898\u6E90\u601D\u8DEF\u9AA8\u67B6 (REPLACES the section): one line per idea \u2014 source (\u9898\u9762/hint/\u56FE\u8C31/\u5206\u53C9) + skeleton steps." },
+      deadEnds: { type: "array", description: "\u2461 append: proven-infeasible paths / missing context." },
+      artifacts: { type: "array", description: "\u2462 append: recyclable artifacts \u2014 credentials, file paths, URLs, scripts, findings." },
+      forks: { type: "array", description: "\u2463 append: untaken branches worth dispatching." }
+    },
+    output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      if (parentAgent !== void 0 && exec.agent !== parentAgent) {
+        return "xiaochang_knowledge_put: \u62D2\u7EDD\u2014\u2014\u77E5\u8BC6\u8D26\u672C\u2460\u662F\u4E3B agent \u4E13\u5C5E(\u9632\u5E76\u53D1\u6539\u5199\u601D\u8DEF\u9AA8\u67B6); \u6267\u884C\u8005\u7528 xiaochang_fork \u4E0A\u62A5\u5206\u53C9\u5373\u53EF";
+      }
+      const s = requireState();
+      if (s.challenges.get(args.code) === void 0) return `xiaochang_knowledge_put: unknown challenge ${args.code}`;
+      const applied = [];
+      try {
+        if (args.skeleton !== void 0) {
+          replaceKnowledgeFile(args.code, "skeleton", args.skeleton);
+          applied.push(`\u2460 \u9AA8\u67B6\u6539\u5199 ${args.skeleton.length} \u6761`);
+        }
+        if (args.deadEnds !== void 0) {
+          appendKnowledgeFile(args.code, "dead", args.deadEnds);
+          applied.push(`\u2461 \u6B7B\u8DEF +${args.deadEnds.length}`);
+        }
+        if (args.artifacts !== void 0) {
+          appendKnowledgeFile(args.code, "artifacts", args.artifacts);
+          applied.push(`\u2462 \u5DE5\u4EF6 +${args.artifacts.length}`);
+        }
+        if (args.forks !== void 0) {
+          appendKnowledgeFile(args.code, "forks", args.forks);
+          applied.push(`\u2463 \u5206\u53C9 +${args.forks.length}`);
+        }
+      } catch {
+      }
+      try {
+        syncKnowledgeFileFromLedger(args.code);
+      } catch {
+      }
+      return `xiaochang_knowledge_put: ${applied.join(", ") || "nothing to write"}
+\u8D26\u672C: ${knowledgeFilePath(args.code)}`;
     }
   }));
   register(defineTool({
@@ -1282,8 +1501,11 @@ ${lines.join("\n")}`;
       const escTxt = escLines.length > 0 ? `
 \u5347\u7EA7\u5EFA\u8BAE:
 ${escLines.join("\n")}` : "";
+      const usage = c().classUsage?.() ?? {};
+      const usageTxt = Object.entries(usage).map(([cls, u]) => `${cls} ${u.open}/${u.limit}`).join(", ") || "n/a";
       return [
         `campaign: open=${count((v) => v.state === "dispatched" || v.state === "help")} queued=${count((v) => v.state === "queued")} done=${count((v) => v.state === "done")} failed=${count((v) => v.state === "failed")} blocked=${count((v) => v.state === "blocked")}`,
+        `resourceClasses: ${usageTxt}`,
         `budgetRemainingMin=${Math.round(remaining / 6e4)}`,
         `openContainers=${[...openContainers(s)].join(",") || "none"}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,

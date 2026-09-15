@@ -8,7 +8,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -17,13 +17,18 @@ import { addFact, createProfile, parse as parseProfile, render as renderProfile 
 import { TsecbenchAdapter, type ChallengeInfo, type FetchLike } from '../../../src/adapters/tsecbench.ts'
 import {
   RunProgress,
+  appendKnowledgeSection,
   baseId,
   cleanRoomGate,
   codeOf,
+  knowledgeSkeleton,
   parseObservations,
+  replaceKnowledgeSection,
   resolveExecutor,
+  resourceClassOf,
   roundOf,
   sweepLegacyWorkdir,
+  type KnowledgeSection,
 } from './orchestrator.ts'
 
 export const name = 'shence-xiaochang-runner'
@@ -54,7 +59,7 @@ function nodeFetch(): FetchLike {
 
 /** 虎符服务面（最小类型面）。 */
 interface HufuLike {
-  add(item: { id: string; label: string; model?: string; reasoningEffort?: string; priority?: { tier: number; score: number }; dependsOn?: string[]; board?: string }): void
+  add(item: { id: string; label: string; model?: string; reasoningEffort?: string; priority?: { tier: number; score: number }; dependsOn?: string[]; board?: string; resourceClass?: string }): void
   freeSlots(): number
   nextQueued(): unknown[]
   dispatchNext(): Promise<unknown>
@@ -65,6 +70,8 @@ interface HufuLike {
   cancel(itemId: string, reason: string): void
   boardPath(group: string): string
   isComplete(): boolean
+  /** v7 类闸可见性：每资源类 {open, limit}。 */
+  classUsage?(): Record<string, { open: number; limit: number }>
   ledger: {
     views(): Array<{ item: { id: string; model?: string }; state: string; seed: number; terminalDetail?: string; dispatchedAt?: number; lastProgressAt?: number }>
   }
@@ -121,6 +128,8 @@ interface SetupArgs {
   defaultEffort?: string
   /** 模型锁：true = 强制所有执行者使用缺省模型/强度（用户/父 agent 锁定选项）。 */
   modelLock?: boolean
+  /** v7: 容器题并发槽位(平台容器上限)。默认 3。 */
+  containerSlots?: number
 }
 
 /** 每题 v2 状态(第 0/3 层)。 */
@@ -191,6 +200,8 @@ interface CampaignState {
   processed: Set<string>
   challenges: Map<string, ChallengeInfo>
   executorPolicy: ExecutorPolicy
+  /** v7: 容器题并发槽位(平台容器上限)。 */
+  containerSlots: number
 }
 
 let state: CampaignState | undefined
@@ -389,6 +400,10 @@ export function apply(ctx: Context): void {
           if (codeOf(v.item.id) !== code) continue
           try { holder.recordKnowledge?.(campaignId ?? '', v.item.id, fresh) } catch { /* 吸收失败不阻断 */ }
         }
+        // v7: 吸收同时补写知识账本文件 ④(跨会话执行者上报的分叉在此落文件)。
+        try {
+          appendKnowledgeFile(code, 'forks', fresh.map(k => `${k.path}${k.conclusion !== undefined ? ' → ' + k.conclusion : ''}${k.evidence !== undefined ? ' (证据: ' + k.evidence + ')' : ''}`))
+        } catch { /* 账本文件失败不阻断 */ }
       }
     }
     try { renameSync(p, `${p}.absorbed-${Date.now()}`) } catch { /* 归档失败不阻断 */ }
@@ -414,16 +429,78 @@ export function apply(ctx: Context): void {
       try { holder.recordKnowledge?.(campaignId, v.item.id, entries) } catch { /* 知识落账失败不阻断调度 */ }
     }
   }
-  function renderKnowledge(code: string): string {
-    const ks = knowledgeOfCode(code)
-    if (ks.length === 0) return ''
-    const lines = ['已知情报(自动附带, 前序执行者沉淀)']
-    for (const k of ks) {
-      const tag = k.kind === 'dead-end' ? '❌死路' : k.kind === 'fork' ? '🔀未走分叉' : '📌事实'
-      lines.push(`- [${tag}] ${k.path}${k.conclusion !== undefined ? ' → ' + k.conclusion : ''}${k.evidence !== undefined ? ' (证据: ' + k.evidence + ')' : ''}`)
-    }
-    return lines.join('\n')
+  // ── v7 每题知识账本文件(四节: ①主 agent 写, ②③④机制自动累积) ──────
+  // 与 FINDINGS.md 同目录; 执行者 bash 直读, 无需工具; 重试零重复识别。
+  const knowledgeFilePath = (code: string): string => join(dirname(c().boardPath(code)), 'KNOWLEDGE.md')
+  function ensureKnowledgeFile(code: string): string {
+    const p = knowledgeFilePath(code)
+    try {
+      if (!existsSync(p)) {
+        mkdirSync(dirname(p), { recursive: true })
+        writeFileSync(p, knowledgeSkeleton(code))
+      }
+    } catch { /* 账本初始化失败不阻断调度 */ }
+    return p
   }
+  /** 账本追加(按行去重幂等); 执行者会话无战役 → no-op(靠信箱, 主 agent 吸收时写)。 */
+  function appendKnowledgeFile(code: string, section: KnowledgeSection, entries: string[]): void {
+    if (campaign === undefined) return
+    const p = ensureKnowledgeFile(code)
+    try {
+      const text = readFileSync(p, 'utf8')
+      const next = appendKnowledgeSection(text, section, entries)
+      if (next !== text) writeFileSync(p, next)
+    } catch { /* 追加失败不阻断 */ }
+  }
+  /** 账本改写(主 agent 重写 ① 思路骨架)。 */
+  function replaceKnowledgeFile(code: string, section: KnowledgeSection, entries: string[]): void {
+    if (campaign === undefined) return
+    const p = ensureKnowledgeFile(code)
+    try {
+      writeFileSync(p, replaceKnowledgeSection(readFileSync(p, 'utf8'), section, entries))
+    } catch { /* 改写失败不阻断 */ }
+  }
+  /** restore/迁移兜底: 把账本(虎符 knowledge + 分叉信箱)里已有的条目镜像进文件(行去重幂等)。 */
+  function syncKnowledgeFileFromLedger(code: string): void {
+    if (campaign === undefined) return
+    const buckets: Record<'dead' | 'artifacts' | 'forks', string[]> = { dead: [], artifacts: [], forks: [] }
+    for (const k of knowledgeOfCode(code)) {
+      const text = `${k.path}${k.conclusion !== undefined ? ' → ' + k.conclusion : ''}${k.evidence !== undefined ? ' (证据: ' + k.evidence + ')' : ''}`
+      if (k.kind === 'dead-end') buckets.dead.push(text)
+      else if (k.kind === 'fork') buckets.forks.push(text)
+      else buckets.artifacts.push(text)
+    }
+    for (const section of ['dead', 'artifacts', 'forks'] as const) {
+      if (buckets[section].length > 0) appendKnowledgeFile(code, section, buckets[section])
+    }
+  }
+
+  // ── v7 极简执行令框架: 主 agent 只写指令, 机制注入题面/入口/账本/画像/纪律 ──
+  function buildExecFrame(code: string, directive: string): string {
+    const s = requireState()
+    const ch = s.challenges.get(code)
+    if (ch === undefined) return directive
+    const cls = resourceClassOf(ch)
+    const addrs = ch.container_addr.length > 0
+      ? ch.container_addr.join(',')
+      : cls === 'local'
+        ? '无需容器(本地求解: bash/python 直开)'
+        : '容器未开: 请主 agent xiaochang_start_container, 或你自行调用(平台同时最多 3 个容器)'
+    const kn = ensureKnowledgeFile(code)
+    return [
+      `【校场执行令 · ${code}】(${cls === 'local' ? '附件题·全并行' : '容器题·3槽轮换'}, ${ch.difficulty}, ${ch.total_score}pts, ${ch.flag_count} flags)`,
+      `题面: ${(ch.description ?? '').slice(0, 1200)}`,
+      `入口: ${addrs}`,
+      `共享战报: ${c().boardPath(code)}`,
+      `知识账本(开工必读): ${kn}`,
+      `画像(快速读): ${s.profilePath}`,
+      `你的任务: ${directive}`,
+      '纪律: ①先读知识账本, 从已知边界出发, 不重复死路, 优先用回收工件;',
+      '      ②找到 flag 立即输出 FLAG_CANDIDATE: <flag>(主 agent 负责提交);',
+      '      ③死路/新分叉调 xiaochang_fork 上报; 终态前把死路原因写清。',
+    ].join('\n')
+  }
+
   const register = (tool: object): void => ctx.tools.register(tool as never)
 
   // ── setup：建/续战役 ──────────────────────────────────────────────
@@ -446,6 +523,7 @@ export function apply(ctx: Context): void {
       defaultModel: { type: 'string', description: 'Executor default model when an item omits one. Default deepseek-v4-flash (you may set a per-run default that fits this run).' },
       defaultEffort: { type: 'string', description: 'Executor default reasoning effort. Default low.' },
       modelLock: { type: 'boolean', description: 'Lock: force ALL executors to defaultModel/defaultEffort, ignoring per-item overrides (user/parent-agent override). Default false (main agent may switch models per item).' },
+      containerSlots: { type: 'number', description: 'v7 container-challenge concurrency slots (platform container cap). Default 3; attachment challenges are never constrained by this.' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
@@ -508,6 +586,7 @@ export function apply(ctx: Context): void {
           defaultEffort: args.defaultEffort ?? 'low',
           locked: args.modelLock ?? false,
         },
+        containerSlots: args.containerSlots ?? 3,
       }
       try {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
@@ -533,6 +612,8 @@ export function apply(ctx: Context): void {
           stallAfterMs: s.roundTimeoutMs + 10 * 60_000,
           heartbeatMs: 15 * 60_000,
           budgetMs: s.budgetMs,
+          // v7 类闸: 容器题受平台容器上限(默认 3), 附件题全并行(继承全局 concurrency)。
+          resourceLimits: { container: args.containerSlots ?? 3, local: s.concurrency },
         }, [], { id: stableId, boardNamespace: `${args.runId ?? 'pending'}` })
         campaign = created.campaign
         campaignId = created.id
@@ -550,7 +631,7 @@ export function apply(ctx: Context): void {
           }
         }
       } catch { /* v2 状态损坏: 重建 */ }
-      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}`
+      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), containerSlots=${args.containerSlots ?? 3}, budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}`
     },
   }))
 
@@ -590,9 +671,11 @@ export function apply(ctx: Context): void {
       const score = s.adapter.scoreOf(fresh)
       const rows = fresh.map(ch => {
         const p = s.progress.get(ch.unique_code)
-        return `${ch.unique_code} [${ch.difficulty}] ${ch.total_score}pts flags=${ch.correct_flag_count}/${ch.flag_count} completed=${ch.is_completed} container=${ch.container_status} addrs=${ch.container_addr.join(',') || '-'} progress=${p?.state ?? 'fresh'} | ${ch.description ?? ''}`
+        const cls = resourceClassOf(ch)
+        return `${ch.unique_code} [${ch.difficulty}·${cls === 'local' ? '附件' : '容器'}] ${ch.total_score}pts flags=${ch.correct_flag_count}/${ch.flag_count} completed=${ch.is_completed} container=${ch.container_status} addrs=${ch.container_addr.join(',') || '-'} progress=${p?.state ?? 'fresh'} | ${ch.description ?? ''}`
       })
-      return `score=${score.score}/${score.max} (${score.completed}/${fresh.length})\n\n${rows.join('\n')}`
+      const locals = fresh.filter(ch => resourceClassOf(ch) === 'local').length
+      return `score=${score.score}/${score.max} (${score.completed}/${fresh.length}; 附件题 ${locals} 个全并行, 容器题 ${fresh.length - locals} 个受 ${s.containerSlots} 槽约束)\n\n${rows.join('\n')}`
     },
   }))
 
@@ -705,33 +788,34 @@ export function apply(ctx: Context): void {
   register(defineTool({
     name: 'xiaochang_enqueue',
     description:
-      'Enqueue one executor work item into the hufu campaign. You (the main agent) compose the prompt — include: challenge description, container addrs, the shared board path with read/append discipline, the org profile, the assigned approach (idea), and the FLAG_CANDIDATE output convention. Optional dependsOn makes it a DAG node (runs after dependencies reach a terminal state).',
+      'Enqueue one executor work item into the hufu campaign. v7 lean prompt: write ONLY the task directive (assigned idea/approach in one or two lines) — the mechanism wraps it with a fixed exec frame (challenge description, live container addrs, shared board path, per-challenge knowledge ledger path, org profile path, FLAG_CANDIDATE discipline). Executors read the knowledge ledger first (prior skeletons/dead-ends/artifacts/forks). resourceClass is auto-set by challenge type (attachment→local full-parallel; container→3-slot rotation); override only when you know better. Optional dependsOn makes it a DAG node.',
     parameters: {
       code: { type: 'string', required: true },
       round: { type: 'number', required: true, description: 'Round number (your own accounting).' },
-      prompt: { type: 'string', required: true, description: 'The full executor prompt.' },
+      prompt: { type: 'string', required: true, description: 'The lean directive: the assigned approach/idea for this executor (1-3 lines). Do NOT paste the challenge description/addrs/board discipline — the frame injects those.' },
       model: { type: 'string', description: 'Executor model. Default deepseek-v4-flash (cheap fast path; override for hard challenges).' },
       effort: { type: 'string', description: 'Reasoning effort (unsupported efforts are dropped per model).' },
       dependsOn: { type: 'array', description: 'Item ids this item waits for (DAG).' },
       priority: { type: 'number', description: 'Priority score (higher first within difficulty tier).' },
+      resourceClass: { type: 'string', description: 'Override the auto class: local (attachment-style, full parallel) or container (counts against the container slot cap). Auto by challenge type — override only when you know the container is already open or the type guess is wrong.' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args: { code: string; round: number; prompt: string; model?: string; effort?: string; dependsOn?: string[]; priority?: number }) {
+    async execute(args: { code: string; round: number; prompt: string; model?: string; effort?: string; dependsOn?: string[]; priority?: number; resourceClass?: string }) {
       const s = requireState()
       const ch = s.challenges.get(args.code)
       if (ch === undefined) return `xiaochang_enqueue: unknown challenge ${args.code}`
-      // F33: 派单自动携带该题已知情报(死路/未走分叉/事实)——任何种子/模型都从已知边界出发。
-      // 知识读取失败绝不阻断派单(调度 > 记账)。
-      let prior = ''
-      try { prior = renderKnowledge(args.code) } catch { /* 附情报失败: 按无知识派单 */ }
+      // v7: 账本文件就绪 + restore/迁移兜底镜像(账本知识全量进文件, 行去重幂等)。
+      try { ensureKnowledgeFile(args.code); syncKnowledgeFileFromLedger(args.code) } catch { /* 账本失败不阻断派单 */ }
       // v2: 上下文缺口自动附带(contextGaps)——缺啥补啥, 不罚模型只补题。
       const vq = s.v2[args.code]
       let gapsTxt = ''
       if (vq !== undefined && vq.gaps.length > 0) {
         gapsTxt = '\n\n已知上下文缺口(前序执行者反馈缺的信息, 若你能补则补, 不能补则明确说缺什么):\n' + vq.gaps.slice(-5).map(g => `- ${g}`).join('\n')
       }
-      const label = (prior + gapsTxt) !== '' ? args.prompt + '\n\n' + prior + gapsTxt : args.prompt
+      // v7: 极简执行令框架(题面/入口/账本/画像/纪律由机制注入); 资源类自动按题类打, 可覆盖。
+      const cls = args.resourceClass ?? resourceClassOf(ch)
+      const label = buildExecFrame(args.code, args.prompt) + gapsTxt
       const seq = s.progress.get(args.code)?.rounds ?? 0
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`
       // 执行者模型/强度：主 agent 逐项覆盖优先，缺省兜底；模型锁定时强制缺省。
@@ -755,12 +839,13 @@ export function apply(ctx: Context): void {
         reasoningEffort: executor.effort,
         ...(args.dependsOn !== undefined && args.dependsOn.length > 0 ? { dependsOn: args.dependsOn } : {}),
         board: args.code,
+        resourceClass: cls,
         priority: { tier: tierOf(ch.difficulty), score: args.priority ?? ch.total_score },
       })
       s.progress.update(args.code, { difficulty: ch.difficulty, rounds: Math.max(s.progress.get(args.code)?.rounds ?? 0, args.round) })
       persistProgress(s)
-      audit(s.auditPath, { type: 'enqueue', id: itemId, code: args.code, round: args.round, model: executor.model, effort: executor.effort })
-      return `enqueued ${itemId} (executor=${executor.model}/${executor.effort}${executor.overriddenByLock ? ', OVERRIDDEN BY MODEL LOCK' : ''})`
+      audit(s.auditPath, { type: 'enqueue', id: itemId, code: args.code, round: args.round, model: executor.model, effort: executor.effort, class: cls })
+      return `enqueued ${itemId} (class=${cls}, executor=${executor.model}/${executor.effort}${executor.overriddenByLock ? ', OVERRIDDEN BY MODEL LOCK' : ''})`
     },
   }))
 
@@ -774,8 +859,11 @@ export function apply(ctx: Context): void {
     async execute() {
       const s = requireState()
       let count = 0
-      while (c().freeSlots() > 0 && c().nextQueued().length > 0) {
-        await c().dispatchNext()
+      // v7: 循环以 dispatchNext 返回 undefined 为准——类闸饱和(容器 3 槽满)时
+      // freeSlots()>0 但顶部排队项全类饱和, 旧式 while 条件会死转。
+      while (true) {
+        const dispatched = await c().dispatchNext()
+        if (dispatched === undefined) break
         count += 1
       }
       audit(s.auditPath, { type: 'dispatch-round', count, open: openCount(c()) })
@@ -885,6 +973,14 @@ export function apply(ctx: Context): void {
         ...(args.observations ?? []).map(e => ({ kind: 'observation', path: e.path, conclusion: e.conclusion, by: 'report', at: Date.now() })),
       ]
       try { if (entries.length > 0) recordKnowledgeOnCode(args.code, entries) } catch { /* 落账失败不阻断 */ }
+      // v7: 知识账本文件自动累积——②死路/缺口, ③工件(observations), ④分叉; 失败不阻断。
+      const line = (e: { path: string; conclusion?: string; evidence?: string }): string => `${e.path}${e.conclusion !== undefined ? ' → ' + e.conclusion : ''}${e.evidence !== undefined ? ' (证据: ' + e.evidence + ')' : ''}`
+      try {
+        if ((args.deadEnds?.length ?? 0) > 0) appendKnowledgeFile(args.code, 'dead', args.deadEnds!.map(line))
+        if ((args.gaps?.length ?? 0) > 0) appendKnowledgeFile(args.code, 'dead', args.gaps!.map(g => `缺口: ${g}`))
+        if ((args.observations?.length ?? 0) > 0) appendKnowledgeFile(args.code, 'artifacts', args.observations!.map(line))
+        if ((args.forks?.length ?? 0) > 0) appendKnowledgeFile(args.code, 'forks', args.forks!.map(line))
+      } catch { /* 账本文件失败不阻断 */ }
       try { await s.adapter.close(args.code) } catch { /* 平台侧已关 */ }
       s.progress.update(args.code, { state: verdict, reason: args.reason, containerClosed: true })
       for (const v of c().ledger.views()) {
@@ -939,6 +1035,7 @@ export function apply(ctx: Context): void {
     const tried = vq.triedModels.length > 0 ? vq.triedModels.join(', ') : '(无)'
     return `[二次思路征集 R${vq.ideaRound + 1}] 题目 ${code}(${vq.qtype}, 校准难度 ${vq.difficulty}/100)
 题面: ${(ch?.description ?? '').slice(0, 1500)}
+知识账本(可选读, 前序骨架/死路/工件/分叉): ${ensureKnowledgeFile(code)}
 
 已知死路(前序思路已证不可行):
 ${dead}
@@ -1015,6 +1112,10 @@ ${gaps}
       try { inbox = writeForkInbox(args.code, entries) } catch { /* 信箱写失败 */ }
       // 同进程直接入账(主 agent 自调 fork 时生效; 执行者会话里 campaign 不存在则为 no-op)。
       try { recordKnowledgeOnCode(args.code, entries) } catch { /* 入账失败不阻断 */ }
+      // v7: 同进程也直接追加知识账本文件 ④(跨会话的走信箱 → 主 agent absorb 时补写)。
+      try {
+        appendKnowledgeFile(args.code, 'forks', entries.map(f => `${f.path}${f.conclusion !== undefined ? ' → ' + f.conclusion : ''}${f.evidence !== undefined ? ' (证据: ' + f.evidence + ')' : ''}`))
+      } catch { /* 账本文件失败不阻断 */ }
       // followup 仅同进程可达(执行者会话里 parentAgent 不是主 agent, 跨进程不可达——
       // 不做虚假承诺; 真正唤醒靠上面的信箱+wait 轮询)。
       const sameProcess = parentAgent !== undefined && campaign !== undefined
@@ -1044,6 +1145,8 @@ ${gaps}
       for (const code of codes) { try { absorbForkInbox(code) } catch { /* 吸收失败不阻断 */ } }
       const views = c().ledger.views().filter(v => args.code === undefined || codeOf(v.item.id) === args.code)
       if (views.length === 0) return `xiaochang_graph: no ledger items${args.code !== undefined ? ` for ${args.code}` : ''}`
+      // v7: 单题视角附知识账本文件路径(主 agent 维护/执行者必读的持久记忆)。
+      const header = args.code !== undefined ? `knowledgeFile=${ensureKnowledgeFile(args.code)}\n` : ''
       const rows: string[] = []
       for (const v of views) {
         const code = codeOf(v.item.id)
@@ -1057,7 +1160,40 @@ ${gaps}
         }
         if (p !== undefined) rows.push(`   progress: ${p.state} reason=${p.reason ?? '-'} containerClosed=${p.containerClosed}`)
       }
-      return rows.join('\n')
+      return header + rows.join('\n')
+    },
+  }))
+
+  // ── v7 知识账本写入(主 agent 专属: ①整体改写, ②③④追加) ──────────
+  register(defineTool({
+    name: 'xiaochang_knowledge_put',
+    description:
+      'v7 per-challenge knowledge ledger write (main agent only): rewrite section ① 题源思路骨架 (idea source + skeleton steps; the one section you own) and/or append ②不可行教训/③回收工件/④未走分叉. The file is auto-accumulated by mechanism for ②③④ (report/fork) — call this mainly to maintain ① and to add your own lessons. Executors read this file at work start; retries continue from the frontier instead of re-identifying.',
+    parameters: {
+      code: { type: 'string', required: true },
+      skeleton: { type: 'array', description: '① 题源思路骨架 (REPLACES the section): one line per idea — source (题面/hint/图谱/分叉) + skeleton steps.' },
+      deadEnds: { type: 'array', description: '② append: proven-infeasible paths / missing context.' },
+      artifacts: { type: 'array', description: '③ append: recyclable artifacts — credentials, file paths, URLs, scripts, findings.' },
+      forks: { type: 'array', description: '④ append: untaken branches worth dispatching.' },
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args: { code: string; skeleton?: string[]; deadEnds?: string[]; artifacts?: string[]; forks?: string[] }, exec) {
+      // ① 由主 agent 专属维护(防多执行者同时改写思路骨架); 执行者经 xiaochang_fork 上报。
+      if (parentAgent !== undefined && exec.agent !== parentAgent) {
+        return 'xiaochang_knowledge_put: 拒绝——知识账本①是主 agent 专属(防并发改写思路骨架); 执行者用 xiaochang_fork 上报分叉即可'
+      }
+      const s = requireState()
+      if (s.challenges.get(args.code) === undefined) return `xiaochang_knowledge_put: unknown challenge ${args.code}`
+      const applied: string[] = []
+      try {
+        if (args.skeleton !== undefined) { replaceKnowledgeFile(args.code, 'skeleton', args.skeleton); applied.push(`① 骨架改写 ${args.skeleton.length} 条`) }
+        if (args.deadEnds !== undefined) { appendKnowledgeFile(args.code, 'dead', args.deadEnds); applied.push(`② 死路 +${args.deadEnds.length}`) }
+        if (args.artifacts !== undefined) { appendKnowledgeFile(args.code, 'artifacts', args.artifacts); applied.push(`③ 工件 +${args.artifacts.length}`) }
+        if (args.forks !== undefined) { appendKnowledgeFile(args.code, 'forks', args.forks); applied.push(`④ 分叉 +${args.forks.length}`) }
+      } catch { /* 写失败不阻断 */ }
+      try { syncKnowledgeFileFromLedger(args.code) } catch { /* 镜像失败不阻断 */ }
+      return `xiaochang_knowledge_put: ${applied.join(', ') || 'nothing to write'}\n账本: ${knowledgeFilePath(args.code)}`
     },
   }))
 
@@ -1131,8 +1267,12 @@ ${gaps}
         }
       }
       const escTxt = escLines.length > 0 ? `\n升级建议:\n${escLines.join('\n')}` : ''
+      // v7 类闸可见性: 主 agent 一眼看清哪条资源线饱和。
+      const usage = c().classUsage?.() ?? {}
+      const usageTxt = Object.entries(usage).map(([cls, u]) => `${cls} ${u.open}/${u.limit}`).join(', ') || 'n/a'
       return [
         `campaign: open=${count(v => v.state === 'dispatched' || v.state === 'help')} queued=${count(v => v.state === 'queued')} done=${count(v => v.state === 'done')} failed=${count(v => v.state === 'failed')} blocked=${count(v => v.state === 'blocked')}`,
+        `resourceClasses: ${usageTxt}`,
         `budgetRemainingMin=${Math.round(remaining / 60000)}`,
         `openContainers=${[...openContainers(s)].join(',') || 'none'}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,

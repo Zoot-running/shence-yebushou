@@ -29,6 +29,10 @@
   - `xiaochang_refanout` R2 一键二次征集(题面+死路+缺口+已试模型, 加模型发兵);
   - `xiaochang_status` ⚠️ 升级建议(死思路 ≥50%);
   - hint 单点守卫(仅主 agent 可调);
+- **v7 资源类 + 知识账本 + 极简执行令**(章程 [CHARTER-NEXT2-资源槽位与知识账本.md](CHARTER-NEXT2-资源槽位与知识账本.md)):
+  - 附件/容器题自动分类 → 虎符类闸: 附件题全并行, 容器题 3 槽轮换(`xiaochang_status` 的 resourceClasses 行);
+  - 每题知识账本文件 `boards/<runId>/<code>/KNOWLEDGE.md` 四节(①题源思路骨架=主 agent 维护/`xiaochang_knowledge_put`, ②死路③工件④分叉=机制自动累积)——执行者开工必读, 重试零重复识别;
+  - `xiaochang_enqueue` 极简执行令: prompt 只写一行指令, 题面/入口/账本/画像/纪律由机制注入;
 - 本地干跑台: `tools/mock-tsecbench.mjs` + `tools/dryrun-local.sh`(不碰 docker),
   流程 = 讨论→改码→单测+干跑→上仓库→托管打包才进 docker。
 

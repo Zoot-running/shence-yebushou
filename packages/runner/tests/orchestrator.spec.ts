@@ -6,11 +6,15 @@
 import { describe, expect, it } from 'vitest'
 import {
   RunProgress,
+  appendKnowledgeSection,
   baseId,
   cleanRoomGate,
   codeOf,
+  knowledgeSkeleton,
   parseObservations,
+  replaceKnowledgeSection,
   resolveExecutor,
+  resourceClassOf,
   roundOf,
 } from '../src/orchestrator.ts'
 
@@ -129,5 +133,64 @@ describe('sweepLegacyWorkdir', () => {
     expect(existsSync(join(dir, 'run7-launch.sh'))).toBe(true)
     expect(existsSync(join(dir, 'g-04'))).toBe(true)
     expect(readdirSync(dir)).toContain('.archive')
+  })
+})
+
+describe('resourceClassOf (v7 附件/容器分类)', () => {
+  it('classifies 无需容器/附件题 as local', () => {
+    expect(resourceClassOf({ description: 'mock 题 g-m1: 计算 base64。无需容器; 工具只用 bash。' })).toBe('local')
+    expect(resourceClassOf({ description: '下载附件 solve.zip 分析。' })).toBe('local')
+    expect(resourceClassOf({ description: 'attachments: flag.png, 本地分析' })).toBe('local')
+  })
+  it('conservative default is container', () => {
+    expect(resourceClassOf({ description: '某企业官网入口 /b02/ 目录。' })).toBe('container')
+    expect(resourceClassOf({ description: '' })).toBe('container')
+    expect(resourceClassOf({})).toBe('container')
+  })
+})
+
+describe('knowledge file (v7 四节账本, 纯函数)', () => {
+  it('skeleton has the four sections in order', () => {
+    const s = knowledgeSkeleton('b-02')
+    expect(s).toContain('## ① 题源思路骨架')
+    expect(s).toContain('## ② 不可行教训')
+    expect(s).toContain('## ③ 回收工件')
+    expect(s).toContain('## ④ 未走分叉')
+    expect(s.indexOf('①') < s.indexOf('②') && s.indexOf('②') < s.indexOf('③') && s.indexOf('③') < s.indexOf('④')).toBe(true)
+  })
+  it('append drops the placeholder and dedupes by exact line', () => {
+    const s0 = knowledgeSkeleton('b-02')
+    const s1 = appendKnowledgeSection(s0, 'dead', ['SSO 绕过不可行'])
+    expect(s1).toContain('- SSO 绕过不可行')
+    // ② 小节的占位行被条目替换(其他小节占位仍在——只查 ② 区间)
+    const between = s1.slice(s1.indexOf('## ②'), s1.indexOf('## ③'))
+    expect(between).not.toContain('(暂无)')
+    const s2 = appendKnowledgeSection(s1, 'dead', ['SSO 绕过不可行', '爆破不可行: 有验证码'])
+    // 幂等: 重复条目不重复生长
+    expect(s2.split('- SSO 绕过不可行').length - 1).toBe(1)
+    expect(s2).toContain('- 爆破不可行: 有验证码')
+  })
+  it('append keeps existing entries and appends after them', () => {
+    const s0 = knowledgeSkeleton('b-02')
+    const s1 = appendKnowledgeSection(s0, 'dead', ['A'])
+    const s2 = appendKnowledgeSection(s1, 'dead', ['B'])
+    expect(s2.indexOf('- A') < s2.indexOf('- B')).toBe(true)
+    // 其他小节不受影响
+    expect(s2).toContain('## ③ 回收工件\n- (暂无)')
+  })
+  it('replace rewrites ① entirely, keeps other sections', () => {
+    const s0 = knowledgeSkeleton('b-02')
+    const s1 = appendKnowledgeSection(s0, 'artifacts', ['凭证 admin/x'])
+    const s2 = replaceKnowledgeSection(s1, 'skeleton', ['思路1: 官网信息泄露 → OA', '思路2: OA 搜索注入'])
+    expect(s2).toContain('- 思路1: 官网信息泄露 → OA')
+    expect(s2).toContain('- 思路2: OA 搜索注入')
+    expect(s2).not.toContain('① 题源思路骨架\n- (暂无)')
+    expect(s2).toContain('- 凭证 admin/x') // ③ 保留
+  })
+  it('append creates a missing section at the end of a partial file', () => {
+    const s0 = knowledgeSkeleton('b-02')
+    const stripped = s0.split('\n').filter(l => !l.startsWith('## ②')).join('\n')
+    const s1 = appendKnowledgeSection(stripped, 'dead', ['X'])
+    expect(s1).toContain('## ② 不可行教训\n- X')
   })
 })

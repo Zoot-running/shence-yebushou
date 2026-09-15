@@ -213,3 +213,113 @@ export class RunProgress {
     return JSON.stringify({ at: Date.now(), challenges: this.all() })
   }
 }
+
+// ── v7: 附件/容器分类 + 每题知识账本(纯函数, 无 IO——便于单测) ─────
+
+/** v7 附件/容器分类(题面启发式; container 保守兜底——错判只损并行度不损正确性)。 */
+export function resourceClassOf(ch: { description?: string }): 'local' | 'container' {
+  const t = ch.description ?? ''
+  if (/(无需容器|纯附件|附件题|下载附件|attachment|静态文件|本地分析|离线求解|只用\s*(bash|shell|脚本))/i.test(t)) return 'local'
+  return 'container'
+}
+
+/** 知识账本四节标题(顺序即文件顺序)。 */
+export const KNOWLEDGE_SECTION_TITLES = [
+  '① 题源思路骨架',
+  '② 不可行教训',
+  '③ 回收工件',
+  '④ 未走分叉',
+] as const
+
+export type KnowledgeSection = 'skeleton' | 'dead' | 'artifacts' | 'forks'
+
+/** 小节名 → 文件标题。 */
+export function knowledgeSectionTitle(section: KnowledgeSection): string {
+  switch (section) {
+    case 'skeleton': return KNOWLEDGE_SECTION_TITLES[0]
+    case 'dead': return KNOWLEDGE_SECTION_TITLES[1]
+    case 'artifacts': return KNOWLEDGE_SECTION_TITLES[2]
+    case 'forks': return KNOWLEDGE_SECTION_TITLES[3]
+  }
+}
+
+/** 四节骨架(文件初始化内容)。 */
+export function knowledgeSkeleton(code: string): string {
+  return [
+    `# ${code} 知识账本`,
+    '',
+    '> 本题求解的持久记忆: 执行者开工第一件事读本文件, 从已知边界出发。',
+    '> ① 由主 agent 维护(xiaochang_knowledge_put); ②③④ 由机制自动累积(report/fork)。',
+    '',
+    '## ① 题源思路骨架',
+    '- (暂无)',
+    '',
+    '## ② 不可行教训',
+    '- (暂无)',
+    '',
+    '## ③ 回收工件',
+    '- (暂无)',
+    '',
+    '## ④ 未走分叉',
+    '- (暂无)',
+    '',
+  ].join('\n')
+}
+
+/** 定位小节区间: 返回 [startLine, endLine) 的行号(0-based 数组索引)。小节不存在返回 undefined。 */
+function sectionRange(lines: string[], title: string): [number, number] | undefined {
+  const start = lines.findIndex(l => l.startsWith(`## ${title}`))
+  if (start < 0) return undefined
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i++) {
+    if (lines[i]!.startsWith('## ')) { end = i; break }
+  }
+  return [start, end]
+}
+
+/**
+ * 追加行到指定小节(按行去重, 幂等)。小节缺失时自动补建(追加到文件末尾)。
+ * 纯函数: 输入输出都是文本, 不落盘。
+ */
+export function appendKnowledgeSection(fileText: string, section: KnowledgeSection, entries: string[]): string {
+  const title = knowledgeSectionTitle(section)
+  const lines = fileText.split('\n')
+  const range = sectionRange(lines, title)
+  const fresh = entries.filter(e => e.trim() !== '' && !lines.includes(`- ${e}`))
+  if (fresh.length === 0) return fileText
+  const body = fresh.map(e => `- ${e}`)
+  if (range === undefined) {
+    // 小节不存在: 文件末尾补 `## 小节` + 条目。
+    const out = [...lines]
+    while (out.length > 0 && out[out.length - 1] === '') out.pop()
+    out.push('', `## ${title}`, ...body, '')
+    return out.join('\n')
+  }
+  const [start, end] = range
+  const block = lines.slice(start, end)
+  // 小节内容 = 去标题与空行后的条目行; 只有占位行时丢弃占位, 否则保留已有条目再追加。
+  const content = block.slice(1).filter(l => l.trim() !== '')
+  const placeholder = content.length === 1 && content[0] === '- (暂无)'
+  const keep = placeholder ? [] : content
+  const out = [...lines.slice(0, start + 1), ...keep, ...body, ...lines.slice(end)]
+  return out.join('\n')
+}
+
+/**
+ * 整体改写某小节(upsert): 主 agent 重写 ① 思路骨架用。其余行不动。
+ * 小节缺失时补建在文件末尾。
+ */
+export function replaceKnowledgeSection(fileText: string, section: KnowledgeSection, entries: string[]): string {
+  const title = knowledgeSectionTitle(section)
+  const lines = fileText.split('\n')
+  const body = entries.map(e => `- ${e}`)
+  const range = sectionRange(lines, title)
+  if (range === undefined) {
+    const out = [...lines]
+    while (out.length > 0 && out[out.length - 1] === '') out.pop()
+    out.push('', `## ${title}`, ...body, '')
+    return out.join('\n')
+  }
+  const [start, end] = range
+  return [...lines.slice(0, start + 1), ...body, ...lines.slice(end)].join('\n')
+}
