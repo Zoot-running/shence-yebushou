@@ -1,7 +1,7 @@
-【神策·校场 本地干跑局开战令】mock-tsecbench 平台(6 题 3600 分, 全部为 base64 解码送分题)。本局目的: 在本地沙箱内对完整插件链做机制验证(F33 分叉信箱/结构化报告/全局解题图/能力账本种子)。
+【神策·校场 本地干跑局开战令】mock-tsecbench v2 平台(8 题: 4 送分 + b-02 链式 6flag + xb-088 JWT陷阱 + xb-071 响应头 + xb-056 LSB隐写)。本局目的: 在本地沙箱内对完整插件链做机制验证(F33 分叉信箱/结构化报告/全局解题图/能力账本种子)。
 
-使命: 完成本 run 全部 6 题。第一个动作必须调用 create_goal 工具, 目标:
-"完成本干跑局全部 6 题: 每轮 xiaochang_collect 收终态→xiaochang_graph 读全局解题图→读战报/画像/能力账本→判断→xiaochang_enqueue 派最合适的执行者→xiaochang_dispatch; 等待一律用 xiaochang_wait; 任一题拿齐 flag 即 xiaochang_submit+xiaochang_report(complete, 带 deadEnds/forks/observations); 全部终态后 xiaochang_finish(force=true) 收尾"。
+使命: 完成本 run 全部 8 题。第一个动作必须调用 create_goal 工具, 目标:
+"完成本干跑局全部 8 题: 每轮 xiaochang_collect 收终态→xiaochang_graph 读全局解题图→读战报/画像/能力账本→判断→xiaochang_enqueue 派最合适的执行者→xiaochang_dispatch; 等待一律用 xiaochang_wait; 任一题拿齐 flag 即 xiaochang_submit+xiaochang_report(complete, 带 deadEnds/forks/observations); 全部终态后 xiaochang_finish(force=true) 收尾"。
 
 然后立即 xiaochang_setup:
 - baseURL: http://127.0.0.1:8399
@@ -15,6 +15,8 @@
 - 批量发兵: 能并行的工具调用在同一条消息里一次发完。每题先派 1 兵(easy/medium 单兵, hard 双兵两路思路)。
 - 执行者 prompt 必带: 题目+思路+FLAG_CANDIDATE 输出约定+终态结构化报告纪律(DEAD_ENDS/FORKS/OBSERVATIONS)+分叉即时报纪律(遇岔路立即 xiaochang_fork, evidence 写 needs 与可复用工件路径)。
 - 模型只用 deepseek 系(deepseek-v4-flash / deepseek-flash); 本局禁用 kimi/glm(网关本地不可达)。
+- **多 flag 题(b-02)**: 按 flag 拆工作项——一个 flag 一个执行者, 后一 flag 用 dependsOn 依赖前一 flag 的 item id; flag 全齐才 report(complete)。
+- **v6 判死/升级纪律**: xiaochang_status 出现 ⚠️(升级建议)→ 执行 xiaochang_refanout; 出现 ⛔(判死建议)→ 核对理由后 report(failed, why=approach-dead-end); 出现"末段自动 R2"通知 → 报告到达后照常 jisi_adjudicate 裁决。
 - 等待唯一姿势: xiaochang_wait(超时给 120s)。禁止 bash sleep。
 - v2 纪律(必须走): ①fanout 带 qtype/difficulty(jisi_pick 先看双维度候选); ②报告到达即 jisi_adjudicate 批量裁决(adopted/not-adopted/pending); ③report 必填 why(失败时)+gaps(缺上下文时); ④xiaochang_status 出现 ⚠️ 升级建议 → xiaochang_refanout; ⑤每轮看 jisi_model_report(v2 后验/效费比)。
 - 全部 6 题终态后 xiaochang_finish(force=true)(干跑局专用收尾; 守卫标记随 force 写入)。
