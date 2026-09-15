@@ -100,8 +100,7 @@ interface JisiLike {
   adoptionStats?(code: string): { adopted: number; dead: number }
   /** v6: 停止规则裁决(序贯弃权)。 */
   judge?(input: { troops: number; filteredFailed: number; noProgressMin: number; difficulty: number; coverageRatio: number; remainingPoints: number; modelExhaustion: number; r2Count: number }): { action: 'continue' | 'escalate' | 'judge-dead'; reasons: string[] }
-  /** v6: 攻击面覆盖率。 */
-  coverage?(qtype: string, triedTexts: string[]): { ratio: number; covered: number; total: number; uncovered: string[] }
+
 }
 
 interface SetupArgs {
@@ -1085,7 +1084,7 @@ ${gaps}
         const lastProgress = Math.max(0, ...views.map(v => v.lastProgressAt ?? 0))
         const noProgressMin = lastProgress > 0 ? Math.round((Date.now() - lastProgress) / 60000) : 0
         const deadTexts = knowledgeOfCode(code).filter(k => k.kind === 'dead-end').map(k => `${k.path} ${k.conclusion ?? ''}`)
-        const cov = jisi?.coverage?.(q.qtype, deadTexts) ?? { ratio: 0, covered: 0, total: 0, uncovered: [] }
+        const cov = coverageOf(q.qtype as 'web' | 'crypto' | 'pwn' | 'rev' | 'forensics' | 'misc', deadTexts)
         const ch = s.challenges.get(code)
         const remainingPoints = ch !== undefined ? Math.max(0, Math.round(ch.total_score * (1 - (ch.correct_flag_count ?? 0) / (ch.flag_count || 1)))) : 0
         const modelExhaustion = listed.length === 0 ? 1 : q.triedModels.length / listed.length

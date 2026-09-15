@@ -1234,7 +1234,7 @@ ${lines.join("\n")}`;
         const lastProgress = Math.max(0, ...views2.map((v) => v.lastProgressAt ?? 0));
         const noProgressMin = lastProgress > 0 ? Math.round((Date.now() - lastProgress) / 6e4) : 0;
         const deadTexts = knowledgeOfCode(code).filter((k) => k.kind === "dead-end").map((k) => `${k.path} ${k.conclusion ?? ""}`);
-        const cov = jisi?.coverage?.(q.qtype, deadTexts) ?? { ratio: 0, covered: 0, total: 0, uncovered: [] };
+        const cov = coverageOf(q.qtype, deadTexts);
         const ch = s.challenges.get(code);
         const remainingPoints = ch !== void 0 ? Math.max(0, Math.round(ch.total_score * (1 - (ch.correct_flag_count ?? 0) / (ch.flag_count || 1)))) : 0;
         const modelExhaustion = listed.length === 0 ? 1 : q.triedModels.length / listed.length;
