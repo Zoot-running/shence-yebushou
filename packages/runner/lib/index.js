@@ -381,6 +381,44 @@ function audit(path, line) {
   } catch {
   }
 }
+function readOutageWindows() {
+  try {
+    const p = join2(process.env.DSH_HOME ?? ".", "storages", "provider-outages.jsonl");
+    if (!existsSync(p)) return [];
+    return readFileSync(p, "utf8").split("\n").filter((l) => l.trim() !== "").map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    }).filter((r) => r !== null);
+  } catch {
+    return [];
+  }
+}
+function filteredFailedOf(code) {
+  const windows = readOutageWindows();
+  let failed = 0;
+  let excluded = 0;
+  const excludedReasons = [];
+  for (const v of campaign?.ledger.views() ?? []) {
+    if (v.state !== "failed" || codeOf(v.item.id) !== code) continue;
+    const detail = v.terminalDetail ?? "";
+    const provErr = /(TRANSPORT|MISSING_CREDENTIAL|429|503|rate limit|insufficient|余额|connection.*(fail|reset|timeout))/i.test(detail);
+    const inOutage = windows.some((w) => {
+      const at = v.lastProgressAt ?? 0;
+      return at >= w.from && (w.to === null || at <= w.to);
+    });
+    if (provErr || inOutage) {
+      excluded += 1;
+      if (provErr) excludedReasons.push("provider\u9519\u8BEF\u7B7E\u540D");
+      if (inOutage) excludedReasons.push("\u6545\u969C\u7A97\u53E3\u5185");
+    } else {
+      failed += 1;
+    }
+  }
+  return { failed, excluded, excludedReasons };
+}
 function persistV2(s) {
   try {
     writeFileSync(s.v2Path, JSON.stringify(s.v2));
@@ -409,8 +447,8 @@ function openContainers(s) {
   }
   return open;
 }
-function openCount(campaign) {
-  return campaign.ledger.views().filter((v) => v.state === "dispatched" || v.state === "help" || v.state === "stalled").length;
+function openCount(campaign2) {
+  return campaign2.ledger.views().filter((v) => v.state === "dispatched" || v.state === "help" || v.state === "stalled").length;
 }
 function walk(dir) {
   const out = [];
@@ -464,7 +502,7 @@ function scanLegacyCwd(cwd, startedAt) {
 function apply(ctx) {
   const jisi = ctx.get?.("jisi");
   const holder = ctx.hufu;
-  let campaign;
+  let campaign2;
   let campaignId;
   let parentAgent;
   heartbeatTimer = setInterval(() => {
@@ -473,8 +511,8 @@ function apply(ctx) {
   }, 12e4);
   heartbeatTimer.unref?.();
   const c = () => {
-    if (campaign === void 0) throw new Error("xiaochang: not set up \u2014 call xiaochang_setup first");
-    return campaign;
+    if (campaign2 === void 0) throw new Error("xiaochang: not set up \u2014 call xiaochang_setup first");
+    return campaign2;
   };
   const forkInboxDir = () => join2(process.env.DSH_HOME ?? ".", "storages", "xiaochang-fork-inbox");
   function readForkInbox(code) {
@@ -502,15 +540,15 @@ function apply(ctx) {
     const entries = readForkInbox(code);
     if (entries.length > 0) {
       const seen = /* @__PURE__ */ new Set();
-      for (const v of campaign?.ledger.views() ?? []) {
+      for (const v of campaign2?.ledger.views() ?? []) {
         if (codeOf(v.item.id) !== code) continue;
-        for (const k of campaign?.knowledgeOf?.(v.item.id) ?? []) {
+        for (const k of campaign2?.knowledgeOf?.(v.item.id) ?? []) {
           seen.add(`${k.path}#${k.at ?? 0}`);
         }
       }
       const fresh = entries.filter((e) => !seen.has(`${e.path}#${e.at ?? 0}`));
       if (fresh.length > 0) {
-        for (const v of campaign?.ledger.views() ?? []) {
+        for (const v of campaign2?.ledger.views() ?? []) {
           if (codeOf(v.item.id) !== code) continue;
           try {
             holder.recordKnowledge?.(campaignId ?? "", v.item.id, fresh);
@@ -526,10 +564,10 @@ function apply(ctx) {
   }
   function knowledgeOfCode(code) {
     const out = [];
-    if (campaign !== void 0) {
-      for (const v of campaign.ledger.views()) {
+    if (campaign2 !== void 0) {
+      for (const v of campaign2.ledger.views()) {
         if (codeOf(v.item.id) !== code) continue;
-        const k = campaign.knowledgeOf?.(v.item.id) ?? [];
+        const k = campaign2.knowledgeOf?.(v.item.id) ?? [];
         out.push(...k);
       }
     }
@@ -537,8 +575,8 @@ function apply(ctx) {
     return out;
   }
   function recordKnowledgeOnCode(code, entries) {
-    if (campaign === void 0 || campaignId === void 0) return;
-    for (const v of campaign.ledger.views()) {
+    if (campaign2 === void 0 || campaignId === void 0) return;
+    for (const v of campaign2.ledger.views()) {
       if (codeOf(v.item.id) !== code) continue;
       try {
         holder.recordKnowledge?.(campaignId, v.item.id, entries);
@@ -650,14 +688,14 @@ function apply(ctx) {
       }
       const fresh = await s.adapter.listChallenges();
       for (const ch of fresh) s.challenges.set(ch.unique_code, ch);
-      if (campaign === void 0) {
+      if (campaign2 === void 0) {
         const created = holder.createCampaign(agent, {
           concurrency: s.concurrency,
           stallAfterMs: s.roundTimeoutMs + 10 * 6e4,
           heartbeatMs: 15 * 6e4,
           budgetMs: s.budgetMs
         }, [], { id: stableId, boardNamespace: `${args.runId ?? "pending"}` });
-        campaign = created.campaign;
+        campaign2 = created.campaign;
         campaignId = created.id;
       }
       persistProgress(s);
@@ -1039,6 +1077,37 @@ ${text}`;
       return render(s.profile);
     }
   }));
+  const buildRefanoutPrompt = (code) => {
+    const s = requireState();
+    const ch = s.challenges.get(code);
+    const vq = s.v2[code] ?? { qtype: classifyQtype(ch?.description ?? ""), difficulty: difficultyPrior(ch?.total_score ?? 300), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 };
+    const dead = knowledgeOfCode(code).filter((k) => k.kind === "dead-end").map((k) => `- ${k.path}: ${k.conclusion ?? ""}`).join("\n") || "(\u65E0)";
+    const gaps = vq.gaps.length > 0 ? vq.gaps.map((g) => `- ${g}`).join("\n") : "(\u65E0)";
+    const tried = vq.triedModels.length > 0 ? vq.triedModels.join(", ") : "(\u65E0)";
+    return `[\u4E8C\u6B21\u601D\u8DEF\u5F81\u96C6 R${vq.ideaRound + 1}] \u9898\u76EE ${code}(${vq.qtype}, \u6821\u51C6\u96BE\u5EA6 ${vq.difficulty}/100)
+\u9898\u9762: ${(ch?.description ?? "").slice(0, 1500)}
+
+\u5DF2\u77E5\u6B7B\u8DEF(\u524D\u5E8F\u601D\u8DEF\u5DF2\u8BC1\u4E0D\u53EF\u884C):
+${dead}
+
+\u4E0A\u4E0B\u6587\u7F3A\u53E3(\u524D\u5E8F\u6267\u884C\u8005\u53CD\u9988\u7F3A\u7684\u4FE1\u606F):
+${gaps}
+
+\u5DF2\u8BD5\u6A21\u578B: ${tried}
+\u5DF2\u91C7\u7528\u601D\u8DEF ${vq.adopted} \u6761, \u5DF2\u6B7B ${vq.deadIdeas} \u6761\u3002
+
+\u63D0\u95EE: \u5DF2\u77E5\u4EE5\u4E0A\u6B7B\u8DEF\u4E0E\u7F3A\u53E3\u4E4B\u540E, \u8FD8\u6709\u54EA\u4E9B**\u6CA1\u8BD5\u8FC7**\u7684\u65B9\u5411? \u4E0D\u8981\u91CD\u590D\u6B7B\u8DEF; \u6BCF\u6761\u7ED9: \u4E3A\u4EC0\u4E48\u53EF\u884C + \u9A8C\u8BC1\u70B9 + \u9700\u8981\u8865\u7684\u4E0A\u4E0B\u6587\u3002`;
+  };
+  const pickRefanoutModels = async (vq) => {
+    if (jisi?.pickRank !== void 0) {
+      const ranked = await jisi.pickRank(vq.qtype, vq.difficulty, "idea");
+      const fresh = ranked.filter((r) => !vq.triedModels.includes(r.model)).map((r) => r.model);
+      if (fresh.length > 0) return fresh.slice(0, 3);
+      if (ranked.length > 0) return ranked.slice(0, 3).map((r) => r.model);
+    }
+    const listed = await jisi?.listModels();
+    return (listed ?? []).map((m) => m.id).slice(0, 3);
+  };
   register(defineTool({
     name: "xiaochang_refanout",
     description: "V2 layer-3 R2 re-fanout: one call re-collects ideas for a stuck challenge WITH all prior context (R1 ideas alive+dead, dead-end list, context gaps, tried models) and ADDS models beyond the tried set (pick-ranked by idea fit, expensive models included when tried set is exhausted). Call it when xiaochang_status shows \u26A0\uFE0F upgrade suggestions, or when half the adopted ideas died.",
@@ -1054,32 +1123,8 @@ ${text}`;
       const vq = s.v2[args.code] ?? { qtype: classifyQtype(ch.description ?? ""), difficulty: difficultyPrior(ch.total_score), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 };
       const agent = exec.agent;
       if (agent === void 0) return "xiaochang_refanout: requires a calling agent";
-      const dead = knowledgeOfCode(args.code).filter((k) => k.kind === "dead-end").map((k) => `- ${k.path}: ${k.conclusion ?? ""}`).join("\n") || "(\u65E0)";
-      const gaps = vq.gaps.length > 0 ? vq.gaps.map((g) => `- ${g}`).join("\n") : "(\u65E0)";
-      const tried = vq.triedModels.length > 0 ? vq.triedModels.join(", ") : "(\u65E0)";
-      const prompt = `[\u4E8C\u6B21\u601D\u8DEF\u5F81\u96C6 R${vq.ideaRound + 1}] \u9898\u76EE ${args.code}(${vq.qtype}, \u6821\u51C6\u96BE\u5EA6 ${vq.difficulty}/100)
-\u9898\u9762: ${(ch.description ?? "").slice(0, 1500)}
-
-\u5DF2\u77E5\u6B7B\u8DEF(\u524D\u5E8F\u601D\u8DEF\u5DF2\u8BC1\u4E0D\u53EF\u884C):
-${dead}
-
-\u4E0A\u4E0B\u6587\u7F3A\u53E3(\u524D\u5E8F\u6267\u884C\u8005\u53CD\u9988\u7F3A\u7684\u4FE1\u606F):
-${gaps}
-
-\u5DF2\u8BD5\u6A21\u578B: ${tried}
-\u5DF2\u91C7\u7528\u601D\u8DEF ${vq.adopted} \u6761, \u5DF2\u6B7B ${vq.deadIdeas} \u6761\u3002
-
-\u63D0\u95EE: \u5DF2\u77E5\u4EE5\u4E0A\u6B7B\u8DEF\u4E0E\u7F3A\u53E3\u4E4B\u540E, \u8FD8\u6709\u54EA\u4E9B**\u6CA1\u8BD5\u8FC7**\u7684\u65B9\u5411? \u4E0D\u8981\u91CD\u590D\u6B7B\u8DEF; \u6BCF\u6761\u7ED9: \u4E3A\u4EC0\u4E48\u53EF\u884C + \u9A8C\u8BC1\u70B9 + \u9700\u8981\u8865\u7684\u4E0A\u4E0B\u6587\u3002`;
-      let models = [];
-      if (jisi?.pickRank !== void 0) {
-        const ranked = await jisi.pickRank(vq.qtype, vq.difficulty, "idea");
-        const fresh = ranked.filter((r) => !vq.triedModels.includes(r.model)).map((r) => r.model);
-        models = fresh.length > 0 ? fresh.slice(0, 3) : ranked.slice(0, 3).map((r) => r.model);
-      }
-      if (models.length === 0) {
-        const listed = await jisi?.listModels();
-        models = (listed ?? []).map((m) => m.id).slice(0, 3);
-      }
+      const prompt = buildRefanoutPrompt(args.code);
+      const models = await pickRefanoutModels(vq);
       if (jisi?.fanoutNotify !== void 0) {
         const ticket = jisi.fanoutNotify(agent, { prompt }, models);
         vq.ideaRound += 1;
@@ -1119,7 +1164,7 @@ ${prompt}`;
         recordKnowledgeOnCode(args.code, entries);
       } catch {
       }
-      const sameProcess = parentAgent !== void 0 && campaign !== void 0;
+      const sameProcess = parentAgent !== void 0 && campaign2 !== void 0;
       if (sameProcess) {
         parentAgent?.followup(createUserMessage({
           content: [{ type: "text", text: `\u{1F500} \u5206\u53C9\u5373\u65F6\u62A5(${args.code}): \u53D1\u73B0 ${entries.length} \u6761\u672A\u8D70\u5206\u53C9, \u5DF2\u5165\u8D26+\u4FE1\u7BB1\u3002\u7531\u4F60(\u4E3B agent)\u51B3\u5B9A\u662F\u5426 jisi_fanout_bulk / xiaochang_enqueue \u589E\u5175\u3002
@@ -1157,7 +1202,7 @@ ${lines.join("\n")}`;
         const kindTag = { done: "\u2705", failed: "\u274C", blocked: "\u26D4", superseded: "\u267B\uFE0F" }[v.state] ?? { queued: "\u23F3", dispatched: "\u{1F3C3}", help: "\u{1F64F}", stalled: "\u{1F40C}" }[v.state] ?? "\xB7";
         rows.push(`${kindTag} ${v.item.id} [${v.state}] seed=${v.seed} model=${v.item.model ?? s.executorPolicy.defaultModel} effort=${v.item.reasoningEffort ?? s.executorPolicy.defaultEffort}${p !== void 0 && p.flags.length > 0 ? ` flags=${p.flags.length}` : ""}${v.terminalDetail !== void 0 ? `
   \u7EC8\u6001: ${v.terminalDetail.slice(0, 400)}` : ""}`);
-        const ks = campaign?.knowledgeOf?.(v.item.id) ?? [];
+        const ks = campaign2?.knowledgeOf?.(v.item.id) ?? [];
         for (const k of ks) {
           const tag = k.kind === "dead-end" ? "\u274C\u6B7B\u8DEF" : k.kind === "fork" ? "\u{1F500}\u672A\u8D70\u5206\u53C9" : "\u{1F4CC}\u4E8B\u5B9E";
           rows.push(`     [${tag}] ${k.path}${k.conclusion !== void 0 ? " \u2192 " + k.conclusion : ""}${k.evidence !== void 0 ? " (\u8BC1\u636E: " + k.evidence + ")" : ""}${k.by !== void 0 ? ` \u2014 by ${k.by}` : ""}`);
@@ -1173,26 +1218,66 @@ ${lines.join("\n")}`;
     parameters: {},
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => true,
-    async execute() {
+    async execute(_args, exec) {
       const s = requireState();
       const views = c().ledger.views();
       const count = (fn) => views.filter(fn).length;
       const remaining = Math.max(0, s.startedAt + s.budgetMs - Date.now());
       const progress = s.progress.all().map((p) => `${p.code}:${p.state}${p.state === "complete" ? `(${p.flags.length} flags)` : ""}`).join(", ");
       const escLines = [];
+      const listed = await jisi?.listModels() ?? [];
       for (const [code, q] of Object.entries(s.v2)) {
-        const st = jisi?.adoptionStats?.(code) ?? { adopted: q.adopted, dead: q.deadIdeas };
-        if (st.adopted === 0) continue;
-        if (st.dead / st.adopted >= 0.5) {
-          escLines.push(`\u26A0\uFE0F ${code}: \u6B7B\u601D\u8DEF ${st.dead}/${st.adopted} \u226550% \u2192 \u5EFA\u8BAE xiaochang_refanout \u4E8C\u6B21\u5F81\u96C6(\u96BE\u5EA6${q.difficulty}, \u5DF2\u8BD5 ${q.triedModels.join(",") || "\u65E0"})`);
-        }
+        const p = s.progress.get(code);
+        if (p === void 0 || p.state === "complete" || p.state === "failed" || p.state === "skipped") continue;
+        const ff = filteredFailedOf(code);
+        const views2 = (campaign2?.ledger.views() ?? []).filter((v) => codeOf(v.item.id) === code);
+        const lastProgress = Math.max(0, ...views2.map((v) => v.lastProgressAt ?? 0));
+        const noProgressMin = lastProgress > 0 ? Math.round((Date.now() - lastProgress) / 6e4) : 0;
+        const deadTexts = knowledgeOfCode(code).filter((k) => k.kind === "dead-end").map((k) => `${k.path} ${k.conclusion ?? ""}`);
+        const cov = jisi?.coverage?.(q.qtype, deadTexts) ?? { ratio: 0, covered: 0, total: 0, uncovered: [] };
+        const ch = s.challenges.get(code);
+        const remainingPoints = ch !== void 0 ? Math.max(0, Math.round(ch.total_score * (1 - (ch.correct_flag_count ?? 0) / (ch.flag_count || 1)))) : 0;
+        const modelExhaustion = listed.length === 0 ? 1 : q.triedModels.length / listed.length;
+        const ruling = jisi?.judge?.({
+          troops: q.triedModels.length,
+          filteredFailed: ff.failed,
+          noProgressMin,
+          difficulty: q.difficulty,
+          coverageRatio: cov.ratio,
+          remainingPoints,
+          modelExhaustion: Math.min(1, modelExhaustion),
+          r2Count: Math.max(0, q.ideaRound - 1)
+        });
+        if (ruling === void 0) continue;
+        const exclTxt = ff.excluded > 0 ? ` (\u6545\u969C\u8FC7\u6EE4\u5254\u9664 ${ff.excluded}: ${[...new Set(ff.excludedReasons)].join("+")})` : "";
+        if (ruling.action === "escalate") escLines.push(`\u26A0\uFE0F ${code}: ${ruling.reasons[0] ?? ""}${exclTxt}`);
+        if (ruling.action === "judge-dead") escLines.push(`\u26D4 ${code}: ${ruling.reasons[0] ?? ""}${exclTxt}`);
       }
       if (remaining <= 60 * 6e4) {
         const hardOpen = [];
         for (const [code, q] of Object.entries(s.v2)) {
           if (q.difficulty >= 55 && q.lastVerdict !== "complete") hardOpen.push(code);
         }
-        if (hardOpen.length > 0) escLines.push(`\u23F0 \u672B\u6BB5\u8D76\u5DE5(\u226460min): ${hardOpen.join(", ")} \u672A\u7834 \u2192 \u7ACB\u5373 xiaochang_refanout \u5168\u6A21\u578B\u6863(\u663E\u5F0F kimi-k3/pro), \u6EE1\u5206>\u7528\u65F6>\u82B1\u8D39`);
+        for (const code of hardOpen.slice(0, 3)) {
+          const q = s.v2[code];
+          if (q.autoR2 !== true) {
+            q.autoR2 = true;
+            s.v2[code] = q;
+            persistV2(s);
+            if (jisi?.fanoutNotify !== void 0) {
+              const prompt = buildRefanoutPrompt(code);
+              const models = await pickRefanoutModels(q);
+              const ticket = jisi.fanoutNotify(parentAgent ?? exec?.agent, { prompt }, models);
+              q.ideaRound += 1;
+              q.triedModels.push(...models.filter((m) => !q.triedModels.includes(m)));
+              s.v2[code] = q;
+              persistV2(s);
+              escLines.push(`\u23F0 \u672B\u6BB5\u81EA\u52A8 R2: ${code} \u5DF2\u81EA\u52A8\u53D1\u8D77\u4E8C\u6B21\u5F81\u96C6(${models.join(", ")}, ticket ${ticket.id})\u2014\u2014\u53EF jisi_fanout_drop \u6539\u5224`);
+            } else {
+              escLines.push(`\u23F0 \u672B\u6BB5\u8D76\u5DE5: ${code} \u672A\u7834\u4E14 jisi \u901A\u9053\u4E0D\u53EF\u7528 \u2192 \u624B\u52A8 xiaochang_refanout`);
+            }
+          }
+        }
       }
       const escTxt = escLines.length > 0 ? `
 \u5347\u7EA7\u5EFA\u8BAE:
@@ -1220,7 +1305,7 @@ ${escLines.join("\n")}` : "";
       const agent = exec.agent;
       const ledgerSnap = () => {
         try {
-          return JSON.stringify(campaign?.ledger.views().map((v) => [v.item.id, v.state, v.terminalDetail ?? "", v.lastProgressAt ?? 0]));
+          return JSON.stringify(campaign2?.ledger.views().map((v) => [v.item.id, v.state, v.terminalDetail ?? "", v.lastProgressAt ?? 0]));
         } catch {
           return "";
         }

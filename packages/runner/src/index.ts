@@ -98,6 +98,10 @@ interface JisiLike {
   fanoutNotify?(parent: unknown, work: { prompt: string }, models: string[], opts?: Record<string, unknown>): { id: string; models: string[] }
   /** v2: 升级状态(采纳累计/已死)。 */
   adoptionStats?(code: string): { adopted: number; dead: number }
+  /** v6: 停止规则裁决(序贯弃权)。 */
+  judge?(input: { troops: number; filteredFailed: number; noProgressMin: number; difficulty: number; coverageRatio: number; remainingPoints: number; modelExhaustion: number; r2Count: number }): { action: 'continue' | 'escalate' | 'judge-dead'; reasons: string[] }
+  /** v6: 攻击面覆盖率。 */
+  coverage?(qtype: string, triedTexts: string[]): { ratio: number; covered: number; total: number; uncovered: string[] }
 }
 
 interface SetupArgs {
@@ -133,6 +137,8 @@ interface V2Question {
   deadIdeas: number
   adopted: number
   lastVerdict?: string
+  /** v6: 末段自动 R2 已发(防重复)。 */
+  autoR2?: boolean
 }
 type V2State = Record<string, V2Question>
 
@@ -200,6 +206,42 @@ function audit(path: string, line: object): void {
   try {
     appendFileSync(path, `${JSON.stringify(line)}\n`)
   } catch { /* 审计失败不影响主流程 */ }
+}
+
+/** v6: 读取供应商故障窗口 sidecar(dsh-compat 写, 纯文件通道)。 */
+function readOutageWindows(): Array<{ provider: string; from: number; to: number | null }> {
+  try {
+    const p = join(process.env.DSH_HOME ?? '.', 'storages', 'provider-outages.jsonl')
+    if (!existsSync(p)) return []
+    return readFileSync(p, 'utf8').split('\n').filter(l => l.trim() !== '')
+      .map(l => { try { return JSON.parse(l) as { provider: string; from: number; to: number | null } } catch { return null } })
+      .filter((r): r is { provider: string; from: number; to: number | null } => r !== null)
+  } catch { return [] }
+}
+
+/** v6: 该 code 的过滤失败计数——剔除故障窗口内与 provider 错误签名的失败(DS 故障夜实锤)。 */
+function filteredFailedOf(code: string): { failed: number; excluded: number; excludedReasons: string[] } {
+  const windows = readOutageWindows()
+  let failed = 0
+  let excluded = 0
+  const excludedReasons: string[] = []
+  for (const v of campaign?.ledger.views() ?? []) {
+    if (v.state !== 'failed' || codeOf(v.item.id) !== code) continue
+    const detail = v.terminalDetail ?? ''
+    const provErr = /(TRANSPORT|MISSING_CREDENTIAL|429|503|rate limit|insufficient|余额|connection.*(fail|reset|timeout))/i.test(detail)
+    const inOutage = windows.some(w => {
+      const at = v.lastProgressAt ?? 0
+      return at >= w.from && (w.to === null || at <= w.to)
+    })
+    if (provErr || inOutage) {
+      excluded += 1
+      if (provErr) excludedReasons.push('provider错误签名')
+      if (inOutage) excludedReasons.push('故障窗口内')
+    } else {
+      failed += 1
+    }
+  }
+  return { failed, excluded, excludedReasons }
 }
 
 function persistV2(s: CampaignState): void {
@@ -888,6 +930,40 @@ export function apply(ctx: Context): void {
     },
   }))
 
+  // v6: R2 prompt 组装(工具与 status 自动触发共用)。
+  const buildRefanoutPrompt = (code: string): string => {
+    const s = requireState()
+    const ch = s.challenges.get(code)
+    const vq = s.v2[code] ?? { qtype: classifyQtype(ch?.description ?? ''), difficulty: difficultyPrior(ch?.total_score ?? 300), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 }
+    const dead = knowledgeOfCode(code).filter(k => k.kind === 'dead-end').map(k => `- ${k.path}: ${k.conclusion ?? ''}`).join('\n') || '(无)'
+    const gaps = vq.gaps.length > 0 ? vq.gaps.map(g => `- ${g}`).join('\n') : '(无)'
+    const tried = vq.triedModels.length > 0 ? vq.triedModels.join(', ') : '(无)'
+    return `[二次思路征集 R${vq.ideaRound + 1}] 题目 ${code}(${vq.qtype}, 校准难度 ${vq.difficulty}/100)
+题面: ${(ch?.description ?? '').slice(0, 1500)}
+
+已知死路(前序思路已证不可行):
+${dead}
+
+上下文缺口(前序执行者反馈缺的信息):
+${gaps}
+
+已试模型: ${tried}
+已采用思路 ${vq.adopted} 条, 已死 ${vq.deadIdeas} 条。
+
+提问: 已知以上死路与缺口之后, 还有哪些**没试过**的方向? 不要重复死路; 每条给: 为什么可行 + 验证点 + 需要补的上下文。`
+  }
+  /** v6: R2 选模(直接加模型, 未试过的优先)。 */
+  const pickRefanoutModels = async (vq: { qtype: string; difficulty: number; triedModels: string[] }): Promise<string[]> => {
+    if (jisi?.pickRank !== undefined) {
+      const ranked = await jisi.pickRank(vq.qtype, vq.difficulty, 'idea')
+      const fresh = ranked.filter(r => !vq.triedModels.includes(r.model)).map(r => r.model)
+      if (fresh.length > 0) return fresh.slice(0, 3)
+      if (ranked.length > 0) return ranked.slice(0, 3).map(r => r.model)
+    }
+    const listed = await jisi?.listModels()
+    return (listed ?? []).map(m => m.id).slice(0, 3)
+  }
+
   // ── v2 第 3 层: R2 二次征集(上下文带入 + 加模型) ────────────────
   register(defineTool({
     name: 'xiaochang_refanout',
@@ -905,34 +981,8 @@ export function apply(ctx: Context): void {
       const vq = s.v2[args.code] ?? { qtype: classifyQtype(ch.description ?? ''), difficulty: difficultyPrior(ch.total_score), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 }
       const agent = exec.agent
       if (agent === undefined) return 'xiaochang_refanout: requires a calling agent'
-      // ① 拼装 R2 prompt: 题面+画像+死路+缺口+已试(R1 全部思路已在知识账本, 主 agent 裁决过的 adopted 也在)。
-      const dead = knowledgeOfCode(args.code).filter(k => k.kind === 'dead-end').map(k => `- ${k.path}: ${k.conclusion ?? ''}`).join('\n') || '(无)'
-      const gaps = vq.gaps.length > 0 ? vq.gaps.map(g => `- ${g}`).join('\n') : '(无)'
-      const tried = vq.triedModels.length > 0 ? vq.triedModels.join(', ') : '(无)'
-      const prompt = `[二次思路征集 R${vq.ideaRound + 1}] 题目 ${args.code}(${vq.qtype}, 校准难度 ${vq.difficulty}/100)
-题面: ${(ch.description ?? '').slice(0, 1500)}
-
-已知死路(前序思路已证不可行):
-${dead}
-
-上下文缺口(前序执行者反馈缺的信息):
-${gaps}
-
-已试模型: ${tried}
-已采用思路 ${vq.adopted} 条, 已死 ${vq.deadIdeas} 条。
-
-提问: 已知以上死路与缺口之后, 还有哪些**没试过**的方向? 不要重复死路; 每条给: 为什么可行 + 验证点 + 需要补的上下文。`
-      // ② 选模: 直接加模型——pick 排名里未试过的优先(增添信息), 全试过则连已试也不排除(全量兜底)。
-      let models: string[] = []
-      if (jisi?.pickRank !== undefined) {
-        const ranked = await jisi.pickRank(vq.qtype, vq.difficulty, 'idea')
-        const fresh = ranked.filter(r => !vq.triedModels.includes(r.model)).map(r => r.model)
-        models = fresh.length > 0 ? fresh.slice(0, 3) : ranked.slice(0, 3).map(r => r.model)
-      }
-      if (models.length === 0) {
-        const listed = await jisi?.listModels()
-        models = (listed ?? []).map(m => m.id).slice(0, 3)
-      }
+      const prompt = buildRefanoutPrompt(args.code)
+      const models = await pickRefanoutModels(vq)
       // ③ 发兵(notify): 主 agent 收到信封后照常 jisi_adjudicate 裁决。
       if (jisi?.fanoutNotify !== undefined) {
         const ticket = jisi.fanoutNotify(agent, { prompt }, models)
@@ -1018,28 +1068,68 @@ ${gaps}
     parameters: {},
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => true,
-    async execute() {
+    async execute(_args: Record<string, never>, exec?: { agent?: { followup(message: unknown): void } }) {
       const s = requireState()
       const views = c().ledger.views()
       const count = (fn: (v: { state: string }) => boolean): number => views.filter(fn).length
       const remaining = Math.max(0, s.startedAt + s.budgetMs - Date.now())
       const progress = s.progress.all().map(p => `${p.code}:${p.state}${p.state === 'complete' ? `(${p.flags.length} flags)` : ''}`).join(', ')
-      // v2 第 3 层: 升级状态机可见性(采纳/已死计数来自集思裁决账)。
+      // v6 不可行性判定(停止规则): 每题裁决 continue/escalate/judge-dead。
       const escLines: string[] = []
+      const listed = await jisi?.listModels() ?? []
       for (const [code, q] of Object.entries(s.v2)) {
-        const st = jisi?.adoptionStats?.(code) ?? { adopted: q.adopted, dead: q.deadIdeas }
-        if (st.adopted === 0) continue
-        if (st.dead / st.adopted >= 0.5) {
-          escLines.push(`⚠️ ${code}: 死思路 ${st.dead}/${st.adopted} ≥50% → 建议 xiaochang_refanout 二次征集(难度${q.difficulty}, 已试 ${q.triedModels.join(',') || '无'})`)
-        }
+        const p = s.progress.get(code)
+        if (p === undefined || p.state === 'complete' || p.state === 'failed' || p.state === 'skipped') continue
+        const ff = filteredFailedOf(code)
+        const views = (campaign?.ledger.views() ?? []).filter(v => codeOf(v.item.id) === code)
+        const lastProgress = Math.max(0, ...views.map(v => v.lastProgressAt ?? 0))
+        const noProgressMin = lastProgress > 0 ? Math.round((Date.now() - lastProgress) / 60000) : 0
+        const deadTexts = knowledgeOfCode(code).filter(k => k.kind === 'dead-end').map(k => `${k.path} ${k.conclusion ?? ''}`)
+        const cov = jisi?.coverage?.(q.qtype, deadTexts) ?? { ratio: 0, covered: 0, total: 0, uncovered: [] }
+        const ch = s.challenges.get(code)
+        const remainingPoints = ch !== undefined ? Math.max(0, Math.round(ch.total_score * (1 - (ch.correct_flag_count ?? 0) / (ch.flag_count || 1)))) : 0
+        const modelExhaustion = listed.length === 0 ? 1 : q.triedModels.length / listed.length
+        const ruling = jisi?.judge?.({
+          troops: q.triedModels.length,
+          filteredFailed: ff.failed,
+          noProgressMin,
+          difficulty: q.difficulty,
+          coverageRatio: cov.ratio,
+          remainingPoints,
+          modelExhaustion: Math.min(1, modelExhaustion),
+          r2Count: Math.max(0, q.ideaRound - 1),
+        })
+        if (ruling === undefined) continue
+        const exclTxt = ff.excluded > 0 ? ` (故障过滤剔除 ${ff.excluded}: ${[...new Set(ff.excludedReasons)].join('+')})` : ''
+        if (ruling.action === 'escalate') escLines.push(`⚠️ ${code}: ${ruling.reasons[0] ?? ''}${exclTxt}`)
+        if (ruling.action === 'judge-dead') escLines.push(`⛔ ${code}: ${ruling.reasons[0] ?? ''}${exclTxt}`)
       }
-      // 末段赶工(第 3 层): 预算 ≤60min 且仍有 hard 未破 → 强制升级提示。
+      // v6 末段自动 R2: 预算 ≤60min 且 hard 未破且该题本窗口未发过 → 插件直接发兵(机制默认动作)。
       if (remaining <= 60 * 60_000) {
         const hardOpen: string[] = []
         for (const [code, q] of Object.entries(s.v2)) {
           if (q.difficulty >= 55 && q.lastVerdict !== 'complete') hardOpen.push(code)
         }
-        if (hardOpen.length > 0) escLines.push(`⏰ 末段赶工(≤60min): ${hardOpen.join(', ')} 未破 → 立即 xiaochang_refanout 全模型档(显式 kimi-k3/pro), 满分>用时>花费`)
+        for (const code of hardOpen.slice(0, 3)) {
+          const q = s.v2[code]!
+          if (q.autoR2 !== true) {
+            q.autoR2 = true
+            s.v2[code] = q
+            persistV2(s)
+            if (jisi?.fanoutNotify !== undefined) {
+              const prompt = buildRefanoutPrompt(code)
+              const models = await pickRefanoutModels(q)
+              const ticket = jisi.fanoutNotify(parentAgent ?? (exec?.agent as unknown), { prompt }, models)
+              q.ideaRound += 1
+              q.triedModels.push(...models.filter(m => !q.triedModels.includes(m)))
+              s.v2[code] = q
+              persistV2(s)
+              escLines.push(`⏰ 末段自动 R2: ${code} 已自动发起二次征集(${models.join(', ')}, ticket ${ticket.id})——可 jisi_fanout_drop 改判`)
+            } else {
+              escLines.push(`⏰ 末段赶工: ${code} 未破且 jisi 通道不可用 → 手动 xiaochang_refanout`)
+            }
+          }
+        }
       }
       const escTxt = escLines.length > 0 ? `\n升级建议:\n${escLines.join('\n')}` : ''
       return [
