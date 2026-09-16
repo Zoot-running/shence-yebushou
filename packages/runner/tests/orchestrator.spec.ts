@@ -13,6 +13,7 @@ import {
   knowledgeSkeleton,
   parseObservations,
   dedupeForkPaths,
+  truncateDirective,
   hintGate,
   replaceKnowledgeSection,
   resolveExecutor,
@@ -227,5 +228,22 @@ describe('v7.4 dedupeForkPaths (fork 源端去重)', () => {
   })
   it('keeps everything when inbox is empty', () => {
     expect(dedupeForkPaths([], [{ path: 'A' }, { path: 'B' }]).map(e => e.path)).toEqual(['A', 'B'])
+  })
+})
+
+describe('v7.6 truncateDirective (方向段截断+反馈)', () => {
+  it('passes short directives through untouched', () => {
+    const r = truncateDirective('打 /api/reports/{id} 越权', 700)
+    expect(r.truncated).toBe(false)
+    expect(r.text).toBe('打 /api/reports/{id} 越权')
+  })
+  it('cuts long directives at the threshold and reports the cut point', () => {
+    const long = 'A'.repeat(800)
+    const r = truncateDirective(long, 700)
+    expect(r.truncated).toBe(true)
+    expect(r.cutAt).toBe(700)
+    expect(r.text.length).toBeLessThan(730)
+    expect(r.text).toContain('已截断')
+    expect(r.cutTail).toBe('A'.repeat(60))
   })
 })

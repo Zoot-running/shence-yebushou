@@ -348,3 +348,24 @@ export function dedupeForkPaths(existingPaths: readonly string[], entries: Array
   }
   return out
 }
+
+// ── v7.6: 方向段截断(带反馈信息, 纯函数) ────────────────────────────
+
+export interface TruncateResult {
+  text: string
+  truncated: boolean
+  cutAt: number
+  /** 被砍掉的开头片段(反馈给主 agent: 截在哪)。 */
+  cutTail: string
+}
+
+/**
+ * 硬截断方向段: 超 max 截掉尾部并附截点上下文——主 agent 收到截断反馈后
+ * 决定是改写短版还是把被砍内容放进知识账本(阈值按 run18728 真局数据: p50≈623)。
+ */
+export function truncateDirective(text: string, max: number): TruncateResult {
+  if (text.length <= max) return { text, truncated: false, cutAt: text.length, cutTail: '' }
+  const head = text.slice(0, max)
+  const cutTail = text.slice(max, max + 60)
+  return { text: `${head}…(方向段已截断)`, truncated: true, cutAt: max, cutTail }
+}

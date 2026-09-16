@@ -501,6 +501,12 @@ function dedupeForkPaths(existingPaths, entries) {
   }
   return out;
 }
+function truncateDirective(text, max) {
+  if (text.length <= max) return { text, truncated: false, cutAt: text.length, cutTail: "" };
+  const head = text.slice(0, max);
+  const cutTail = text.slice(max, max + 60);
+  return { text: `${head}\u2026(\u65B9\u5411\u6BB5\u5DF2\u622A\u65AD)`, truncated: true, cutAt: max, cutTail };
+}
 
 // src/index.ts
 var name = "shence-xiaochang-runner";
@@ -944,6 +950,33 @@ function apply(ctx) {
         campaign = created.campaign;
         campaignId = created.id;
       }
+      if (s.containerQueue === void 0 && holder.resourceQueue !== void 0) {
+        s.containerQueue = holder.resourceQueue({
+          capacity: s.containerSlots,
+          pollMs: 3e3,
+          defaultTimeoutMs: 5 * 6e4,
+          canGrant: async () => {
+            try {
+              const fresh2 = await s.adapter.listChallenges();
+              for (const x of fresh2) s.challenges.set(x.unique_code, x);
+              return openContainers(s).size < s.containerSlots;
+            } catch {
+              return false;
+            }
+          },
+          grant: async (code) => {
+            const ch = s.challenges.get(code);
+            if (ch !== void 0 && ch.container_status === "available" && ch.container_addr.length > 0) return;
+            if (ch !== void 0 && ch.container_status === "pending") return;
+            await s.adapter.start(code);
+            const fresh2 = await s.adapter.listChallenges();
+            for (const x of fresh2) s.challenges.set(x.unique_code, x);
+            s.progress.update(code, { difficulty: ch?.difficulty ?? "medium", containerClosed: false });
+            persistProgress(s);
+            audit(s.auditPath, { type: "container-start", code });
+          }
+        });
+      }
       persistProgress(s);
       try {
         if (existsSync(s.v2Path)) s.v2 = JSON.parse(readFileSync(s.v2Path, "utf8"));
@@ -1017,7 +1050,7 @@ ${rows.join("\n")}`;
   }));
   register(defineTool({
     name: "xiaochang_start_container",
-    description: "Start a challenge container (platform cap: 3 containers at once). Seeds the shared findings board and returns its path \u2014 include the board path + read/append discipline in every executor prompt you build.",
+    description: "Start a challenge container (platform cap: 3). v7.6: waits in the resource queue with ZERO tokens \u2014 the call blocks here (polling platform state internally) until a slot frees, then starts automatically; same-challenge waiters share one container. Returns the addrs + board path. Timeout (5min) or challenge-terminal eviction return a message instead \u2014 do NOT spin your own retry loop.",
     parameters: {
       code: { type: "string", required: true, description: "Challenge unique_code." }
     },
@@ -1033,22 +1066,26 @@ ${rows.join("\n")}`;
         return `already available: addrs=${ch.container_addr.join(",")}
 boardPath=${c().boardPath(args.code)}`;
       }
-      if (openContainers(s).size >= 3) {
-        return "xiaochang_start_container: platform cap reached (3 containers open) \u2014 close a finished challenge first";
-      }
-      const started = await s.adapter.start(args.code);
-      const fresh = await s.adapter.listChallenges();
-      for (const x of fresh) s.challenges.set(x.unique_code, x);
-      s.progress.update(args.code, { difficulty: ch.difficulty, containerClosed: false });
-      persistProgress(s);
-      audit(s.auditPath, { type: "container-start", code: args.code });
-      return `started: addrs=${started.container_addr.join(",")}
+      const q = s.containerQueue;
+      if (q === void 0) return "xiaochang_start_container: \u8D44\u6E90\u961F\u5217\u672A\u521D\u59CB\u5316\u2014\u2014\u5148 xiaochang_setup";
+      const res = await q.acquire(args.code, { timeoutMs: 5 * 6e4 });
+      if (res.status === "granted") {
+        const fresh = await s.adapter.listChallenges();
+        for (const x of fresh) s.challenges.set(x.unique_code, x);
+        const now = s.challenges.get(args.code);
+        const addrs = now?.container_addr ?? [];
+        return `started: addrs=${addrs.join(",")}
 boardPath=${c().boardPath(args.code)}`;
+      }
+      if (res.status === "timeout") {
+        return `xiaochang_start_container: \u6392\u961F\u4F4D ${res.position} \u5DF2\u7B49 5 \u5206\u949F\u4ECD\u65E0\u5BB9\u5668\u69FD\u2014\u2014\u628A"\u9700\u8981\u5BB9\u5668"\u5199\u8FDB\u6218\u62A5\u540E\u6536\u5DE5, \u7531\u4E3B agent \u8C03\u5EA6; \u4E0D\u8981\u81EA\u5DF1\u518D\u5199\u91CD\u8BD5\u5FAA\u73AF`;
+      }
+      return `xiaochang_start_container: ${res.reason ?? "\u5DF2\u51FA\u961F"}\u2014\u2014\u8BE5\u9898\u5DF2\u7EC8\u6001/\u88AB\u4E2D\u65AD, \u65E0\u9700\u5BB9\u5668; \u6536\u5DE5\u7B49\u4E3B agent \u5904\u7406`;
     }
   }));
   register(defineTool({
     name: "xiaochang_close",
-    description: "Close a challenge container (release a platform slot).",
+    description: "Close a challenge container (release a platform slot; wakes the next waiter in the resource queue).",
     parameters: { code: { type: "string", required: true } },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
@@ -1057,6 +1094,10 @@ boardPath=${c().boardPath(args.code)}`;
       await s.adapter.close(args.code);
       s.progress.update(args.code, { containerClosed: true });
       persistProgress(s);
+      try {
+        await s.containerQueue?.release();
+      } catch {
+      }
       return `closed ${args.code}`;
     }
   }));
@@ -1126,11 +1167,11 @@ boardPath=${c().boardPath(args.code)}`;
   }));
   register(defineTool({
     name: "xiaochang_enqueue",
-    description: "Enqueue one executor work item into the hufu campaign. v7 lean prompt: write ONLY the task directive (assigned idea/approach in one or two lines) \u2014 the mechanism wraps it with a fixed exec frame (challenge description, live container addrs, shared board path, per-challenge knowledge ledger path, org profile path, FLAG_CANDIDATE discipline). Executors read the knowledge ledger first (prior skeletons/dead-ends/artifacts/forks). resourceClass is auto-set by challenge type (attachment\u2192local full-parallel; container\u21923-slot rotation); override only when you know better. Optional dependsOn makes it a DAG node.",
+    description: "Enqueue one executor work item into the hufu campaign. v7 lean prompt: write ONLY the task directive (assigned idea/approach in one or two lines) \u2014 the mechanism wraps it with a fixed exec frame (challenge description, live container addrs, shared board path, per-challenge knowledge ledger path, org profile path, FLAG_CANDIDATE discipline). Executors read the knowledge ledger first (prior skeletons/dead-ends/artifacts/forks). resourceClass is auto-set by challenge type (attachment\u2192local full-parallel; container\u21923-slot rotation); override only when you know better. Optional dependsOn makes it a DAG node. v7.6 prompt rules: directive \u2264700 chars; do NOT paste CVE lists/default-credential dictionaries/product fingerprint tables \u2014 that knowledge already lives in the executor model and in the org profile; put reusable knowledge in the ledger (xiaochang_knowledge_put) and reference it. Overlong directives are truncated and you get a cut-point report to decide whether to rewrite.",
     parameters: {
       code: { type: "string", required: true },
       round: { type: "number", required: true, description: "Round number (your own accounting)." },
-      prompt: { type: "string", required: true, description: "The lean directive: the assigned approach/idea for this executor (1-3 lines). Do NOT paste the challenge description/addrs/board discipline \u2014 the frame injects those." },
+      prompt: { type: "string", required: true, description: "The lean directive: the assigned approach/idea for this executor (1-3 lines, \u2264700 chars). Do NOT paste the challenge description/addrs/board discipline \u2014 the frame injects those. Do NOT paste CVE/dictionary-style knowledge." },
       model: { type: "string", description: "Executor model. Default deepseek-v4-flash (cheap fast path; override for hard challenges)." },
       effort: { type: "string", description: "Reasoning effort (unsupported efforts are dropped per model)." },
       dependsOn: { type: "array", description: "Item ids this item waits for (DAG)." },
@@ -1139,7 +1180,10 @@ boardPath=${c().boardPath(args.code)}`;
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args) {
+    async execute(args, exec) {
+      if (parentAgent !== void 0 && exec.agent !== parentAgent) {
+        return "xiaochang_enqueue: \u62D2\u7EDD\u2014\u2014\u6D3E\u5355\u662F\u4E3B agent \u4E13\u5C5E(\u5355\u8C03\u5EA6\u5668); \u6267\u884C\u8005\u53EA\u89E3\u81EA\u5DF1\u7684\u9898, \u6709\u53D1\u73B0\u7528 xiaochang_fork \u4E0A\u62A5";
+      }
       const s = requireState();
       const ch = s.challenges.get(args.code);
       if (ch === void 0) return `xiaochang_enqueue: unknown challenge ${args.code}`;
@@ -1153,8 +1197,15 @@ boardPath=${c().boardPath(args.code)}`;
       if (vq !== void 0 && vq.gaps.length > 0) {
         gapsTxt = "\n\n\u5DF2\u77E5\u4E0A\u4E0B\u6587\u7F3A\u53E3(\u524D\u5E8F\u6267\u884C\u8005\u53CD\u9988\u7F3A\u7684\u4FE1\u606F, \u82E5\u4F60\u80FD\u8865\u5219\u8865, \u4E0D\u80FD\u8865\u5219\u660E\u786E\u8BF4\u7F3A\u4EC0\u4E48):\n" + vq.gaps.slice(-5).map((g) => `- ${g}`).join("\n");
       }
+      const DIRECTIVE_MAX = 700;
+      const trunc = truncateDirective(args.prompt, DIRECTIVE_MAX);
+      let truncNotice = "";
+      if (trunc.truncated) {
+        truncNotice = `
+\u26A0\uFE0F \u65B9\u5411\u6BB5\u622A\u65AD\u53CD\u9988: ${args.prompt.length}\u2192${DIRECTIVE_MAX} \u5B57\u7B26, \u622A\u70B9\u539F\u6587 "${trunc.cutTail}\u2026"\u3002\u88AB\u780D\u6389\u7684\u5185\u5BB9\u82E5\u662F\u5173\u952E\u9A8C\u8BC1\u70B9: \u2460\u7528 xiaochang_knowledge_put \u5199\u8FDB\u8BE5\u9898\u8D26\u672C\u2460/\u2462(\u6267\u884C\u8005\u5F00\u5DE5\u5FC5\u8BFB, \u4E0D\u5360 prompt), \u6216 \u2461\u62C6\u6210\u591A\u6761\u6D3E\u5355; \u82E5\u53EA\u662F CVE/\u53E3\u4EE4\u8BCD\u5178\u7C7B\u516C\u5171\u77E5\u8BC6, \u4E0D\u7528\u8865\u2014\u2014\u6267\u884C\u8005\u6A21\u578B\u81EA\u5E26\u3002\u9700\u8981\u6539\u5199\u8BF7\u91CD\u65B0 enqueue\u3002`;
+      }
       const cls = args.resourceClass ?? resourceClassOf(ch);
-      const label = buildExecFrame(args.code, args.prompt) + gapsTxt;
+      const label = buildExecFrame(args.code, trunc.text) + gapsTxt;
       const seq = s.progress.get(args.code)?.rounds ?? 0;
       const itemId = `${args.code}#s${args.round}-w${seq + 1}`;
       const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy);
@@ -1180,7 +1231,7 @@ boardPath=${c().boardPath(args.code)}`;
       s.progress.update(args.code, { difficulty: ch.difficulty, rounds: Math.max(s.progress.get(args.code)?.rounds ?? 0, args.round) });
       persistProgress(s);
       audit(s.auditPath, { type: "enqueue", id: itemId, code: args.code, round: args.round, model: executor.model, effort: executor.effort, class: cls });
-      return `enqueued ${itemId} (class=${cls}, executor=${executor.model}/${executor.effort}${executor.overriddenByLock ? ", OVERRIDDEN BY MODEL LOCK" : ""})`;
+      return `enqueued ${itemId} (class=${cls}, executor=${executor.model}/${executor.effort}${executor.overriddenByLock ? ", OVERRIDDEN BY MODEL LOCK" : ""})${truncNotice}`;
     }
   }));
   register(defineTool({
@@ -1273,7 +1324,10 @@ ${detail.slice(0, 6e3)}`);
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args) {
+    async execute(args, exec) {
+      if (parentAgent !== void 0 && exec.agent !== parentAgent) {
+        return "xiaochang_report: \u62D2\u7EDD\u2014\u2014\u88C1\u51B3\u662F\u4E3B agent \u4E13\u5C5E(\u5355\u8C03\u5EA6\u5668); \u6267\u884C\u8005\u53EA\u62A5\u544A\u7ED3\u679C, \u4EA4\u4E3B agent \u5224\u65AD";
+      }
       const s = requireState();
       const verdict = args.verdict === "complete" ? "complete" : args.verdict === "failed" ? "failed" : "skipped";
       const vq = s.v2[args.code] ?? { qtype: classifyQtype(s.challenges.get(args.code)?.description ?? ""), difficulty: difficultyPrior(s.challenges.get(args.code)?.total_score ?? 300), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 };
@@ -1310,6 +1364,14 @@ ${detail.slice(0, 6e3)}`);
       }
       try {
         await s.adapter.close(args.code);
+      } catch {
+      }
+      try {
+        await s.containerQueue?.release();
+      } catch {
+      }
+      try {
+        s.containerQueue?.evict(args.code, `challenge ${verdict}`);
       } catch {
       }
       s.progress.update(args.code, { state: verdict, reason: args.reason, containerClosed: true });
@@ -1403,6 +1465,9 @@ ${gaps}
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
     async execute(args, exec) {
+      if (parentAgent !== void 0 && exec.agent !== parentAgent) {
+        return "xiaochang_refanout: \u62D2\u7EDD\u2014\u2014\u4E8C\u6B21\u5F81\u96C6\u662F\u4E3B agent \u4E13\u5C5E(\u5355\u8C03\u5EA6\u5668); \u5361\u4F4F\u4E86\u8BF7\u628A\u7F3A\u53E3\u5199\u8FDB\u7EC8\u6001\u8F93\u51FA\u4EA4\u4E3B agent";
+      }
       const s = requireState();
       const ch = s.challenges.get(args.code);
       if (ch === void 0) return `xiaochang_refanout: unknown challenge ${args.code}`;
@@ -1667,18 +1732,22 @@ ${escLines.join("\n")}` : "";
   }));
   register(defineTool({
     name: "xiaochang_wait",
-    description: "Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, (d) a fork lands in the fork inbox for a NON-terminal challenge (executor xiaochang_fork; v7.1: late forks of already-terminal challenges are archived silently and do NOT wake you \u2014 no dispatch impulse for solved challenges), or (e) the timeout. This is THE way to wait \u2014 never bash sleep for waiting. Returns what woke it.",
+    description: "Event-driven wait (F30): blocks the turn without spending any LLM tokens until (a) an executor settles, (b) the campaign ledger changes, (c) a new session message arrives, (d) a fork lands in the fork inbox for a NON-terminal challenge (executor xiaochang_fork; v7.1: late forks of already-terminal challenges are archived silently), or (e) the timeout. v7.6: pass code to wait ONLY on your own challenge (single-challenge executors MUST pass it \u2014 other challenges' activity will not wake you; global waits omit it). This is THE way to wait \u2014 never bash sleep for waiting.",
     parameters: {
-      timeoutSeconds: { type: "number", description: "Max wait seconds (default 300, clamp 5..900)." }
+      timeoutSeconds: { type: "number", description: "Max wait seconds (default 300, clamp 5..900)." },
+      code: { type: "string", description: "v7.6 filter: only wake on events of this challenge (single-challenge executors must pass it)." }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => true,
     async execute(args, exec) {
       const timeoutMs = Math.min(Math.max(args.timeoutSeconds ?? 300, 5), 900) * 1e3;
       const agent = exec.agent;
+      const codeFilter = args.code;
       const ledgerSnap = () => {
         try {
-          return JSON.stringify(campaign?.ledger.views().map((v) => [v.item.id, v.state, v.terminalDetail ?? "", v.lastProgressAt ?? 0]));
+          const views = campaign?.ledger.views() ?? [];
+          const picked = codeFilter !== void 0 ? views.filter((v) => codeOf(v.item.id) === codeFilter) : views;
+          return JSON.stringify(picked.map((v) => [v.item.id, v.state, v.terminalDetail ?? "", v.lastProgressAt ?? 0]));
         } catch {
           return "";
         }
@@ -1693,7 +1762,10 @@ ${escLines.join("\n")}` : "";
           cleanup();
           resolve(why);
         };
-        const unsub = campaignId !== void 0 && holder.onSettle !== void 0 ? holder.onSettle(campaignId, (ev) => done(`xiaochang_wait: ${ev.itemId} settled (${ev.status})${ev.text !== "" ? ": " + ev.text.slice(0, 200) : ""}`)) : () => {
+        const unsub = campaignId !== void 0 && holder.onSettle !== void 0 ? holder.onSettle(campaignId, (ev) => {
+          if (codeFilter !== void 0 && codeOf(ev.itemId) !== codeFilter) return;
+          done(`xiaochang_wait: ${ev.itemId} settled (${ev.status})${ev.text !== "" ? ": " + ev.text.slice(0, 200) : ""}`);
+        }) : () => {
         };
         const before = ledgerSnap();
         const iv = setInterval(() => {
@@ -1707,7 +1779,8 @@ ${escLines.join("\n")}` : "";
         const inboxSnap = () => {
           try {
             if (!existsSync(inboxDir)) return "";
-            return readdirSync2(inboxDir).filter((f) => f.endsWith(".jsonl")).map((f) => {
+            const files = codeFilter !== void 0 ? readdirSync2(inboxDir).filter((f) => f.endsWith(".jsonl") && f.replace(/\.jsonl$/, "") === codeFilter) : readdirSync2(inboxDir).filter((f) => f.endsWith(".jsonl"));
+            return files.map((f) => {
               const st = statSync2(join2(inboxDir, f));
               return `${f}:${st.mtimeMs}:${st.size}`;
             }).join("|");
@@ -1715,12 +1788,13 @@ ${escLines.join("\n")}` : "";
             return "";
           }
         };
-        const evaluateInbox = () => {
+        const evaluateInbox = (onlyCode) => {
           try {
             if (!existsSync(inboxDir)) return false;
             let live = false;
             for (const f of readdirSync2(inboxDir).filter((f2) => f2.endsWith(".jsonl"))) {
               const code = f.replace(/\.jsonl$/, "");
+              if (onlyCode !== void 0 && code !== onlyCode) continue;
               if (!progressTerminal(code)) live = true;
               try {
                 absorbForkInbox(code);
@@ -1740,7 +1814,7 @@ ${escLines.join("\n")}` : "";
             done("xiaochang_wait: fork inbox changed \u2014 read xiaochang_graph and dispatch the untaken branches");
             return;
           }
-          if (evaluateInbox()) done("xiaochang_wait: fork inbox changed \u2014 read xiaochang_graph and dispatch the untaken branches");
+          if (evaluateInbox(codeFilter)) done("xiaochang_wait: fork inbox changed \u2014 read xiaochang_graph and dispatch the untaken branches");
         }, 2e3);
         const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1e3)}s, no event`), timeoutMs);
         cleanup = () => {
@@ -1750,7 +1824,7 @@ ${escLines.join("\n")}` : "";
           clearInterval(fv);
           clearTimeout(to);
         };
-        if (state !== void 0 && evaluateInbox()) {
+        if (state !== void 0 && evaluateInbox(codeFilter)) {
           inboxBefore = inboxSnap();
           done("xiaochang_wait: fork inbox changed \u2014 read xiaochang_graph and dispatch the untaken branches");
         }
@@ -1765,16 +1839,33 @@ ${escLines.join("\n")}` : "";
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args) {
+    async execute(args, exec) {
+      if (parentAgent !== void 0 && exec.agent !== parentAgent) {
+        return "xiaochang_finish: \u62D2\u7EDD\u2014\u2014\u6536\u5B98\u662F\u4E3B agent \u4E13\u5C5E(\u5355\u8C03\u5EA6\u5668); \u6267\u884C\u8005\u89E3\u5B8C\u9898\u76F4\u63A5\u6536\u5DE5\u5373\u53EF";
+      }
       const s = requireState();
+      let closedCount = 0;
       for (const ch of s.challenges.values()) {
         if (ch.container_status === "available" || ch.container_status === "pending") {
           try {
             await s.adapter.close(ch.unique_code);
           } catch {
           }
+          closedCount += 1;
         }
         s.progress.update(ch.unique_code, { containerClosed: true });
+      }
+      for (let i = 0; i < closedCount; i++) {
+        try {
+          await s.containerQueue?.release();
+        } catch {
+        }
+      }
+      for (const w of s.containerQueue?.waiters() ?? []) {
+        try {
+          s.containerQueue?.evict(w.holderId, "campaign finished");
+        } catch {
+        }
       }
       persistProgress(s);
       if (campaignId !== void 0) holder.finish?.(campaignId);

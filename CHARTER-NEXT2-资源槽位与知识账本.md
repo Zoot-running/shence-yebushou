@@ -165,3 +165,13 @@ enqueue 的 `prompt` 参数语义降级为**一句话指令**(思路/职责),机
 - 归属校正: 种子是校场资产 → 迁入 yebushou `packaging/seeds/jisi-model-ledger.seed.json`(集思只读消费)。
 - 托管镜像禁带: 打包审计把 `jisi-model-ledger.seed.json` 与 `storages/**` 列为无条件阻断(删除原"仅 execution 豁免"), 自测 6/6 通过; 镜像上下文已移除种子文件。
 - 本地/干跑仍可用种子(复现性), 托管冷启动(Beta(1,1) + Thompson 探索); 开战令删除"账本有据"表述, 显式声明本局冷启动。
+
+## v7.6(2026-09-17, 资源调度机制化——session-769750 暴露的"卡容器→空烧→漂移"链根治)
+
+- **虎符通用竞争资源队列原语** `ResourceQueue`(resource-queue.ts): FIFO / 同 holderId 合并等待位 / 单一授权点(granting 互斥) / canGrant+grant 使用方注入 / 授予失败队首重排 / release 唤醒队首 / evict 出队(终态) / 超时带位置 / abort 出队。单测 7 条(44/44)。经 ctx.hufu.resourceQueue 暴露。
+- **校场容器槽使用**: setup 建容器队列(capacity=containerSlots, canGrant=平台 listChallenges 刷新+openContainers 判定, grant=adapter.start 且同题 available/pending 短路共享); start_container 改为 acquire 阻塞等待(零 token, 5min 超时带队位, 终态 evict 返回"无需容器"); close/report/finish 统一 release+evict。死锁不变量: 每 holder 单资源 + 单一授权点 ⇒ 无持有并等待环。
+- **wait 按题过滤**: xiaochang_wait 加 code 参数——settle/账本/分叉信箱三条唤醒通道都按题过滤, 单题执行者不再被全战役噪音打断(session-769750 里"300s 等待变 20s 热循环"的元凶)。
+- **调度权四守卫**: enqueue/report/refanout/finish 加主 agent 专属单点(与 hint/submit 同款)——执行者物理上不能改写战役(定向验证局三拒绝原文逐字录得)。
+- **方向段截断 + 反馈循环**: enqueue prompt 硬截断 700 字符(阈值=run18728 真局派单分布 p50≈623/p75≈884 折中); 截断时工具返回截点原文反馈, 引导主 agent 决定改写/进账本/拆多条; 规则事前写进工具描述+skill+开战令。
+- **共享知识席位(skill 红线)**: 禁抄 CVE 清单/默认口令词典/产品指纹表——执行者模型自带 + 画像该存; 跨题复用知识写画像/账本③, 派单只引用(run18728 数据: 76 条派单 median 623 字, 最长 1148 全是词典搬运; 与 fanout 报告重合度 ≤24%——主 agent 有重组, 缺的是"共享知识不抄"的席位)。
+- 验证: 定向验证局(三守卫拒绝原文 + 1010→700 截断反馈原文 + 终态注入静默) + 全量干跑 8/8 4400/4400 ~2min(历史最快)。
