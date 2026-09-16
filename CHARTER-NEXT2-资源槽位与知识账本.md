@@ -145,3 +145,23 @@ enqueue 的 `prompt` 参数语义降级为**一句话指令**(思路/职责),机
 - 机制: `xiaochang_submit` 加 hint 同款单点守卫——非主 agent 调用即拒绝并指路("执行者请把 flag 输出为 FLAG_CANDIDATE: <flag> 交给主 agent 提交"); 交卷唯一路径 = 主 agent, 平台判定串行可审计。缺省语义不变(临门一脚仍是主 agent 的 ≤3 工具调用)。
 - 定向验证局: 执行者按令先调 submit → 逐字拒绝回执("xiaochang_submit: 拒绝——submit 是主 agent 专属单点…我作为执行者无权"), 主 agent 交卷 correct=true/awarded 300; 同局复验 v7.2 双路由(死路静默②/分叉信箱④)与 v7.1 注入抑制(absorbed×2, 收尾 wait timeout 0 唤醒)。
 - 全量干跑: 8/8 4400/4400 hints 0 无判死, "is not defined" 0 次, 8 题账本四节齐全, 类闸 5 container/4 local。观察: b-02 本局被 R2 一击全清, dependsOn 链式拆项未实战(上轮已验)。
+
+## v7.4 + v7.5(2026-09-16, V1 榜一被撤后的整改轮)
+
+**v7.4 平台分与 hint 经济(全部落在校场 runner)**:
+- 平台权威分: submit 回执的 cumulative_score 入库 `platformScore`, list/status/finish 一律显示"平台权威分"(V1 实锤: agent 自算 23000, 平台实给 22820——180 分差 = b-02/b-03 两条 hint 的扣分)。
+- hint 时机闸(机制化): 放行条件 = 该题 ideaRound≥2(已走过 ≥1 次 R2 二次征集) **且** 过滤后失败 ≥1(供应商故障不计)。未满足即拒绝并指路"先 refanout 加模型再打一轮"。hint 返回大声报扣分(该题累计/全局累计)。
+- fork 风暴根治 A+B+C: 去掉 followup 会话消息(唤醒唯一通道=信箱+wait 轮询, 不打断主 agent turn); 源端按 path 去重(信箱已有则不重复上报); 信箱按 code 聚合(既有); **唤醒即清账**(evaluateInbox 吸收先于唤醒——每条 fork 一生只唤醒一次, 定向验证局实锤的"未消费重复唤醒"根治)。
+- 定向验证局: 同 path 二次上报源端拦截、hint 闸拒绝原文、platformScore 显示、注入终态 fork 静默归档、收尾 wait 0 唤醒。
+- 全量干跑: 8/8 4400/4400, 平台权威分显示, interrupt 实弹。
+
+**v7.5 剪枝/判负即真杀(用户实锤: 题已解同题执行者不杀=空烧 token)**:
+- 虎符 binding: 每 item 独立 AbortController(经 jisi DispatchOptions.signal → ctx.subagents.start), interrupt 端口从 no-op 变真 abort; 结算时自动摘表。
+- 虎符 campaign: 公开 `interruptItem(itemId)`(仅活跃项触发端口)。
+- 校场: xiaochang_report 剪枝同题在途项前先 interruptItem; xiaochang_collect 轮次超时判负前先 interruptItem; 都落 audit。
+- 干跑实弹: audit 记 `interrupt b-02#s3-w4 reason=challenge complete`。
+
+**种子处置(规则 6 红线)**:
+- 归属校正: 种子是校场资产 → 迁入 yebushou `packaging/seeds/jisi-model-ledger.seed.json`(集思只读消费)。
+- 托管镜像禁带: 打包审计把 `jisi-model-ledger.seed.json` 与 `storages/**` 列为无条件阻断(删除原"仅 execution 豁免"), 自测 6/6 通过; 镜像上下文已移除种子文件。
+- 本地/干跑仍可用种子(复现性), 托管冷启动(Beta(1,1) + Thompson 探索); 开战令删除"账本有据"表述, 显式声明本局冷启动。

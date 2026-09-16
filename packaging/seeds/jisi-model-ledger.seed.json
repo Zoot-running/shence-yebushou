@@ -1,0 +1,54 @@
+{
+  "models": {
+    "deepseek-flash": {
+      "dimensions": {
+        "execution": {
+          "easy": {
+            "attempts": 21,
+            "wins": 21
+          },
+          "hard": {
+            "attempts": 15,
+            "wins": 15
+          },
+          "medium": {
+            "attempts": 28,
+            "wins": 28
+          }
+        }
+      }
+    },
+    "deepseek-v4-flash": {
+      "dimensions": {
+        "execution": {
+          "easy": {
+            "attempts": 21,
+            "wins": 21
+          },
+          "hard": {
+            "attempts": 15,
+            "wins": 15
+          },
+          "medium": {
+            "attempts": 28,
+            "wins": 28
+          }
+        }
+      }
+    },
+    "glm-5.3-flash": {
+      "dimensions": {
+        "execution": {
+          "easy": {
+            "attempts": 11,
+            "wins": 10
+          },
+          "medium": {
+            "attempts": 8,
+            "wins": 8
+          }
+        }
+      }
+    }
+  }
+}

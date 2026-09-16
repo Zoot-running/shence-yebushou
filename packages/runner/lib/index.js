@@ -2,7 +2,6 @@
 import { existsSync, mkdirSync as mkdirSync2, readFileSync, readdirSync as readdirSync2, renameSync as renameSync2, statSync as statSync2, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join as join2 } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { createUserMessage } from "@deepseek-ai/dsh-llm";
 
 // ../../src/hint-ledger.ts
 var HintLedger = class _HintLedger {
@@ -486,6 +485,22 @@ function replaceKnowledgeSection(fileText, section, entries) {
   const [start, end] = range;
   return [...lines.slice(0, start + 1), ...body, ...lines.slice(end)].join("\n");
 }
+function hintGate(input) {
+  const missing = [];
+  if (input.ideaRound < 2) missing.push(`R2 \u4E8C\u6B21\u5F81\u96C6\u672A\u8D70(\u5F53\u524D\u7B2C ${input.ideaRound} \u8F6E, \u9700 \u22652)\u2014\u2014\u5148 xiaochang_refanout \u52A0\u6A21\u578B\u518D\u6253\u4E00\u8F6E`);
+  if (input.filteredFailed < 1) missing.push("\u8BE5\u9898\u5C1A\u65E0\u8FC7\u6EE4\u540E\u5931\u8D25(\u9700 \u22651 \u6B21\u771F\u5B9E\u8D25\u7EE9)\u2014\u2014\u5148\u6D3E\u6267\u884C\u8005\u6253\u51FA\u771F\u5B9E\u7ED3\u679C");
+  return { allowed: missing.length === 0, missing };
+}
+function dedupeForkPaths(existingPaths, entries) {
+  const seen = new Set(existingPaths);
+  const out = [];
+  for (const e of entries) {
+    if (seen.has(e.path)) continue;
+    seen.add(e.path);
+    out.push(e);
+  }
+  return out;
+}
 
 // src/index.ts
 var name = "shence-xiaochang-runner";
@@ -902,7 +917,8 @@ function apply(ctx) {
           defaultEffort: args.defaultEffort ?? "low",
           locked: args.modelLock ?? false
         },
-        containerSlots: args.containerSlots ?? 3
+        containerSlots: args.containerSlots ?? 3,
+        platformScore: void 0
       };
       try {
         if (existsSync(s.profilePath)) s.profile = parse(readFileSync(s.profilePath, "utf8"));
@@ -992,7 +1008,9 @@ function apply(ctx) {
         return `${ch.unique_code} [${ch.difficulty}\xB7${cls === "local" ? "\u9644\u4EF6" : "\u5BB9\u5668"}] ${ch.total_score}pts flags=${ch.correct_flag_count}/${ch.flag_count} completed=${ch.is_completed} container=${ch.container_status} addrs=${ch.container_addr.join(",") || "-"} progress=${p?.state ?? "fresh"} | ${ch.description ?? ""}`;
       });
       const locals = fresh.filter((ch) => resourceClassOf(ch) === "local").length;
-      return `score=${score.score}/${score.max} (${score.completed}/${fresh.length}; \u9644\u4EF6\u9898 ${locals} \u4E2A\u5168\u5E76\u884C, \u5BB9\u5668\u9898 ${fresh.length - locals} \u4E2A\u53D7 ${s.containerSlots} \u69FD\u7EA6\u675F)
+      const scoreLine = s.platformScore !== void 0 ? `platformScore=${s.platformScore}/${score.max}(\u5E73\u53F0\u6743\u5A01, \u542B hint \u6263\u5206) \u672C\u5730\u4F30\u7B97=${score.score}/${score.max}` : `score=${score.score}/${score.max}`;
+      const hintTxt = s.hintLedger.totalHints() > 0 ? `; hint \u5DF2\u770B ${s.hintLedger.totalHints()} \u6B21\u3001\u5DF2\u6263\u7EA6 ${s.hintLedger.totalDeducted()} \u5206` : "";
+      return `${scoreLine} (${score.completed}/${fresh.length}; \u9644\u4EF6\u9898 ${locals} \u4E2A\u5168\u5E76\u884C, \u5BB9\u5668\u9898 ${fresh.length - locals} \u4E2A\u53D7 ${s.containerSlots} \u69FD\u7EA6\u675F${hintTxt})
 
 ${rows.join("\n")}`;
     }
@@ -1058,6 +1076,7 @@ boardPath=${c().boardPath(args.code)}`;
       const s = requireState();
       try {
         const res = await s.adapter.submit(args.code, args.flag);
+        if (typeof res.cumulative_score === "number") s.platformScore = res.cumulative_score;
         if (res.correct) {
           const p = s.progress.get(args.code);
           s.progress.update(args.code, { flags: [.../* @__PURE__ */ new Set([...p?.flags ?? [], args.flag])] });
@@ -1079,7 +1098,7 @@ boardPath=${c().boardPath(args.code)}`;
   }));
   register(defineTool({
     name: "xiaochang_hint",
-    description: "Fetch the official hint (deducts ~10% of the challenge score per hint; capped per challenge). Returns the hint text.",
+    description: "Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v7.4 gate: refused until the challenge has gone through \u22651 R2 re-fanout (ideaRound\u22652) AND has \u22651 filtered failure (provider-outage failures excluded) \u2014 hint is the last resort after escalation, never a shortcut. The deduction is reported loudly and the platform's cumulative_score is the authoritative account.",
     parameters: { code: { type: "string", required: true } },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
@@ -1090,12 +1109,19 @@ boardPath=${c().boardPath(args.code)}`;
       const s = requireState();
       const used = s.hintLedger.get(args.code)?.hints ?? 0;
       if (used >= s.maxHints) return "xiaochang_hint: hint cap reached";
+      const vq = s.v2[args.code];
+      const ff = filteredFailedOf(args.code, campaign);
+      const gate = hintGate({ ideaRound: vq?.ideaRound ?? 1, filteredFailed: ff.failed });
+      if (!gate.allowed) {
+        return `xiaochang_hint: \u62D2\u7EDD(hint \u6263\u8BE5\u9898\u5206\u503C, \u662F R2+\u5931\u8D25\u540E\u7684\u6700\u540E\u624B\u6BB5): ${gate.missing.join("; ")}\u3002\u5F53\u524D\u8BE5\u9898 hint \u5DF2\u7528 ${used}/${s.maxHints}\u3001\u5DF2\u6263 ${s.hintLedger.get(args.code)?.deducted ?? 0} \u5206\u3002`;
+      }
       const ch = s.challenges.get(args.code);
       const raw = await s.adapter.hint(args.code);
       const hint = raw.hint;
       if (hint === null || hint === void 0 || hint === "") return "xiaochang_hint: no hint available";
-      s.hintLedger.record(args.code, ch?.total_score ?? 100, "main-agent requested");
-      return `hint (${used + 1}/${s.maxHints} used): ${hint}`;
+      const cost = s.hintLedger.record(args.code, ch?.total_score ?? 100, "main-agent requested");
+      return `hint (${used + 1}/${s.maxHints} used): ${hint}
+\u26A0\uFE0F \u672C\u6B21\u770B\u63D0\u793A\u5DF2\u6263\u8BE5\u9898\u7EA6 ${cost} \u5206(\u8BE5\u9898\u7D2F\u8BA1\u5DF2\u6263 ${s.hintLedger.get(args.code)?.deducted ?? cost}, \u5168\u5C40\u7D2F\u8BA1 ${s.hintLedger.totalDeducted()})\u2014\u2014\u6EE1\u5206\u8D26\u91CC\u8981\u6263\u6389; \u6743\u5A01\u5206\u4EE5 submit \u56DE\u6267\u7684 cumulative_score / xiaochang_list \u7684 platformScore \u4E3A\u51C6\u3002`;
     }
   }));
   register(defineTool({
@@ -1192,6 +1218,11 @@ boardPath=${c().boardPath(args.code)}`;
         const timeout = Math.round(s.roundTimeoutMs * factor);
         const last = v.lastProgressAt ?? v.dispatchedAt;
         if (last === void 0 || now - last < timeout) continue;
+        try {
+          await c().interruptItem?.(v.item.id);
+        } catch {
+        }
+        audit(s.auditPath, { type: "interrupt", id: v.item.id, code: codeOf(v.item.id), reason: "round timeout" });
         c().report(v.item.id, "failed", "round timeout");
         s.processed.add(baseId(v.item.id));
       }
@@ -1284,6 +1315,13 @@ ${detail.slice(0, 6e3)}`);
       s.progress.update(args.code, { state: verdict, reason: args.reason, containerClosed: true });
       for (const v of c().ledger.views()) {
         if (codeOf(v.item.id) === args.code && (v.state === "queued" || v.state === "dispatched" || v.state === "help" || v.state === "stalled")) {
+          if (v.state !== "queued") {
+            try {
+              await c().interruptItem?.(v.item.id);
+            } catch {
+            }
+            audit(s.auditPath, { type: "interrupt", id: v.item.id, code: args.code, reason: `challenge ${verdict}` });
+          }
           try {
             c().cancel(v.item.id, `challenge ${verdict}: ${args.reason ?? ""}`);
           } catch {
@@ -1392,10 +1430,10 @@ ${prompt}`;
   }));
   register(defineTool({
     name: "xiaochang_fork",
-    description: 'F33 fork alarm: you (executor) report branches with an explicit status \u2014 "untaken" (default): promising branch not taken, worth dispatching (goes to ledger \u2463 + inbox + wakes the main agent immediately); "dead-end": a path you PROVED infeasible (403/impossible/verified-fail) \u2014 archived silently to ledger \u2461 only, no inbox, no wake, no dispatch impulse. The main agent alone decides whether to dispatch. v7.1: untaken forks of already-terminal challenges are archived as knowledge only.',
+    description: `F33 fork alarm: you (executor) report branches with an explicit status \u2014 "untaken" (default): promising branch not taken, worth dispatching (goes to ledger \u2463 + the fork inbox; the main agent is woken by xiaochang_wait polling the inbox \u2014 NO direct interrupt, forks are collected in the main agent's normal rhythm); "dead-end": a path you PROVED infeasible (403/impossible/verified-fail) \u2014 archived silently to ledger \u2461 only, no inbox, no wake, no dispatch impulse. v7.1: untaken forks of already-terminal challenges are archived silently. v7.4: duplicate paths already in the inbox are skipped at the source.`,
     parameters: {
       code: { type: "string", required: true },
-      forks: { type: "array", required: true, description: '[{path, conclusion, evidence, status}] \u2014 status: "untaken" (default, \u672A\u8D70\u5206\u53C9\u2192\u2463+\u5524\u9192\u4E3B agent) | "dead-end" (\u5DF2\u8BC1\u6B7B\u8DEF\u2192\u53EA\u8FDB\u2461\u4E0D\u53EF\u884C\u6559\u8BAD, \u4E0D\u5524\u9192\u4E0D\u6D3E\u5175).' }
+      forks: { type: "array", required: true, description: '[{path, conclusion, evidence, status}] \u2014 status: "untaken" (default, \u672A\u8D70\u5206\u53C9\u2192\u2463+\u4FE1\u7BB1, \u4E3B agent \u7ECF xiaochang_wait \u5524\u9192) | "dead-end" (\u5DF2\u8BC1\u6B7B\u8DEF\u2192\u53EA\u8FDB\u2461, \u4E0D\u5524\u9192\u4E0D\u6D3E\u5175).' }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => true,
@@ -1405,7 +1443,6 @@ ${prompt}`;
       const deadEnds = args.forks.filter((f) => f.status === "dead-end");
       const untaken = args.forks.filter((f) => f.status !== "dead-end");
       const deadLines = deadEnds.map(fmt);
-      const forkLines = untaken.map(fmt);
       if (deadEnds.length > 0) {
         const de = deadEnds.map((f) => ({ kind: "dead-end", path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: "fork", at: Date.now() }));
         try {
@@ -1418,41 +1455,44 @@ ${prompt}`;
         }
       }
       const terminalNow = progressTerminal(args.code);
-      const entries = untaken.map((f) => ({ kind: "fork", path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: "fork", at: Date.now() }));
+      let entries = [];
       let inbox = "";
-      if (untaken.length > 0 && !terminalNow) {
+      let skipped = 0;
+      if (untaken.length > 0) {
+        const existingPaths = [];
         try {
-          inbox = writeForkInbox(args.code, entries);
+          existingPaths.push(...readForkInbox(args.code).map((k) => k.path));
         } catch {
         }
-      }
-      if (entries.length > 0) {
-        try {
-          recordKnowledgeOnCode(args.code, entries);
-        } catch {
+        const fresh = dedupeForkPaths(existingPaths, untaken);
+        skipped = untaken.length - fresh.length;
+        entries = fresh.map((f) => ({ kind: "fork", path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: "fork", at: Date.now() }));
+        if (entries.length > 0 && !terminalNow) {
+          try {
+            inbox = writeForkInbox(args.code, entries);
+          } catch {
+          }
         }
-        try {
-          appendKnowledgeFile(args.code, "forks", forkLines);
-        } catch {
+        if (entries.length > 0) {
+          try {
+            recordKnowledgeOnCode(args.code, entries);
+          } catch {
+          }
+          try {
+            appendKnowledgeFile(args.code, "forks", entries.map((f) => fmt(f)));
+          } catch {
+          }
         }
-      }
-      const sameProcess = parentAgent !== void 0 && campaign !== void 0;
-      if (sameProcess && entries.length > 0 && !terminalNow) {
-        parentAgent?.followup(createUserMessage({
-          content: [{ type: "text", text: `\u{1F500} \u5206\u53C9\u5373\u65F6\u62A5(${args.code}): \u53D1\u73B0 ${entries.length} \u6761\u672A\u8D70\u5206\u53C9, \u5DF2\u5165\u8D26+\u4FE1\u7BB1\u3002\u7531\u4F60(\u4E3B agent)\u51B3\u5B9A\u662F\u5426 jisi_fanout_bulk / xiaochang_enqueue \u589E\u5175\u3002
-${forkLines.map((l) => `- \u{1F500} ${l}`).join("\n")}` }],
-          source: { kind: "user" }
-        }));
       }
       const parts = [];
       if (deadEnds.length > 0) parts.push(`\u6B7B\u8DEF ${deadEnds.length} \u6761\u5DF2\u9759\u9ED8\u5165\u8D26\u2461(\u4E0D\u5524\u9192\u4E0D\u6D3E\u5175)`);
+      if (skipped > 0) parts.push(`\u91CD\u590D path ${skipped} \u6761\u5DF2\u5728\u4FE1\u7BB1\u4E2D, \u6E90\u7AEF\u8DF3\u8FC7(\u4E0D\u91CD\u590D\u4E0A\u62A5)`);
       if (entries.length > 0) {
-        parts.push(inbox !== "" ? `\u672A\u8D70\u5206\u53C9 ${entries.length} \u6761\u5DF2\u5199\u4FE1\u7BB1(${inbox}), \u4E3B agent \u7684 xiaochang_wait \u4F1A\u88AB\u5524\u9192` : "\u672A\u8D70\u5206\u53C9: \u4FE1\u7BB1\u672A\u5199(\u7EC8\u6001\u6291\u5236\u6216\u5199\u5165\u5931\u8D25)");
-        if (sameProcess && !terminalNow) parts.push("\u540C\u8FDB\u7A0B\u5DF2\u76F4\u63A5\u5165\u8D26\u5E76\u5524\u9192");
+        parts.push(inbox !== "" ? `\u672A\u8D70\u5206\u53C9 ${entries.length} \u6761\u5DF2\u5199\u5165\u4FE1\u7BB1(${inbox})\u2014\u2014\u4E3B agent \u7684 xiaochang_wait \u8F6E\u8BE2\u5230\u5373\u5524\u9192, \u4E0D\u6253\u65AD\u5176\u5F53\u524D turn` : "\u672A\u8D70\u5206\u53C9: \u4FE1\u7BB1\u672A\u5199(\u7EC8\u6001\u6291\u5236\u6216\u5199\u5165\u5931\u8D25)");
         if (terminalNow) parts.push("\u9898\u5DF2\u7EC8\u6001: \u4EC5\u5B58\u6863\u5165\u8D26, \u672A\u5199\u4FE1\u7BB1/\u672A\u5524\u9192(\u4E0D\u6D3E\u5175)");
       }
       return `fork ${parts.join("; ") || "nothing to record"}:
-${[...deadLines.map((l) => `- \u274C${l}`), ...forkLines.map((l) => `- \u{1F500}${l}`)].join("\n")}`;
+${[...deadLines.map((l) => `- \u274C${l}`), ...entries.map((f) => `- \u{1F500}${fmt(f)}`)].join("\n")}`;
     }
   }));
   register(defineTool({
@@ -1617,6 +1657,7 @@ ${escLines.join("\n")}` : "";
         `campaign: open=${count((v) => v.state === "dispatched" || v.state === "help")} queued=${count((v) => v.state === "queued")} done=${count((v) => v.state === "done")} failed=${count((v) => v.state === "failed")} blocked=${count((v) => v.state === "blocked")}`,
         `resourceClasses: ${usageTxt}`,
         `budgetRemainingMin=${Math.round(remaining / 6e4)}`,
+        `platformScore=${s.platformScore ?? "n/a"}${s.platformScore !== void 0 ? "(\u6743\u5A01, \u542B hint \u6263\u5206)" : ""}`,
         `openContainers=${[...openContainers(s)].join(",") || "none"}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
         `progress: ${progress}`,
@@ -1680,13 +1721,10 @@ ${escLines.join("\n")}` : "";
             let live = false;
             for (const f of readdirSync2(inboxDir).filter((f2) => f2.endsWith(".jsonl"))) {
               const code = f.replace(/\.jsonl$/, "");
-              if (progressTerminal(code)) {
-                try {
-                  absorbForkInbox(code);
-                } catch {
-                }
-              } else {
-                live = true;
+              if (!progressTerminal(code)) live = true;
+              try {
+                absorbForkInbox(code);
+              } catch {
               }
             }
             return live;
@@ -1770,7 +1808,7 @@ ${escLines.join("\n")}` : "";
           clock = `\u26A0\uFE0F \u5E73\u53F0\u505C\u8868\u8C03\u7528\u5931\u8D25\uFF1A${String(error)} \u2014\u2014 \u6392\u540D\u949F\u4ECD\u5728\u8D70\uFF0C\u8BF7\u91CD\u8BD5 xiaochang_finish`;
         }
       }
-      return `xiaochang_finish: score=${score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ", ALL TERMINAL" : ""})
+      return `xiaochang_finish: score=${s.platformScore ?? score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ", ALL TERMINAL" : ""}${s.platformScore !== void 0 ? ", \u5E73\u53F0\u6743\u5A01\u5206" : ", \u672C\u5730\u4F30\u7B97\u5206"})
 \u6392\u540D\u949F\uFF1A${clock}${guardMarker}`;
     }
   }));

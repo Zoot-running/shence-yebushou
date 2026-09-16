@@ -17,7 +17,6 @@
 | `src/governance.ts` | clean-room 运行时扫描器 | 门禁 |
 | 合规版开战令 | 由主 agent 当 run 生成（无机制先验版） | 授权来源 |
 | DSH 核心 + 插件依赖（node_modules 等） | 运行环境 | 不含业务知识 |
-| `storages/jisi-model-ledger.seed.json`（仅 execution 维度） | 能力账本种子（F33 ①） | 规则 6 豁免：审计脚本做结构校验（出现非 execution 维度即违规） |
 
 ## 黑名单（**绝不**进镜像，审计脚本按此阻断）
 
@@ -26,7 +25,8 @@
 | `local/**`（hosted-priors.md / SOLUTIONS / DEAD-ENDS / creds-corpus 等） | 机制先验/历史题解/凭据语料 | 规则 6 |
 | `boards/**`、`*.jsonl`（usage/audit/snapshot 账本） | 历史 run 产物 | 规则 6 |
 | `*-order.txt`、`run*-launch.sh`、`*.ovpn` | 开战令含 token/凭据 | 规则 3（凭据走 env） |
-| `.secrets/**`、`.dsh*`、`storages/**`（例外：`jisi-model-ledger.seed.json`，见白名单） | 密钥/凭据 | 规则 3 |
+| `.secrets/**`、`.dsh*`、`storages/**`（**无例外**） | 密钥/凭据/历史账本 | 规则 3 |
+| `jisi-model-ledger.seed.json`（任何位置） | 能力账本种子 = 历史答题战绩 | **规则 6（2026-09-16 V1 榜一被撤实锤：平台判定"直接内置赛题信息和解法"——种子不再带豁免，托管镜像一律禁带）** |
 | `retro-*.md`、`run*-war-report.md`、`plan-*.md`、`L4-*.md` | 历史复盘（含 flag/题解） | 规则 6 |
 | `xiaochang-archive/**`、`.archive/**` | 历史会话快照 | 规则 6 |
 | shence-jintuo（guard/watch） | 本地守护，沙箱一次性无重启语义 | 探索档案 §5 |

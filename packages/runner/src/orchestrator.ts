@@ -323,3 +323,28 @@ export function replaceKnowledgeSection(fileText: string, section: KnowledgeSect
   const [start, end] = range
   return [...lines.slice(0, start + 1), ...body, ...lines.slice(end)].join('\n')
 }
+
+// ── v7.4: hint 时机门禁 + fork 源端去重(纯函数) ─────────────────────
+
+/**
+ * hint 放行条件(V1 实锤 180 分教训): 必须已走过 ≥1 次 R2 二次征集(ideaRound≥2)
+ * 且该题已有 ≥1 次过滤后失败(供应商故障不计)——hint 是扣分的最后手段, 不是捷径。
+ */
+export function hintGate(input: { ideaRound: number; filteredFailed: number }): { allowed: boolean; missing: string[] } {
+  const missing: string[] = []
+  if (input.ideaRound < 2) missing.push(`R2 二次征集未走(当前第 ${input.ideaRound} 轮, 需 ≥2)——先 xiaochang_refanout 加模型再打一轮`)
+  if (input.filteredFailed < 1) missing.push('该题尚无过滤后失败(需 ≥1 次真实败绩)——先派执行者打出真实结果')
+  return { allowed: missing.length === 0, missing }
+}
+
+/** fork 源端去重: 与信箱已有条目按 path 去重——只压重复上报, 不吞真分叉。 */
+export function dedupeForkPaths(existingPaths: readonly string[], entries: Array<{ path: string }>): Array<{ path: string }> {
+  const seen = new Set(existingPaths)
+  const out: Array<{ path: string }> = []
+  for (const e of entries) {
+    if (seen.has(e.path)) continue
+    seen.add(e.path)
+    out.push(e)
+  }
+  return out
+}

@@ -11,7 +11,6 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { HintLedger } from '../../../src/hint-ledger.ts'
 import { addFact, createProfile, parse as parseProfile, render as renderProfile } from '../../../src/profile.ts'
 import { TsecbenchAdapter, type ChallengeInfo, type FetchLike } from '../../../src/adapters/tsecbench.ts'
@@ -22,6 +21,8 @@ import {
   baseId,
   cleanRoomGate,
   codeOf,
+  dedupeForkPaths,
+  hintGate,
   knowledgeSkeleton,
   parseObservations,
   replaceKnowledgeSection,
@@ -73,6 +74,8 @@ interface HufuLike {
   isComplete(): boolean
   /** v7 类闸可见性：每资源类 {open, limit}。 */
   classUsage?(): Record<string, { open: number; limit: number }>
+  /** v7.5: 中止某在途项的执行者进程(剪枝/超时判负时真杀)。 */
+  interruptItem?(itemId: string): Promise<void>
   ledger: {
     views(): Array<{ item: { id: string; model?: string }; state: string; seed: number; terminalDetail?: string; dispatchedAt?: number; lastProgressAt?: number }>
   }
@@ -203,6 +206,8 @@ interface CampaignState {
   executorPolicy: ExecutorPolicy
   /** v7: 容器题并发槽位(平台容器上限)。 */
   containerSlots: number
+  /** v7.4: 平台权威累计分(submit 回执的 cumulative_score)——满分判定以此为准, 不自算。 */
+  platformScore?: number
 }
 
 let state: CampaignState | undefined
@@ -596,6 +601,7 @@ export function apply(ctx: Context): void {
           locked: args.modelLock ?? false,
         },
         containerSlots: args.containerSlots ?? 3,
+        platformScore: undefined,
       }
       try {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
@@ -684,7 +690,11 @@ export function apply(ctx: Context): void {
         return `${ch.unique_code} [${ch.difficulty}·${cls === 'local' ? '附件' : '容器'}] ${ch.total_score}pts flags=${ch.correct_flag_count}/${ch.flag_count} completed=${ch.is_completed} container=${ch.container_status} addrs=${ch.container_addr.join(',') || '-'} progress=${p?.state ?? 'fresh'} | ${ch.description ?? ''}`
       })
       const locals = fresh.filter(ch => resourceClassOf(ch) === 'local').length
-      return `score=${score.score}/${score.max} (${score.completed}/${fresh.length}; 附件题 ${locals} 个全并行, 容器题 ${fresh.length - locals} 个受 ${s.containerSlots} 槽约束)\n\n${rows.join('\n')}`
+      const scoreLine = s.platformScore !== undefined
+        ? `platformScore=${s.platformScore}/${score.max}(平台权威, 含 hint 扣分) 本地估算=${score.score}/${score.max}`
+        : `score=${score.score}/${score.max}`
+      const hintTxt = s.hintLedger.totalHints() > 0 ? `; hint 已看 ${s.hintLedger.totalHints()} 次、已扣约 ${s.hintLedger.totalDeducted()} 分` : ''
+      return `${scoreLine} (${score.completed}/${fresh.length}; 附件题 ${locals} 个全并行, 容器题 ${fresh.length - locals} 个受 ${s.containerSlots} 槽约束${hintTxt})\n\n${rows.join('\n')}`
     },
   }))
 
@@ -755,6 +765,8 @@ export function apply(ctx: Context): void {
       const s = requireState()
       try {
         const res = await s.adapter.submit(args.code, args.flag)
+        // v7.4: 平台权威累计分入库——满分判定/展示以此为准(不自算 total_score 累加, hint 扣分天然算清)。
+        if (typeof res.cumulative_score === 'number') s.platformScore = res.cumulative_score
         if (res.correct) {
           const p = s.progress.get(args.code)
           s.progress.update(args.code, { flags: [...new Set([...(p?.flags ?? []), args.flag])] })
@@ -778,7 +790,8 @@ export function apply(ctx: Context): void {
 
   register(defineTool({
     name: 'xiaochang_hint',
-    description: 'Fetch the official hint (deducts ~10% of the challenge score per hint; capped per challenge). Returns the hint text.',
+    description:
+      'Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v7.4 gate: refused until the challenge has gone through ≥1 R2 re-fanout (ideaRound≥2) AND has ≥1 filtered failure (provider-outage failures excluded) — hint is the last resort after escalation, never a shortcut. The deduction is reported loudly and the platform\'s cumulative_score is the authoritative account.',
     parameters: { code: { type: 'string', required: true } },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
@@ -790,12 +803,20 @@ export function apply(ctx: Context): void {
       const s = requireState()
       const used = s.hintLedger.get(args.code)?.hints ?? 0
       if (used >= s.maxHints) return 'xiaochang_hint: hint cap reached'
+      // v7.4 时机门禁: hint 是扣分的最后手段——必须先走过 R2 二次征集且已有过滤后失败
+      // (V1 实锤: 两条 hint 吃掉 180 分, agent 还浑然不知)。
+      const vq = s.v2[args.code]
+      const ff = filteredFailedOf(args.code, campaign)
+      const gate = hintGate({ ideaRound: vq?.ideaRound ?? 1, filteredFailed: ff.failed })
+      if (!gate.allowed) {
+        return `xiaochang_hint: 拒绝(hint 扣该题分值, 是 R2+失败后的最后手段): ${gate.missing.join('; ')}。当前该题 hint 已用 ${used}/${s.maxHints}、已扣 ${s.hintLedger.get(args.code)?.deducted ?? 0} 分。`
+      }
       const ch = s.challenges.get(args.code)
       const raw = await s.adapter.hint(args.code) as { hint?: string | null }
       const hint = raw.hint
       if (hint === null || hint === undefined || hint === '') return 'xiaochang_hint: no hint available'
-      s.hintLedger.record(args.code, ch?.total_score ?? 100, 'main-agent requested')
-      return `hint (${used + 1}/${s.maxHints} used): ${hint}`
+      const cost = s.hintLedger.record(args.code, ch?.total_score ?? 100, 'main-agent requested')
+      return `hint (${used + 1}/${s.maxHints} used): ${hint}\n⚠️ 本次看提示已扣该题约 ${cost} 分(该题累计已扣 ${s.hintLedger.get(args.code)?.deducted ?? cost}, 全局累计 ${s.hintLedger.totalDeducted()})——满分账里要扣掉; 权威分以 submit 回执的 cumulative_score / xiaochang_list 的 platformScore 为准。`
     },
   }))
 
@@ -907,6 +928,9 @@ export function apply(ctx: Context): void {
         const timeout = Math.round(s.roundTimeoutMs * factor)
         const last = v.lastProgressAt ?? v.dispatchedAt
         if (last === undefined || now - last < timeout) continue
+        // v7.5: 超时判负前真杀——账本级超时 ≠ 进程已停, 执行者可能还在烧 token。
+        try { await c().interruptItem?.(v.item.id) } catch { /* 中断失败不阻断判负 */ }
+        audit(s.auditPath, { type: 'interrupt', id: v.item.id, code: codeOf(v.item.id), reason: 'round timeout' })
         c().report(v.item.id, 'failed', 'round timeout')
         s.processed.add(baseId(v.item.id))
       }
@@ -1001,6 +1025,11 @@ export function apply(ctx: Context): void {
       for (const v of c().ledger.views()) {
         if (codeOf(v.item.id) === args.code
           && (v.state === 'queued' || v.state === 'dispatched' || v.state === 'help' || v.state === 'stalled')) {
+          // v7.5: 剪枝前真杀在途执行者——题已解(终态), 同题执行者继续跑就是空烧 token。
+          if (v.state !== 'queued') {
+            try { await c().interruptItem?.(v.item.id) } catch { /* 中断失败不阻断剪枝 */ }
+            audit(s.auditPath, { type: 'interrupt', id: v.item.id, code: args.code, reason: `challenge ${verdict}` })
+          }
           try { c().cancel(v.item.id, `challenge ${verdict}: ${args.reason ?? ''}`) } catch { /* 终态竞争 */ }
         }
       }
@@ -1111,10 +1140,10 @@ ${gaps}
   register(defineTool({
     name: 'xiaochang_fork',
     description:
-      'F33 fork alarm: you (executor) report branches with an explicit status — "untaken" (default): promising branch not taken, worth dispatching (goes to ledger ④ + inbox + wakes the main agent immediately); "dead-end": a path you PROVED infeasible (403/impossible/verified-fail) — archived silently to ledger ② only, no inbox, no wake, no dispatch impulse. The main agent alone decides whether to dispatch. v7.1: untaken forks of already-terminal challenges are archived as knowledge only.',
+      'F33 fork alarm: you (executor) report branches with an explicit status — "untaken" (default): promising branch not taken, worth dispatching (goes to ledger ④ + the fork inbox; the main agent is woken by xiaochang_wait polling the inbox — NO direct interrupt, forks are collected in the main agent\'s normal rhythm); "dead-end": a path you PROVED infeasible (403/impossible/verified-fail) — archived silently to ledger ② only, no inbox, no wake, no dispatch impulse. v7.1: untaken forks of already-terminal challenges are archived silently. v7.4: duplicate paths already in the inbox are skipped at the source.',
     parameters: {
       code: { type: 'string', required: true },
-      forks: { type: 'array', required: true, description: '[{path, conclusion, evidence, status}] — status: "untaken" (default, 未走分叉→④+唤醒主 agent) | "dead-end" (已证死路→只进②不可行教训, 不唤醒不派兵).' },
+      forks: { type: 'array', required: true, description: '[{path, conclusion, evidence, status}] — status: "untaken" (default, 未走分叉→④+信箱, 主 agent 经 xiaochang_wait 唤醒) | "dead-end" (已证死路→只进②, 不唤醒不派兵).' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => true,
@@ -1124,41 +1153,39 @@ ${gaps}
       const deadEnds = args.forks.filter(f => f.status === 'dead-end')
       const untaken = args.forks.filter(f => f.status !== 'dead-end')
       const deadLines = deadEnds.map(fmt)
-      const forkLines = untaken.map(fmt)
       // v7.2 dead-end 语义位: 死路只进②不可行教训(静默)——不信箱/不唤醒/不进④, 账本不再双写。
       if (deadEnds.length > 0) {
         const de: KnowledgeIn[] = deadEnds.map(f => ({ kind: 'dead-end', path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: 'fork', at: Date.now() }))
         try { recordKnowledgeOnCode(args.code, de) } catch { /* 入账失败不阻断 */ }
         try { appendKnowledgeFile(args.code, 'dead', deadLines) } catch { /* 账本文件失败不阻断 */ }
       }
-      // untaken: v7.1 终态抑制(同进程侧) + 信箱 + followup + ④。
+      // untaken: v7.4 B 源端去重(与信箱已有条目按 path 去重) + v7.1 终态抑制 + 信箱(唯一唤醒通道)。
       const terminalNow = progressTerminal(args.code)
-      const entries: KnowledgeIn[] = untaken.map(f => ({ kind: 'fork', path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: 'fork', at: Date.now() }))
+      let entries: KnowledgeIn[] = []
       let inbox = ''
-      if (untaken.length > 0 && !terminalNow) {
-        try { inbox = writeForkInbox(args.code, entries) } catch { /* 信箱写失败 */ }
-      }
-      if (entries.length > 0) {
-        try { recordKnowledgeOnCode(args.code, entries) } catch { /* 入账失败不阻断 */ }
-        try { appendKnowledgeFile(args.code, 'forks', forkLines) } catch { /* 账本文件失败不阻断 */ }
-      }
-      // followup 仅同进程可达(执行者会话里 parentAgent 不是主 agent, 跨进程不可达——
-      // 真正唤醒靠上面的信箱+wait 轮询)。
-      const sameProcess = parentAgent !== undefined && campaign !== undefined
-      if (sameProcess && entries.length > 0 && !terminalNow) {
-        parentAgent?.followup(createUserMessage({
-          content: [{ type: 'text', text: `🔀 分叉即时报(${args.code}): 发现 ${entries.length} 条未走分叉, 已入账+信箱。由你(主 agent)决定是否 jisi_fanout_bulk / xiaochang_enqueue 增兵。\n${forkLines.map(l => `- 🔀 ${l}`).join('\n')}` }],
-          source: { kind: 'user' },
-        }))
+      let skipped = 0
+      if (untaken.length > 0) {
+        const existingPaths: string[] = []
+        try { existingPaths.push(...readForkInbox(args.code).map(k => k.path)) } catch { /* 信箱读失败按空处理 */ }
+        const fresh = dedupeForkPaths(existingPaths, untaken)
+        skipped = untaken.length - fresh.length
+        entries = fresh.map(f => ({ kind: 'fork', path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: 'fork', at: Date.now() }))
+        if (entries.length > 0 && !terminalNow) {
+          try { inbox = writeForkInbox(args.code, entries) } catch { /* 信箱写失败 */ }
+        }
+        if (entries.length > 0) {
+          try { recordKnowledgeOnCode(args.code, entries) } catch { /* 入账失败不阻断 */ }
+          try { appendKnowledgeFile(args.code, 'forks', entries.map(f => fmt(f))) } catch { /* 账本文件失败不阻断 */ }
+        }
       }
       const parts: string[] = []
       if (deadEnds.length > 0) parts.push(`死路 ${deadEnds.length} 条已静默入账②(不唤醒不派兵)`)
+      if (skipped > 0) parts.push(`重复 path ${skipped} 条已在信箱中, 源端跳过(不重复上报)`)
       if (entries.length > 0) {
-        parts.push(inbox !== '' ? `未走分叉 ${entries.length} 条已写信箱(${inbox}), 主 agent 的 xiaochang_wait 会被唤醒` : '未走分叉: 信箱未写(终态抑制或写入失败)')
-        if (sameProcess && !terminalNow) parts.push('同进程已直接入账并唤醒')
+        parts.push(inbox !== '' ? `未走分叉 ${entries.length} 条已写入信箱(${inbox})——主 agent 的 xiaochang_wait 轮询到即唤醒, 不打断其当前 turn` : '未走分叉: 信箱未写(终态抑制或写入失败)')
         if (terminalNow) parts.push('题已终态: 仅存档入账, 未写信箱/未唤醒(不派兵)')
       }
-      return `fork ${parts.join('; ') || 'nothing to record'}:\n${[...deadLines.map(l => `- ❌${l}`), ...forkLines.map(l => `- 🔀${l}`)].join('\n')}`
+      return `fork ${parts.join('; ') || 'nothing to record'}:\n${[...deadLines.map(l => `- ❌${l}`), ...entries.map(f => `- 🔀${fmt(f)}`)].join('\n')}`
     },
   }))
 
@@ -1310,6 +1337,7 @@ ${gaps}
         `campaign: open=${count(v => v.state === 'dispatched' || v.state === 'help')} queued=${count(v => v.state === 'queued')} done=${count(v => v.state === 'done')} failed=${count(v => v.state === 'failed')} blocked=${count(v => v.state === 'blocked')}`,
         `resourceClasses: ${usageTxt}`,
         `budgetRemainingMin=${Math.round(remaining / 60000)}`,
+        `platformScore=${s.platformScore ?? 'n/a'}${s.platformScore !== undefined ? '(权威, 含 hint 扣分)' : ''}`,
         `openContainers=${[...openContainers(s)].join(',') || 'none'}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
         `progress: ${progress}`, escTxt,
@@ -1361,18 +1389,17 @@ ${gaps}
               .join('|')
           } catch { return '' }
         }
-        // v7.1 终态抑制: 终态题的 fork 吸收归档(不唤醒); 返回是否存在**非终态**题的 fork。
+        // v7.1/v7.4 终态抑制 + 唤醒即清账: 信箱里每条 fork 吸收归档(终态题静默, 活跃题唤醒一次——
+        // 吸收先于唤醒, 同一 fork 一生只唤醒一次, 不复读(定向验证局实锤的"未消费重复唤醒"由此根治);
+        // 返回是否存在**非终态**题的 fork(决定是否唤醒)。
         const evaluateInbox = (): boolean => {
           try {
-            if (!existsSync(inboxDir)) return false // 信箱尚未创建 = 无分叉(2026-09-15 定向验证实锤: 缺此判断时 ENOENT 走 catch→true, 每次 wait 都假唤醒)
+            if (!existsSync(inboxDir)) return false // 信箱尚未创建 = 无分叉
             let live = false
             for (const f of readdirSync(inboxDir).filter(f => f.endsWith('.jsonl'))) {
               const code = f.replace(/\.jsonl$/, '')
-              if (progressTerminal(code)) {
-                try { absorbForkInbox(code) } catch { /* 归档失败: 下次再试 */ }
-              } else {
-                live = true
-              }
+              if (!progressTerminal(code)) live = true
+              try { absorbForkInbox(code) } catch { /* 吸收失败: 文件仍在, 下次再试(可能重复唤醒, 可接受兜底) */ }
             }
             return live
           } catch { return true } // 真读盘错误: 保守唤醒
@@ -1454,7 +1481,7 @@ ${gaps}
           clock = `⚠️ 平台停表调用失败：${String(error)} —— 排名钟仍在走，请重试 xiaochang_finish`
         }
       }
-      return `xiaochang_finish: score=${score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ', ALL TERMINAL' : ''})\n排名钟：${clock}${guardMarker}`
+      return `xiaochang_finish: score=${s.platformScore ?? score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ', ALL TERMINAL' : ''}${s.platformScore !== undefined ? ', 平台权威分' : ', 本地估算分'})\n排名钟：${clock}${guardMarker}`
     },
   }))
 }

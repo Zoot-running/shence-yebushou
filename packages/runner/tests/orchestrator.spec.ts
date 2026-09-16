@@ -12,6 +12,8 @@ import {
   codeOf,
   knowledgeSkeleton,
   parseObservations,
+  dedupeForkPaths,
+  hintGate,
   replaceKnowledgeSection,
   resolveExecutor,
   resourceClassOf,
@@ -192,5 +194,38 @@ describe('knowledge file (v7 四节账本, 纯函数)', () => {
     const stripped = s0.split('\n').filter(l => !l.startsWith('## ②')).join('\n')
     const s1 = appendKnowledgeSection(stripped, 'dead', ['X'])
     expect(s1).toContain('## ② 不可行教训\n- X')
+  })
+})
+
+describe('v7.4 hintGate (hint 时机门禁)', () => {
+  it('refuses before R2 (ideaRound<2)', () => {
+    const g = hintGate({ ideaRound: 1, filteredFailed: 5 })
+    expect(g.allowed).toBe(false)
+    expect(g.missing.length).toBe(1)
+    expect(g.missing[0]).toContain('R2')
+  })
+  it('refuses without filtered failures', () => {
+    const g = hintGate({ ideaRound: 3, filteredFailed: 0 })
+    expect(g.allowed).toBe(false)
+    expect(g.missing[0]).toContain('失败')
+  })
+  it('allows only after R2 AND ≥1 filtered failure', () => {
+    expect(hintGate({ ideaRound: 2, filteredFailed: 1 }).allowed).toBe(true)
+    expect(hintGate({ ideaRound: 2, filteredFailed: 0 }).allowed).toBe(false)
+    expect(hintGate({ ideaRound: 1, filteredFailed: 1 }).allowed).toBe(false)
+  })
+})
+
+describe('v7.4 dedupeForkPaths (fork 源端去重)', () => {
+  it('drops paths already in the inbox, keeps new ones', () => {
+    const out = dedupeForkPaths(['SSO 绕过'], [
+      { path: 'SSO 绕过' },
+      { path: 'OA 注入' },
+      { path: 'OA 注入' },
+    ])
+    expect(out.map(e => e.path)).toEqual(['OA 注入'])
+  })
+  it('keeps everything when inbox is empty', () => {
+    expect(dedupeForkPaths([], [{ path: 'A' }, { path: 'B' }]).map(e => e.path)).toEqual(['A', 'B'])
   })
 })
