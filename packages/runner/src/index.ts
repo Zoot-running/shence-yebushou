@@ -710,13 +710,19 @@ export function apply(ctx: Context): void {
       let warmup = ''
       if (progress.all().length === 0 && jisi?.fanoutNotify !== undefined) {
         try {
-          const models = ['deepseek-flash']
+          const allowModel = (m: string): boolean => s.modelWhitelist.length === 0 || s.modelWhitelist.includes(m)
           const tickets: string[] = []
+          let hardMulti = 0
           for (const ch of fresh) {
+            // v7.9 暖账分层: hard(≥700 分) 自动加 glm-5.3 一路(公开 CyberGym 先验 84.5), easy/medium 一路 flash。
+            const models = (ch.total_score ?? 0) >= 700
+              ? ['deepseek-flash', 'glm-5.3'].filter(allowModel)
+              : ['deepseek-flash'].filter(allowModel)
+            if (models.length > 1) hardMulti += 1
             const ticket = jisi.fanoutNotify(agent, { prompt: buildWarmupPrompt(ch) }, models)
             tickets.push(ticket.id)
           }
-          warmup = `, 暖账 fanout 已发 ${tickets.length} 路(模型=${models.join(',')}, 报告按信封到达请照常裁决——**暖账已覆盖全题, 无需再 jisi_fanout_bulk 全量发; 只对 hard/卡题加模型补征**)`
+          warmup = `, 暖账 fanout 已发 ${tickets.length} 路(hard 题 ${hardMulti} 道为 flash+glm-5.3 双路, 其余 flash 单路; 报告按信封到达请照常裁决——**暖账已覆盖全题, 无需再 jisi_fanout_bulk 全量发; 只对 hard/卡题加模型补征**)`
         } catch { warmup = ', 暖账 fanout 发送失败(可手动 jisi_fanout_bulk 全量征集)' }
       }
       return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), containerSlots=${args.containerSlots ?? 3}, budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}${warmup}`
@@ -1103,6 +1109,14 @@ export function apply(ctx: Context): void {
         // v7.5: 超时判负前真杀——账本级超时 ≠ 进程已停, 执行者可能还在烧 token。
         try { await c().interruptItem?.(v.item.id) } catch { /* 中断失败不阻断判负 */ }
         audit(s.auditPath, { type: 'interrupt', id: v.item.id, code: codeOf(v.item.id), reason: 'round timeout' })
+        // v7.9: 僵尸排队位收口——该 code 除本项外已无其他在途执行者时, 摘除它在容器队列的排队位
+        // (否则槽空后会把容器授给已死的执行者; 若还有活人同题等待, 不摘——容器留给活人)。
+        const timedCode = codeOf(v.item.id)
+        const hasOthers = c().ledger.views().some(x => x.item.id !== v.item.id && codeOf(x.item.id) === timedCode
+          && (x.state === 'dispatched' || x.state === 'help' || x.state === 'stalled'))
+        if (!hasOthers) {
+          try { s.containerQueue?.evict(timedCode, 'last executor timed out') } catch { /* 摘位失败不阻断 */ }
+        }
         c().report(v.item.id, 'failed', 'round timeout')
         s.processed.add(baseId(v.item.id))
       }

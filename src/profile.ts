@@ -10,6 +10,8 @@ export interface OrgFact {
   kind: FactKind
   note: string
   confidence?: 'confirmed' | 'likely'
+  /** v7.9: 机制自动盖的时间戳(追加顺序=权威序, 后者覆盖前者)——不靠子代理自标记。 */
+  at?: number
 }
 
 export interface OrgProfile {
@@ -30,10 +32,11 @@ export function addFact(profile: OrgProfile, fact: OrgFact): OrgProfile {
   if (existing !== undefined) {
     // 已有事实：升级为 confirmed（若有新证据），更新时间戳。
     if (fact.confidence === 'confirmed') existing.confidence = 'confirmed'
+    existing.at = Date.now() // v7.9: 时间戳随新证据刷新——"后者覆盖前者"由 at 排序体现。
     profile.observedAt = Date.now()
     return profile
   }
-  profile.facts.push({ ...fact, confidence: fact.confidence ?? 'likely' })
+  profile.facts.push({ ...fact, confidence: fact.confidence ?? 'likely', at: Date.now() })
   profile.observedAt = Date.now()
   return profile
 }
@@ -47,6 +50,11 @@ export function render(profile: OrgProfile): string {
     `observed_at: ${new Date(profile.observedAt).toISOString()}`,
     '---',
     `# 组织画像：${profile.org}`,
+    '',
+    '> 本文件规则(机制保证, 勿违反):',
+    '> 1. **同主题多条记录, 后者覆盖前者**——以最新一条为准(按时间倒序排列, 最新在最上);',
+    '> 2. 路径/脚本类记录使用前先 ls 验证存在性(文件可能已被换名/删除);',
+    '> 3. 每条记录的时间戳由机制自动盖, 无需你标注来源。',
     '',
   ]
   const byKind = new Map<FactKind, OrgFact[]>()
@@ -68,8 +76,10 @@ export function render(profile: OrgProfile): string {
     const facts = byKind.get(kind)
     if (facts === undefined) continue
     lines.push(`## ${kindNames[kind]}`)
-    for (const fact of facts) {
-      lines.push(`- ${fact.note}${fact.confidence === 'confirmed' ? '（已确认）' : ''}`)
+    // v7.9: 时间倒序渲染——最新在最上, "后者覆盖前者"由排序自然体现(零遍历标记旧记录)。
+    const ordered = [...facts].sort((a, b) => (b.at ?? 0) - (a.at ?? 0))
+    for (const fact of ordered) {
+      lines.push(`- ${fact.note}${fact.confidence === 'confirmed' ? '（已确认）' : ''}${fact.at !== undefined ? ` [${new Date(fact.at).toISOString().slice(0, 16).replace('T', ' ')}]` : ''}`)
     }
     lines.push('')
   }
@@ -109,11 +119,20 @@ export function parse(content: string): OrgProfile {
     }
     if (line.startsWith('- ') && currentKind !== undefined) {
       const note = line.slice(2)
-      const confirmed = note.endsWith('（已确认）')
+      // v7.9: 剥离机制时间戳后缀 [YYYY-MM-DD HH:MM](若有), 时间戳回填 at。
+      const m = note.match(/^(.*?)\s\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]$/)
+      const raw = m !== null ? m[1]! : note
+      let at: number | undefined
+      if (m !== null) {
+        const parsedAt = Date.parse(m[2]!.replace(' ', 'T') + ':00Z')
+        if (!Number.isNaN(parsedAt)) at = parsedAt
+      }
+      const confirmed = raw.endsWith('（已确认）')
       profile.facts.push({
         kind: currentKind,
-        note: confirmed ? note.slice(0, -5) : note,
+        note: confirmed ? raw.slice(0, -5) : raw,
         confidence: confirmed ? 'confirmed' : 'likely',
+        ...(at !== undefined ? { at } : {}),
       })
     }
   }

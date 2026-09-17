@@ -50,10 +50,11 @@ function addFact(profile, fact) {
   const existing = profile.facts.find((f) => f.kind === fact.kind && f.note === fact.note);
   if (existing !== void 0) {
     if (fact.confidence === "confirmed") existing.confidence = "confirmed";
+    existing.at = Date.now();
     profile.observedAt = Date.now();
     return profile;
   }
-  profile.facts.push({ ...fact, confidence: fact.confidence ?? "likely" });
+  profile.facts.push({ ...fact, confidence: fact.confidence ?? "likely", at: Date.now() });
   profile.observedAt = Date.now();
   return profile;
 }
@@ -65,6 +66,11 @@ function render(profile) {
     `observed_at: ${new Date(profile.observedAt).toISOString()}`,
     "---",
     `# \u7EC4\u7EC7\u753B\u50CF\uFF1A${profile.org}`,
+    "",
+    "> \u672C\u6587\u4EF6\u89C4\u5219(\u673A\u5236\u4FDD\u8BC1, \u52FF\u8FDD\u53CD):",
+    "> 1. **\u540C\u4E3B\u9898\u591A\u6761\u8BB0\u5F55, \u540E\u8005\u8986\u76D6\u524D\u8005**\u2014\u2014\u4EE5\u6700\u65B0\u4E00\u6761\u4E3A\u51C6(\u6309\u65F6\u95F4\u5012\u5E8F\u6392\u5217, \u6700\u65B0\u5728\u6700\u4E0A);",
+    "> 2. \u8DEF\u5F84/\u811A\u672C\u7C7B\u8BB0\u5F55\u4F7F\u7528\u524D\u5148 ls \u9A8C\u8BC1\u5B58\u5728\u6027(\u6587\u4EF6\u53EF\u80FD\u5DF2\u88AB\u6362\u540D/\u5220\u9664);",
+    "> 3. \u6BCF\u6761\u8BB0\u5F55\u7684\u65F6\u95F4\u6233\u7531\u673A\u5236\u81EA\u52A8\u76D6, \u65E0\u9700\u4F60\u6807\u6CE8\u6765\u6E90\u3002",
     ""
   ];
   const byKind = /* @__PURE__ */ new Map();
@@ -86,8 +92,9 @@ function render(profile) {
     const facts = byKind.get(kind);
     if (facts === void 0) continue;
     lines.push(`## ${kindNames[kind]}`);
-    for (const fact of facts) {
-      lines.push(`- ${fact.note}${fact.confidence === "confirmed" ? "\uFF08\u5DF2\u786E\u8BA4\uFF09" : ""}`);
+    const ordered = [...facts].sort((a, b) => (b.at ?? 0) - (a.at ?? 0));
+    for (const fact of ordered) {
+      lines.push(`- ${fact.note}${fact.confidence === "confirmed" ? "\uFF08\u5DF2\u786E\u8BA4\uFF09" : ""}${fact.at !== void 0 ? ` [${new Date(fact.at).toISOString().slice(0, 16).replace("T", " ")}]` : ""}`);
     }
     lines.push("");
   }
@@ -125,11 +132,19 @@ function parse(content) {
     }
     if (line.startsWith("- ") && currentKind !== void 0) {
       const note = line.slice(2);
-      const confirmed = note.endsWith("\uFF08\u5DF2\u786E\u8BA4\uFF09");
+      const m = note.match(/^(.*?)\s\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]$/);
+      const raw = m !== null ? m[1] : note;
+      let at;
+      if (m !== null) {
+        const parsedAt = Date.parse(m[2].replace(" ", "T") + ":00Z");
+        if (!Number.isNaN(parsedAt)) at = parsedAt;
+      }
+      const confirmed = raw.endsWith("\uFF08\u5DF2\u786E\u8BA4\uFF09");
       profile.facts.push({
         kind: currentKind,
-        note: confirmed ? note.slice(0, -5) : note,
-        confidence: confirmed ? "confirmed" : "likely"
+        note: confirmed ? raw.slice(0, -5) : raw,
+        confidence: confirmed ? "confirmed" : "likely",
+        ...at !== void 0 ? { at } : {}
       });
     }
   }
@@ -1028,13 +1043,16 @@ function apply(ctx) {
       let warmup = "";
       if (progress.all().length === 0 && jisi?.fanoutNotify !== void 0) {
         try {
-          const models = ["deepseek-flash"];
+          const allowModel = (m) => s.modelWhitelist.length === 0 || s.modelWhitelist.includes(m);
           const tickets = [];
+          let hardMulti = 0;
           for (const ch of fresh) {
+            const models = (ch.total_score ?? 0) >= 700 ? ["deepseek-flash", "glm-5.3"].filter(allowModel) : ["deepseek-flash"].filter(allowModel);
+            if (models.length > 1) hardMulti += 1;
             const ticket = jisi.fanoutNotify(agent, { prompt: buildWarmupPrompt(ch) }, models);
             tickets.push(ticket.id);
           }
-          warmup = `, \u6696\u8D26 fanout \u5DF2\u53D1 ${tickets.length} \u8DEF(\u6A21\u578B=${models.join(",")}, \u62A5\u544A\u6309\u4FE1\u5C01\u5230\u8FBE\u8BF7\u7167\u5E38\u88C1\u51B3\u2014\u2014**\u6696\u8D26\u5DF2\u8986\u76D6\u5168\u9898, \u65E0\u9700\u518D jisi_fanout_bulk \u5168\u91CF\u53D1; \u53EA\u5BF9 hard/\u5361\u9898\u52A0\u6A21\u578B\u8865\u5F81**)`;
+          warmup = `, \u6696\u8D26 fanout \u5DF2\u53D1 ${tickets.length} \u8DEF(hard \u9898 ${hardMulti} \u9053\u4E3A flash+glm-5.3 \u53CC\u8DEF, \u5176\u4F59 flash \u5355\u8DEF; \u62A5\u544A\u6309\u4FE1\u5C01\u5230\u8FBE\u8BF7\u7167\u5E38\u88C1\u51B3\u2014\u2014**\u6696\u8D26\u5DF2\u8986\u76D6\u5168\u9898, \u65E0\u9700\u518D jisi_fanout_bulk \u5168\u91CF\u53D1; \u53EA\u5BF9 hard/\u5361\u9898\u52A0\u6A21\u578B\u8865\u5F81**)`;
         } catch {
           warmup = ", \u6696\u8D26 fanout \u53D1\u9001\u5931\u8D25(\u53EF\u624B\u52A8 jisi_fanout_bulk \u5168\u91CF\u5F81\u96C6)";
         }
@@ -1402,6 +1420,14 @@ ${manifest.join("\n")}`;
         } catch {
         }
         audit(s.auditPath, { type: "interrupt", id: v.item.id, code: codeOf(v.item.id), reason: "round timeout" });
+        const timedCode = codeOf(v.item.id);
+        const hasOthers = c().ledger.views().some((x) => x.item.id !== v.item.id && codeOf(x.item.id) === timedCode && (x.state === "dispatched" || x.state === "help" || x.state === "stalled"));
+        if (!hasOthers) {
+          try {
+            s.containerQueue?.evict(timedCode, "last executor timed out");
+          } catch {
+          }
+        }
         c().report(v.item.id, "failed", "round timeout");
         s.processed.add(baseId(v.item.id));
       }
