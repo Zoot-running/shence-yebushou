@@ -369,3 +369,28 @@ export function truncateDirective(text: string, max: number): TruncateResult {
   const cutTail = text.slice(max, max + 60)
   return { text: `${head}…(方向段已截断)`, truncated: true, cutAt: max, cutTail }
 }
+
+// ── v7.8: 开局饱和机制(暖账 fanout / 附件判定 / 下载候选路径, 纯函数) ─────
+
+/** 开局暖账征集 prompt(机制生成, 不靠主 agent 手写)。 */
+export function buildWarmupPrompt(ch: { unique_code: string; description?: string; difficulty?: string; total_score?: number }): string {
+  return [
+    `[开局暖账征集] 题目 ${ch.unique_code}(${ch.difficulty ?? 'unknown'}, ${ch.total_score ?? '?'}分): 只要方向/打点, 不要完整解法。`,
+    `题面: ${(ch.description ?? '').slice(0, 800)}`,
+    '输出: 2-3 条候选思路, 每条 = 打哪(攻击面) + 为什么可行 + 怎么验证; 注明题目类型判断。',
+  ].join('\n')
+}
+
+/** 附件题判定(宽松: 描述提到附件/源码文件/下载 → 大概率有本地工件)。 */
+export function attachmentLikely(description?: string): boolean {
+  return /(附件|源码|源代码|source|下载|\.zip|\.tar|\.gz|\.py\b|\.txt\b|\.png\b|\.pcap\b)/i.test(description ?? '')
+}
+
+/** 附件下载候选路径(容器 HTTP 服务的常见约定; 全 miss 时留给执行者手工处理)。 */
+export function attachmentFetchCandidates(code: string): string[] {
+  const safe = code.replace(/-/g, '')
+  return [
+    `/att/${code}/`, `/att/${safe}/`, `/attachments/${code}/`, `/files/${code}.zip`,
+    `/download/${code}`, `/download`, `/files/`, `/`,
+  ]
+}

@@ -7,7 +7,10 @@ import { describe, expect, it } from 'vitest'
 import {
   RunProgress,
   appendKnowledgeSection,
+  attachmentFetchCandidates,
+  attachmentLikely,
   baseId,
+  buildWarmupPrompt,
   cleanRoomGate,
   codeOf,
   knowledgeSkeleton,
@@ -245,5 +248,25 @@ describe('v7.6 truncateDirective (方向段截断+反馈)', () => {
     expect(r.text.length).toBeLessThan(730)
     expect(r.text).toContain('已截断')
     expect(r.cutTail).toBe('A'.repeat(60))
+  })
+})
+
+describe('v7.8 开局饱和 helpers', () => {
+  it('buildWarmupPrompt includes code/difficulty/score and asks for directions only', () => {
+    const p = buildWarmupPrompt({ unique_code: 'a-01', description: '某系统', difficulty: 'easy', total_score: 300 })
+    expect(p).toContain('a-01')
+    expect(p).toContain('easy')
+    expect(p).toContain('300')
+    expect(p).toContain('方向/打点')
+  })
+  it('attachmentLikely detects 附件/源码/下载 keywords, ignores plain container text', () => {
+    expect(attachmentLikely('下载附件, 里面是 source.py 与 output.txt')).toBe(true)
+    expect(attachmentLikely('某企业官网入口 /b02/ 目录')).toBe(false)
+    expect(attachmentLikely(undefined)).toBe(false)
+  })
+  it('attachmentFetchCandidates returns container-relative paths', () => {
+    const c = attachmentFetchCandidates('g-25')
+    expect(c.some(p => p.includes('g-25') || p.includes('g25'))).toBe(true)
+    expect(c).toContain('/download')
   })
 })

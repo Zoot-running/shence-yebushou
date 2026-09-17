@@ -8,6 +8,7 @@
 - benchmarkToken: mock-benchmark-token
 - vpnGateway: http://127.0.0.1:8399/health
 - defaultModel: deepseek-v4-flash, defaultEffort: low, modelLock: false, budgetMinutes: 40, maxHintsPerChallenge: 1
+- modelWhitelist: "deepseek-v4-flash,deepseek-flash"(v7.8: 本局网关只通 deepseek, 自动 R2/派单校验不拉 kimi/glm)
 - 本局没有 runId/runBearerToken, 不要传。
 
 调度纪律(与托管局相同, 规模缩小):

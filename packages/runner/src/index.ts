@@ -18,7 +18,10 @@ import { coverageOf } from '../../../src/attack-surfaces.ts'
 import {
   RunProgress,
   appendKnowledgeSection,
+  attachmentFetchCandidates,
+  attachmentLikely,
   baseId,
+  buildWarmupPrompt,
   cleanRoomGate,
   codeOf,
   dedupeForkPaths,
@@ -101,6 +104,7 @@ interface HufuHolderLike {
     release(): Promise<void>
     evict(holderId: string, reason: string): boolean
     waiters(): Array<{ holderId: string; position: number }>
+    grantedCount?(): number
   }
 }
 
@@ -148,6 +152,8 @@ interface SetupArgs {
   modelLock?: boolean
   /** v7: 容器题并发槽位(平台容器上限)。默认 3。 */
   containerSlots?: number
+  /** v7.8: 模型白名单(逗号分隔字符串或省略)——空=不限制; 本地干跑局传 deepseek 系(网关不可达的模型不进自动 R2/派单校验)。 */
+  modelWhitelist?: string
 }
 
 /** 每题 v2 状态(第 0/3 层)。 */
@@ -224,6 +230,10 @@ interface CampaignState {
   platformScore?: number
   /** v7.6: 容器资源队列(虎符原语, 校场注入平台判定)。 */
   containerQueue?: Awaited<ReturnType<NonNullable<HufuHolderLike['resourceQueue']>>>
+  /** v7.8: 每 code 单调派单计数器(item id 唯一性归机制——同 round 重派不再吞单)。 */
+  enqCounters: Map<string, number>
+  /** v7.8: 模型白名单(空 = 不限制; 本地干跑可配 deepseek 系)。 */
+  modelWhitelist: string[]
 }
 
 let state: CampaignState | undefined
@@ -554,6 +564,7 @@ export function apply(ctx: Context): void {
       defaultEffort: { type: 'string', description: 'Executor default reasoning effort. Default low.' },
       modelLock: { type: 'boolean', description: 'Lock: force ALL executors to defaultModel/defaultEffort, ignoring per-item overrides (user/parent-agent override). Default false (main agent may switch models per item).' },
       containerSlots: { type: 'number', description: 'v7 container-challenge concurrency slots (platform container cap). Default 3; attachment challenges are never constrained by this.' },
+      modelWhitelist: { type: 'string', description: 'v7.8 model whitelist (comma-separated; empty = no restriction). Local dry runs should pass deepseek models — unreachable models are excluded from auto-R2 and enqueue validation.' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
@@ -618,6 +629,8 @@ export function apply(ctx: Context): void {
         },
         containerSlots: args.containerSlots ?? 3,
         platformScore: undefined,
+        enqCounters: new Map(),
+        modelWhitelist: (args.modelWhitelist ?? []).filter(m => m !== ''),
       }
       try {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
@@ -643,8 +656,10 @@ export function apply(ctx: Context): void {
           stallAfterMs: s.roundTimeoutMs + 10 * 60_000,
           heartbeatMs: 15 * 60_000,
           budgetMs: s.budgetMs,
-          // v7 类闸: 容器题受平台容器上限(默认 3), 附件题全并行(继承全局 concurrency)。
-          resourceLimits: { container: args.containerSlots ?? 3, local: s.concurrency },
+          // v7 类闸: 附件题全并行(继承全局 concurrency)。
+          // v7.8: 容器题不再在 dispatch 层限 3——3 槽是"容器启动数"约束, 由资源队列在 start 层管;
+          // dispatch 层限 3 会把全战役并行掐成 3 车道(run 19097 实锤: 每题首派被拖 90 分钟)。
+          resourceLimits: { local: s.concurrency },
         }, [], { id: stableId, boardNamespace: `${args.runId ?? 'pending'}` })
         campaign = created.campaign
         campaignId = created.id
@@ -690,7 +705,21 @@ export function apply(ctx: Context): void {
           }
         }
       } catch { /* v2 状态损坏: 重建 */ }
-      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), containerSlots=${args.containerSlots ?? 3}, budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}`
+      // v7.8: 开局暖账(fresh run 才发)——机制化全量 fanout 把模型用满, 不靠主 agent 记得。
+      // 每路 prompt 由机制生成(题面+题型+难度, 只要方向/打点); 报告按 [fanout:票] 信封到达, 主 agent 照常裁决。
+      let warmup = ''
+      if (progress.all().length === 0 && jisi?.fanoutNotify !== undefined) {
+        try {
+          const models = ['deepseek-flash']
+          const tickets: string[] = []
+          for (const ch of fresh) {
+            const ticket = jisi.fanoutNotify(agent, { prompt: buildWarmupPrompt(ch) }, models)
+            tickets.push(ticket.id)
+          }
+          warmup = `, 暖账 fanout 已发 ${tickets.length} 路(模型=${models.join(',')}, 报告按信封到达请照常裁决——**暖账已覆盖全题, 无需再 jisi_fanout_bulk 全量发; 只对 hard/卡题加模型补征**)`
+        } catch { warmup = ', 暖账 fanout 发送失败(可手动 jisi_fanout_bulk 全量征集)' }
+      }
+      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), containerSlots=${args.containerSlots ?? 3}, budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}${warmup}`
     },
   }))
 
@@ -797,6 +826,67 @@ export function apply(ctx: Context): void {
     },
   }))
 
+  // ── v7.8 附件清道(一键, 零 LLM turn 的 开容器→下附件→关 循环) ──────
+  register(defineTool({
+    name: 'xiaochang_sweep_attachments',
+    description:
+      'v7.8 attachment sweep (one call): for every challenge whose description suggests an attachment, run the open-container → download → close-container cycle through the resource queue (zero-token slot waiting), saving artifacts to <cwd>/att/<code>/ and returning a per-challenge manifest. Candidate download paths are conventional guesses — misses are left to executors to handle manually. Call this ONCE early in the campaign (the order prescribes it); safe to re-call anytime.',
+    parameters: {},
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute() {
+      const s = requireState()
+      const targets = [...s.challenges.values()].filter(ch => attachmentLikely(ch.description))
+      const manifest: string[] = []
+      let downloaded = 0
+      for (const ch of targets) {
+        const code = ch.unique_code
+        try {
+          const res = (s.containerQueue !== undefined)
+            ? await s.containerQueue.acquire(code, { timeoutMs: 45_000 })
+            : { status: 'granted' as const }
+          if (res.status !== 'granted') {
+            manifest.push(`${code}: 容器排队 ${res.status === 'timeout' ? '超时' : '出队'}——留给执行者处理`)
+            continue
+          }
+          const fresh = await s.adapter.listChallenges()
+          for (const x of fresh) s.challenges.set(x.unique_code, x)
+          const addr = s.challenges.get(code)?.container_addr?.[0]
+          const dir = join(process.cwd(), 'att', code)
+          let saved = 0
+          if (addr !== undefined) {
+            try { mkdirSync(dir, { recursive: true }) } catch { /* 目录失败按无下载 */ }
+            for (const p of attachmentFetchCandidates(code)) {
+              try {
+                const ctrl = new AbortController()
+                const to = setTimeout(() => ctrl.abort(), 8000)
+                const r = await fetch(`http://${addr}${p}`, { signal: ctrl.signal })
+                clearTimeout(to)
+                if (!r.ok) continue
+                const buf = Buffer.from(await r.arrayBuffer())
+                if (buf.length < 16) continue
+                const ct = r.headers.get('content-type') ?? ''
+                const ext = /zip/.test(ct) ? '.zip' : /tar/.test(ct) ? '.tar' : /json/.test(ct) ? '.json' : /text/.test(ct) ? '.txt' : '.bin'
+                writeFileSync(join(dir, `sweep-${saved + 1}${ext}`), buf)
+                saved += 1
+              } catch { /* 单路径失败继续 */ }
+            }
+          }
+          try { await s.adapter.close(code) } catch { /* 平台侧已关 */ }
+          try { await s.containerQueue?.release() } catch { /* 释放失败不阻断 */ }
+          s.progress.update(code, { containerClosed: true })
+          downloaded += saved
+          manifest.push(`${code}: 下载 ${saved} 件${saved === 0 ? '(候选路径无命中, 留给执行者)' : ''}`)
+        } catch (error) {
+          manifest.push(`${code}: 处理失败 ${String(error)}`)
+        }
+      }
+      persistProgress(s)
+      audit(s.auditPath, { type: 'attachment-sweep', targets: targets.length, downloaded })
+      return `附件清道: 疑似附件题 ${targets.length} 道, 共下载 ${downloaded} 件工件到 <cwd>/att/<code>/。\n${manifest.join('\n')}`
+    },
+  }))
+
   register(defineTool({
     name: 'xiaochang_submit',
     description:
@@ -815,22 +905,37 @@ export function apply(ctx: Context): void {
       }
       const s = requireState()
       try {
-        const res = await s.adapter.submit(args.code, args.flag)
-        // v7.4: 平台权威累计分入库——满分判定/展示以此为准(不自算 total_score 累加, hint 扣分天然算清)。
-        if (typeof res.cumulative_score === 'number') s.platformScore = res.cumulative_score
-        if (res.correct) {
+        const recordWin = (flag: string): void => {
           const p = s.progress.get(args.code)
-          s.progress.update(args.code, { flags: [...new Set([...(p?.flags ?? []), args.flag])] })
+          s.progress.update(args.code, { flags: [...new Set([...(p?.flags ?? []), flag])] })
           persistProgress(s)
-          // 自动回记胜绩：终态输出里含该 flag 的执行者 → 集思能力账本记 execution win。
           const difficulty = s.challenges.get(args.code)?.difficulty ?? 'unknown'
           for (const v of c().ledger.views()) {
             if (v.state !== 'done' || codeOf(v.item.id) !== args.code) continue
             if (v.item.model === undefined) continue
-            if ((v.terminalDetail ?? '').includes(args.flag)) {
+            if ((v.terminalDetail ?? '').includes(flag)) {
               jisi?.ledger.record(v.item.model, 'execution', difficulty, true)
             }
           }
+        }
+        const res = await s.adapter.submit(args.code, args.flag)
+        // v7.4: 平台权威累计分入库——满分判定/展示以此为准(不自算 total_score 累加, hint 扣分天然算清)。
+        if (typeof res.cumulative_score === 'number') s.platformScore = res.cumulative_score
+        if (res.correct) {
+          recordWin(args.flag)
+          return JSON.stringify(res)
+        }
+        // v7.8: 提交口径自动回退——裸串被拒且题面口径疑似带壳时, 自动试一次 flag{...} 包装(干跑实锤: 口径歧义)。
+        const desc = s.challenges.get(args.code)?.description ?? ''
+        if (!args.flag.startsWith('flag{') && !args.flag.startsWith('HTB{') && !args.flag.startsWith('mock{') && /flag\{/.test(desc)) {
+          const wrapped = `flag{${args.flag}}`
+          const res2 = await s.adapter.submit(args.code, wrapped)
+          if (typeof res2.cumulative_score === 'number') s.platformScore = res2.cumulative_score
+          if (res2.correct) {
+            recordWin(wrapped)
+            return `裸串被拒, 自动回退包装提交成功: ${JSON.stringify(res2)}`
+          }
+          return `裸串被拒(${JSON.stringify(res)}); 包装回退也被拒(${JSON.stringify(res2)})——以平台判定为准, 换值或换题面口径`
         }
         return JSON.stringify(res)
       } catch (error) {
@@ -914,14 +1019,19 @@ export function apply(ctx: Context): void {
       // v7: 极简执行令框架(题面/入口/账本/画像/纪律由机制注入); 资源类自动按题类打, 可覆盖。
       const cls = args.resourceClass ?? resourceClassOf(ch)
       const label = buildExecFrame(args.code, trunc.text) + gapsTxt
-      const seq = s.progress.get(args.code)?.rounds ?? 0
-      const itemId = `${args.code}#s${args.round}-w${seq + 1}`
+      // v7.8: item id 唯一性归机制——per-code 单调计数器(同 round 重派不再吞单, 干跑实锤)。
+      const workNo = (s.enqCounters.get(args.code) ?? 0) + 1
+      s.enqCounters.set(args.code, workNo)
+      const itemId = `${args.code}#s${args.round}-w${workNo}`
       // 执行者模型/强度：主 agent 逐项覆盖优先，缺省兜底；模型锁定时强制缺省。
       const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy)
       // F8 护栏：模型必须出现在集思目录（能解析到 provider），否则拒绝入队——
       // 防"目录外模型"被静默送到默认 provider 后无声失败。
       if (jisi !== undefined) {
         const listed = await jisi.listModels()
+        if (s.modelWhitelist.length > 0 && !s.modelWhitelist.includes(executor.model)) {
+          return `xiaochang_enqueue: model ${executor.model} 不在本局白名单(${s.modelWhitelist.join(',')})——换白名单内模型`
+        }
         if (!listed.some(m => m.id === executor.model)) {
           return `xiaochang_enqueue: model ${executor.model} is not in the registered model catalog (jisi listModels) — pick a listed model`
         }
@@ -1163,14 +1273,17 @@ ${gaps}
   }
   /** v6: R2 选模(直接加模型, 未试过的优先)。 */
   const pickRefanoutModels = async (vq: { qtype: string; difficulty: number; triedModels: string[] }): Promise<string[]> => {
+    // v7.8: 白名单过滤——本地不可达模型不进自动 R2(干跑实锤: kimi/glm 子代理 failed 烧槽)。
+    const s = requireState()
+    const allow = (m: string): boolean => s.modelWhitelist.length === 0 || s.modelWhitelist.includes(m)
     if (jisi?.pickRank !== undefined) {
-      const ranked = await jisi.pickRank(vq.qtype, vq.difficulty, 'idea')
+      const ranked = (await jisi.pickRank(vq.qtype, vq.difficulty, 'idea')).filter(r => allow(r.model))
       const fresh = ranked.filter(r => !vq.triedModels.includes(r.model)).map(r => r.model)
       if (fresh.length > 0) return fresh.slice(0, 3)
       if (ranked.length > 0) return ranked.slice(0, 3).map(r => r.model)
     }
     const listed = await jisi?.listModels()
-    return (listed ?? []).map(m => m.id).slice(0, 3)
+    return (listed ?? []).map(m => m.id).filter(allow).slice(0, 3)
   }
 
   // ── v2 第 3 层: R2 二次征集(上下文带入 + 加模型) ────────────────
@@ -1406,13 +1519,34 @@ ${gaps}
       // v7 类闸可见性: 主 agent 一眼看清哪条资源线饱和。
       const usage = c().classUsage?.() ?? {}
       const usageTxt = Object.entries(usage).map(([cls, u]) => `${cls} ${u.open}/${u.limit}`).join(', ') || 'n/a'
+      // v7.8 资源盘点: 容器队列(启动/排队) + 未破题在途清单——饱和仪表, 不看 3 车道假饱和。
+      const q = s.containerQueue
+      const qLine = q !== undefined
+        ? `containerQueue: started=${q.grantedCount?.() ?? '?'}/${s.containerSlots} queued=[${q.waiters().map(w => w.holderId).join(',') || '无'}]`
+        : 'containerQueue: 未初始化'
+      const openByCode = new Map<string, number>()
+      for (const v of c().ledger.views()) {
+        if (v.state !== 'dispatched' && v.state !== 'help' && v.state !== 'stalled') continue
+        const code = codeOf(v.item.id)
+        openByCode.set(code, (openByCode.get(code) ?? 0) + 1)
+      }
+      const unsolved = [...s.challenges.keys()].filter(code => {
+        const p = s.progress.get(code)
+        return p === undefined || (p.state !== 'complete' && p.state !== 'failed' && p.state !== 'skipped')
+      })
+      const unsolvedTxt = unsolved.length === 0
+        ? '无'
+        : unsolved.slice(0, 15).map(code => `${code}(${openByCode.get(code) ?? 0}在途)`).join(' ')
+          + (unsolved.length > 15 ? ` …共${unsolved.length}题` : '')
       return [
         `campaign: open=${count(v => v.state === 'dispatched' || v.state === 'help')} queued=${count(v => v.state === 'queued')} done=${count(v => v.state === 'done')} failed=${count(v => v.state === 'failed')} blocked=${count(v => v.state === 'blocked')}`,
         `resourceClasses: ${usageTxt}`,
+        qLine,
         `budgetRemainingMin=${Math.round(remaining / 60000)}`,
         `platformScore=${s.platformScore ?? 'n/a'}${s.platformScore !== undefined ? '(权威, 含 hint 扣分)' : ''}`,
-        `openContainers=${[...openContainers(s)].join(',') || 'none'}`,
+        `openContainers(平台视角, 异步更新会滞后; 槽真相以 containerQueue 行为准)=${[...openContainers(s)].join(',') || 'none'}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
+        `未破题(在途数): ${unsolvedTxt}`,
         `progress: ${progress}`, escTxt,
       ].join('\n')
     },

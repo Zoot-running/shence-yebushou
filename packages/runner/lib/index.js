@@ -507,6 +507,29 @@ function truncateDirective(text, max) {
   const cutTail = text.slice(max, max + 60);
   return { text: `${head}\u2026(\u65B9\u5411\u6BB5\u5DF2\u622A\u65AD)`, truncated: true, cutAt: max, cutTail };
 }
+function buildWarmupPrompt(ch) {
+  return [
+    `[\u5F00\u5C40\u6696\u8D26\u5F81\u96C6] \u9898\u76EE ${ch.unique_code}(${ch.difficulty ?? "unknown"}, ${ch.total_score ?? "?"}\u5206): \u53EA\u8981\u65B9\u5411/\u6253\u70B9, \u4E0D\u8981\u5B8C\u6574\u89E3\u6CD5\u3002`,
+    `\u9898\u9762: ${(ch.description ?? "").slice(0, 800)}`,
+    "\u8F93\u51FA: 2-3 \u6761\u5019\u9009\u601D\u8DEF, \u6BCF\u6761 = \u6253\u54EA(\u653B\u51FB\u9762) + \u4E3A\u4EC0\u4E48\u53EF\u884C + \u600E\u4E48\u9A8C\u8BC1; \u6CE8\u660E\u9898\u76EE\u7C7B\u578B\u5224\u65AD\u3002"
+  ].join("\n");
+}
+function attachmentLikely(description) {
+  return /(附件|源码|源代码|source|下载|\.zip|\.tar|\.gz|\.py\b|\.txt\b|\.png\b|\.pcap\b)/i.test(description ?? "");
+}
+function attachmentFetchCandidates(code) {
+  const safe = code.replace(/-/g, "");
+  return [
+    `/att/${code}/`,
+    `/att/${safe}/`,
+    `/attachments/${code}/`,
+    `/files/${code}.zip`,
+    `/download/${code}`,
+    `/download`,
+    `/files/`,
+    `/`
+  ];
+}
 
 // src/index.ts
 var name = "shence-xiaochang-runner";
@@ -860,7 +883,8 @@ function apply(ctx) {
       defaultModel: { type: "string", description: "Executor default model when an item omits one. Default deepseek-v4-flash (you may set a per-run default that fits this run)." },
       defaultEffort: { type: "string", description: "Executor default reasoning effort. Default low." },
       modelLock: { type: "boolean", description: "Lock: force ALL executors to defaultModel/defaultEffort, ignoring per-item overrides (user/parent-agent override). Default false (main agent may switch models per item)." },
-      containerSlots: { type: "number", description: "v7 container-challenge concurrency slots (platform container cap). Default 3; attachment challenges are never constrained by this." }
+      containerSlots: { type: "number", description: "v7 container-challenge concurrency slots (platform container cap). Default 3; attachment challenges are never constrained by this." },
+      modelWhitelist: { type: "string", description: "v7.8 model whitelist (comma-separated; empty = no restriction). Local dry runs should pass deepseek models \u2014 unreachable models are excluded from auto-R2 and enqueue validation." }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
@@ -924,7 +948,9 @@ function apply(ctx) {
           locked: args.modelLock ?? false
         },
         containerSlots: args.containerSlots ?? 3,
-        platformScore: void 0
+        platformScore: void 0,
+        enqCounters: /* @__PURE__ */ new Map(),
+        modelWhitelist: (args.modelWhitelist ?? []).filter((m) => m !== "")
       };
       try {
         if (existsSync(s.profilePath)) s.profile = parse(readFileSync(s.profilePath, "utf8"));
@@ -944,8 +970,10 @@ function apply(ctx) {
           stallAfterMs: s.roundTimeoutMs + 10 * 6e4,
           heartbeatMs: 15 * 6e4,
           budgetMs: s.budgetMs,
-          // v7 类闸: 容器题受平台容器上限(默认 3), 附件题全并行(继承全局 concurrency)。
-          resourceLimits: { container: args.containerSlots ?? 3, local: s.concurrency }
+          // v7 类闸: 附件题全并行(继承全局 concurrency)。
+          // v7.8: 容器题不再在 dispatch 层限 3——3 槽是"容器启动数"约束, 由资源队列在 start 层管;
+          // dispatch 层限 3 会把全战役并行掐成 3 车道(run 19097 实锤: 每题首派被拖 90 分钟)。
+          resourceLimits: { local: s.concurrency }
         }, [], { id: stableId, boardNamespace: `${args.runId ?? "pending"}` });
         campaign = created.campaign;
         campaignId = created.id;
@@ -997,7 +1025,21 @@ function apply(ctx) {
         }
       } catch {
       }
-      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), containerSlots=${args.containerSlots ?? 3}, budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}`;
+      let warmup = "";
+      if (progress.all().length === 0 && jisi?.fanoutNotify !== void 0) {
+        try {
+          const models = ["deepseek-flash"];
+          const tickets = [];
+          for (const ch of fresh) {
+            const ticket = jisi.fanoutNotify(agent, { prompt: buildWarmupPrompt(ch) }, models);
+            tickets.push(ticket.id);
+          }
+          warmup = `, \u6696\u8D26 fanout \u5DF2\u53D1 ${tickets.length} \u8DEF(\u6A21\u578B=${models.join(",")}, \u62A5\u544A\u6309\u4FE1\u5C01\u5230\u8FBE\u8BF7\u7167\u5E38\u88C1\u51B3\u2014\u2014**\u6696\u8D26\u5DF2\u8986\u76D6\u5168\u9898, \u65E0\u9700\u518D jisi_fanout_bulk \u5168\u91CF\u53D1; \u53EA\u5BF9 hard/\u5361\u9898\u52A0\u6A21\u578B\u8865\u5F81**)`;
+        } catch {
+          warmup = ", \u6696\u8D26 fanout \u53D1\u9001\u5931\u8D25(\u53EF\u624B\u52A8 jisi_fanout_bulk \u5168\u91CF\u5F81\u96C6)";
+        }
+      }
+      return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), containerSlots=${args.containerSlots ?? 3}, budget ${Math.round(s.budgetMs / 6e4)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}${warmup}`;
     }
   }));
   register(defineTool({
@@ -1102,6 +1144,73 @@ boardPath=${c().boardPath(args.code)}`;
     }
   }));
   register(defineTool({
+    name: "xiaochang_sweep_attachments",
+    description: "v7.8 attachment sweep (one call): for every challenge whose description suggests an attachment, run the open-container \u2192 download \u2192 close-container cycle through the resource queue (zero-token slot waiting), saving artifacts to <cwd>/att/<code>/ and returning a per-challenge manifest. Candidate download paths are conventional guesses \u2014 misses are left to executors to handle manually. Call this ONCE early in the campaign (the order prescribes it); safe to re-call anytime.",
+    parameters: {},
+    output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
+    isConcurrencySafe: () => false,
+    async execute() {
+      const s = requireState();
+      const targets = [...s.challenges.values()].filter((ch) => attachmentLikely(ch.description));
+      const manifest = [];
+      let downloaded = 0;
+      for (const ch of targets) {
+        const code = ch.unique_code;
+        try {
+          const res = s.containerQueue !== void 0 ? await s.containerQueue.acquire(code, { timeoutMs: 45e3 }) : { status: "granted" };
+          if (res.status !== "granted") {
+            manifest.push(`${code}: \u5BB9\u5668\u6392\u961F ${res.status === "timeout" ? "\u8D85\u65F6" : "\u51FA\u961F"}\u2014\u2014\u7559\u7ED9\u6267\u884C\u8005\u5904\u7406`);
+            continue;
+          }
+          const fresh = await s.adapter.listChallenges();
+          for (const x of fresh) s.challenges.set(x.unique_code, x);
+          const addr = s.challenges.get(code)?.container_addr?.[0];
+          const dir = join2(process.cwd(), "att", code);
+          let saved = 0;
+          if (addr !== void 0) {
+            try {
+              mkdirSync2(dir, { recursive: true });
+            } catch {
+            }
+            for (const p of attachmentFetchCandidates(code)) {
+              try {
+                const ctrl = new AbortController();
+                const to = setTimeout(() => ctrl.abort(), 8e3);
+                const r = await fetch(`http://${addr}${p}`, { signal: ctrl.signal });
+                clearTimeout(to);
+                if (!r.ok) continue;
+                const buf = Buffer.from(await r.arrayBuffer());
+                if (buf.length < 16) continue;
+                const ct = r.headers.get("content-type") ?? "";
+                const ext = /zip/.test(ct) ? ".zip" : /tar/.test(ct) ? ".tar" : /json/.test(ct) ? ".json" : /text/.test(ct) ? ".txt" : ".bin";
+                writeFileSync(join2(dir, `sweep-${saved + 1}${ext}`), buf);
+                saved += 1;
+              } catch {
+              }
+            }
+          }
+          try {
+            await s.adapter.close(code);
+          } catch {
+          }
+          try {
+            await s.containerQueue?.release();
+          } catch {
+          }
+          s.progress.update(code, { containerClosed: true });
+          downloaded += saved;
+          manifest.push(`${code}: \u4E0B\u8F7D ${saved} \u4EF6${saved === 0 ? "(\u5019\u9009\u8DEF\u5F84\u65E0\u547D\u4E2D, \u7559\u7ED9\u6267\u884C\u8005)" : ""}`);
+        } catch (error) {
+          manifest.push(`${code}: \u5904\u7406\u5931\u8D25 ${String(error)}`);
+        }
+      }
+      persistProgress(s);
+      audit(s.auditPath, { type: "attachment-sweep", targets: targets.length, downloaded });
+      return `\u9644\u4EF6\u6E05\u9053: \u7591\u4F3C\u9644\u4EF6\u9898 ${targets.length} \u9053, \u5171\u4E0B\u8F7D ${downloaded} \u4EF6\u5DE5\u4EF6\u5230 <cwd>/att/<code>/\u3002
+${manifest.join("\n")}`;
+    }
+  }));
+  register(defineTool({
     name: "xiaochang_submit",
     description: "Submit a flag candidate (main agent ONLY \u2014 executors report FLAG_CANDIDATE to the main agent, who submits; single-point submission keeps the platform verdict path serialized). Returns the platform verdict (correct/awarded/cumulative/flag counts).",
     parameters: {
@@ -1116,20 +1225,35 @@ boardPath=${c().boardPath(args.code)}`;
       }
       const s = requireState();
       try {
-        const res = await s.adapter.submit(args.code, args.flag);
-        if (typeof res.cumulative_score === "number") s.platformScore = res.cumulative_score;
-        if (res.correct) {
+        const recordWin = (flag) => {
           const p = s.progress.get(args.code);
-          s.progress.update(args.code, { flags: [.../* @__PURE__ */ new Set([...p?.flags ?? [], args.flag])] });
+          s.progress.update(args.code, { flags: [.../* @__PURE__ */ new Set([...p?.flags ?? [], flag])] });
           persistProgress(s);
           const difficulty = s.challenges.get(args.code)?.difficulty ?? "unknown";
           for (const v of c().ledger.views()) {
             if (v.state !== "done" || codeOf(v.item.id) !== args.code) continue;
             if (v.item.model === void 0) continue;
-            if ((v.terminalDetail ?? "").includes(args.flag)) {
+            if ((v.terminalDetail ?? "").includes(flag)) {
               jisi?.ledger.record(v.item.model, "execution", difficulty, true);
             }
           }
+        };
+        const res = await s.adapter.submit(args.code, args.flag);
+        if (typeof res.cumulative_score === "number") s.platformScore = res.cumulative_score;
+        if (res.correct) {
+          recordWin(args.flag);
+          return JSON.stringify(res);
+        }
+        const desc = s.challenges.get(args.code)?.description ?? "";
+        if (!args.flag.startsWith("flag{") && !args.flag.startsWith("HTB{") && !args.flag.startsWith("mock{") && /flag\{/.test(desc)) {
+          const wrapped = `flag{${args.flag}}`;
+          const res2 = await s.adapter.submit(args.code, wrapped);
+          if (typeof res2.cumulative_score === "number") s.platformScore = res2.cumulative_score;
+          if (res2.correct) {
+            recordWin(wrapped);
+            return `\u88F8\u4E32\u88AB\u62D2, \u81EA\u52A8\u56DE\u9000\u5305\u88C5\u63D0\u4EA4\u6210\u529F: ${JSON.stringify(res2)}`;
+          }
+          return `\u88F8\u4E32\u88AB\u62D2(${JSON.stringify(res)}); \u5305\u88C5\u56DE\u9000\u4E5F\u88AB\u62D2(${JSON.stringify(res2)})\u2014\u2014\u4EE5\u5E73\u53F0\u5224\u5B9A\u4E3A\u51C6, \u6362\u503C\u6216\u6362\u9898\u9762\u53E3\u5F84`;
         }
         return JSON.stringify(res);
       } catch (error) {
@@ -1206,11 +1330,15 @@ boardPath=${c().boardPath(args.code)}`;
       }
       const cls = args.resourceClass ?? resourceClassOf(ch);
       const label = buildExecFrame(args.code, trunc.text) + gapsTxt;
-      const seq = s.progress.get(args.code)?.rounds ?? 0;
-      const itemId = `${args.code}#s${args.round}-w${seq + 1}`;
+      const workNo = (s.enqCounters.get(args.code) ?? 0) + 1;
+      s.enqCounters.set(args.code, workNo);
+      const itemId = `${args.code}#s${args.round}-w${workNo}`;
       const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy);
       if (jisi !== void 0) {
         const listed = await jisi.listModels();
+        if (s.modelWhitelist.length > 0 && !s.modelWhitelist.includes(executor.model)) {
+          return `xiaochang_enqueue: model ${executor.model} \u4E0D\u5728\u672C\u5C40\u767D\u540D\u5355(${s.modelWhitelist.join(",")})\u2014\u2014\u6362\u767D\u540D\u5355\u5185\u6A21\u578B`;
+        }
         if (!listed.some((m) => m.id === executor.model)) {
           return `xiaochang_enqueue: model ${executor.model} is not in the registered model catalog (jisi listModels) \u2014 pick a listed model`;
         }
@@ -1447,14 +1575,16 @@ ${gaps}
 \u63D0\u95EE: \u5DF2\u77E5\u4EE5\u4E0A\u6B7B\u8DEF\u4E0E\u7F3A\u53E3\u4E4B\u540E, \u8FD8\u6709\u54EA\u4E9B**\u6CA1\u8BD5\u8FC7**\u7684\u65B9\u5411? \u4E0D\u8981\u91CD\u590D\u6B7B\u8DEF; \u6BCF\u6761\u7ED9: \u4E3A\u4EC0\u4E48\u53EF\u884C + \u9A8C\u8BC1\u70B9 + \u9700\u8981\u8865\u7684\u4E0A\u4E0B\u6587\u3002`;
   };
   const pickRefanoutModels = async (vq) => {
+    const s = requireState();
+    const allow = (m) => s.modelWhitelist.length === 0 || s.modelWhitelist.includes(m);
     if (jisi?.pickRank !== void 0) {
-      const ranked = await jisi.pickRank(vq.qtype, vq.difficulty, "idea");
+      const ranked = (await jisi.pickRank(vq.qtype, vq.difficulty, "idea")).filter((r) => allow(r.model));
       const fresh = ranked.filter((r) => !vq.triedModels.includes(r.model)).map((r) => r.model);
       if (fresh.length > 0) return fresh.slice(0, 3);
       if (ranked.length > 0) return ranked.slice(0, 3).map((r) => r.model);
     }
     const listed = await jisi?.listModels();
-    return (listed ?? []).map((m) => m.id).slice(0, 3);
+    return (listed ?? []).map((m) => m.id).filter(allow).slice(0, 3);
   };
   register(defineTool({
     name: "xiaochang_refanout",
@@ -1658,7 +1788,7 @@ ${[...deadLines.map((l) => `- \u274C${l}`), ...entries.map((f) => `- \u{1F500}${
       const progress = s.progress.all().map((p) => `${p.code}:${p.state}${p.state === "complete" ? `(${p.flags.length} flags)` : ""}`).join(", ");
       const escLines = [];
       const listed = await jisi?.listModels() ?? [];
-      for (const [code, q] of Object.entries(s.v2)) {
+      for (const [code, q2] of Object.entries(s.v2)) {
         const p = s.progress.get(code);
         if (p === void 0 || p.state === "complete" || p.state === "failed" || p.state === "skipped") continue;
         const ff = filteredFailedOf(code, campaign);
@@ -1666,19 +1796,19 @@ ${[...deadLines.map((l) => `- \u274C${l}`), ...entries.map((f) => `- \u{1F500}${
         const lastProgress = Math.max(0, ...views2.map((v) => v.lastProgressAt ?? 0));
         const noProgressMin = lastProgress > 0 ? Math.round((Date.now() - lastProgress) / 6e4) : 0;
         const deadTexts = knowledgeOfCode(code).filter((k) => k.kind === "dead-end").map((k) => `${k.path} ${k.conclusion ?? ""}`);
-        const cov = coverageOf(q.qtype, deadTexts);
+        const cov = coverageOf(q2.qtype, deadTexts);
         const ch = s.challenges.get(code);
         const remainingPoints = ch !== void 0 ? Math.max(0, Math.round(ch.total_score * (1 - (ch.correct_flag_count ?? 0) / (ch.flag_count || 1)))) : 0;
-        const modelExhaustion = listed.length === 0 ? 1 : q.triedModels.length / listed.length;
+        const modelExhaustion = listed.length === 0 ? 1 : q2.triedModels.length / listed.length;
         const ruling = jisi?.judge?.({
-          troops: q.triedModels.length,
+          troops: q2.triedModels.length,
           filteredFailed: ff.failed,
           noProgressMin,
-          difficulty: q.difficulty,
+          difficulty: q2.difficulty,
           coverageRatio: cov.ratio,
           remainingPoints,
           modelExhaustion: Math.min(1, modelExhaustion),
-          r2Count: Math.max(0, q.ideaRound - 1)
+          r2Count: Math.max(0, q2.ideaRound - 1)
         });
         if (ruling === void 0) continue;
         const exclTxt = ff.excluded > 0 ? ` (\u6545\u969C\u8FC7\u6EE4\u5254\u9664 ${ff.excluded}: ${[...new Set(ff.excludedReasons)].join("+")})` : "";
@@ -1687,24 +1817,24 @@ ${[...deadLines.map((l) => `- \u274C${l}`), ...entries.map((f) => `- \u{1F500}${
       }
       if (remaining <= 60 * 6e4) {
         const hardOpen = [];
-        for (const [code, q] of Object.entries(s.v2)) {
+        for (const [code, q2] of Object.entries(s.v2)) {
           const p = s.progress.get(code);
           if (p !== void 0 && (p.state === "complete" || p.state === "failed" || p.state === "skipped")) continue;
-          if (q.difficulty >= 55 && q.lastVerdict !== "complete") hardOpen.push(code);
+          if (q2.difficulty >= 55 && q2.lastVerdict !== "complete") hardOpen.push(code);
         }
         for (const code of hardOpen.slice(0, 3)) {
-          const q = s.v2[code];
-          if (q.autoR2 !== true) {
-            q.autoR2 = true;
-            s.v2[code] = q;
+          const q2 = s.v2[code];
+          if (q2.autoR2 !== true) {
+            q2.autoR2 = true;
+            s.v2[code] = q2;
             persistV2(s);
             if (jisi?.fanoutNotify !== void 0) {
               const prompt = buildRefanoutPrompt(code);
-              const models = await pickRefanoutModels(q);
+              const models = await pickRefanoutModels(q2);
               const ticket = jisi.fanoutNotify(parentAgent ?? exec?.agent, { prompt }, models);
-              q.ideaRound += 1;
-              q.triedModels.push(...models.filter((m) => !q.triedModels.includes(m)));
-              s.v2[code] = q;
+              q2.ideaRound += 1;
+              q2.triedModels.push(...models.filter((m) => !q2.triedModels.includes(m)));
+              s.v2[code] = q2;
               persistV2(s);
               escLines.push(`\u23F0 \u672B\u6BB5\u81EA\u52A8 R2: ${code} \u5DF2\u81EA\u52A8\u53D1\u8D77\u4E8C\u6B21\u5F81\u96C6(${models.join(", ")}, ticket ${ticket.id})\u2014\u2014\u53EF jisi_fanout_drop \u6539\u5224`);
             } else {
@@ -1718,13 +1848,28 @@ ${[...deadLines.map((l) => `- \u274C${l}`), ...entries.map((f) => `- \u{1F500}${
 ${escLines.join("\n")}` : "";
       const usage = c().classUsage?.() ?? {};
       const usageTxt = Object.entries(usage).map(([cls, u]) => `${cls} ${u.open}/${u.limit}`).join(", ") || "n/a";
+      const q = s.containerQueue;
+      const qLine = q !== void 0 ? `containerQueue: started=${q.grantedCount?.() ?? "?"}/${s.containerSlots} queued=[${q.waiters().map((w) => w.holderId).join(",") || "\u65E0"}]` : "containerQueue: \u672A\u521D\u59CB\u5316";
+      const openByCode = /* @__PURE__ */ new Map();
+      for (const v of c().ledger.views()) {
+        if (v.state !== "dispatched" && v.state !== "help" && v.state !== "stalled") continue;
+        const code = codeOf(v.item.id);
+        openByCode.set(code, (openByCode.get(code) ?? 0) + 1);
+      }
+      const unsolved = [...s.challenges.keys()].filter((code) => {
+        const p = s.progress.get(code);
+        return p === void 0 || p.state !== "complete" && p.state !== "failed" && p.state !== "skipped";
+      });
+      const unsolvedTxt = unsolved.length === 0 ? "\u65E0" : unsolved.slice(0, 15).map((code) => `${code}(${openByCode.get(code) ?? 0}\u5728\u9014)`).join(" ") + (unsolved.length > 15 ? ` \u2026\u5171${unsolved.length}\u9898` : "");
       return [
         `campaign: open=${count((v) => v.state === "dispatched" || v.state === "help")} queued=${count((v) => v.state === "queued")} done=${count((v) => v.state === "done")} failed=${count((v) => v.state === "failed")} blocked=${count((v) => v.state === "blocked")}`,
         `resourceClasses: ${usageTxt}`,
+        qLine,
         `budgetRemainingMin=${Math.round(remaining / 6e4)}`,
         `platformScore=${s.platformScore ?? "n/a"}${s.platformScore !== void 0 ? "(\u6743\u5A01, \u542B hint \u6263\u5206)" : ""}`,
-        `openContainers=${[...openContainers(s)].join(",") || "none"}`,
+        `openContainers(\u5E73\u53F0\u89C6\u89D2, \u5F02\u6B65\u66F4\u65B0\u4F1A\u6EDE\u540E; \u69FD\u771F\u76F8\u4EE5 containerQueue \u884C\u4E3A\u51C6)=${[...openContainers(s)].join(",") || "none"}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
+        `\u672A\u7834\u9898(\u5728\u9014\u6570): ${unsolvedTxt}`,
         `progress: ${progress}`,
         escTxt
       ].join("\n");
