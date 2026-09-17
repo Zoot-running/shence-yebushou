@@ -153,7 +153,7 @@ interface SetupArgs {
   /** v7: 容器题并发槽位(平台容器上限)。默认 3。 */
   containerSlots?: number
   /** v7.8: 模型白名单(逗号分隔字符串或省略)——空=不限制; 本地干跑局传 deepseek 系(网关不可达的模型不进自动 R2/派单校验)。 */
-  modelWhitelist?: string
+  modelWhitelist?: string | string[]
 }
 
 /** 每题 v2 状态(第 0/3 层)。 */
@@ -630,7 +630,9 @@ export function apply(ctx: Context): void {
         containerSlots: args.containerSlots ?? 3,
         platformScore: undefined,
         enqCounters: new Map(),
-        modelWhitelist: (args.modelWhitelist ?? []).filter(m => m !== ''),
+        modelWhitelist: (typeof args.modelWhitelist === 'string'
+          ? args.modelWhitelist.split(',').map(m => m.trim())
+          : (args.modelWhitelist ?? [])).filter(m => m !== ''),
       }
       try {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))

@@ -965,7 +965,7 @@ function apply(ctx) {
         containerSlots: args.containerSlots ?? 3,
         platformScore: void 0,
         enqCounters: /* @__PURE__ */ new Map(),
-        modelWhitelist: (args.modelWhitelist ?? []).filter((m) => m !== "")
+        modelWhitelist: (typeof args.modelWhitelist === "string" ? args.modelWhitelist.split(",").map((m) => m.trim()) : args.modelWhitelist ?? []).filter((m) => m !== "")
       };
       try {
         if (existsSync(s.profilePath)) s.profile = parse(readFileSync(s.profilePath, "utf8"));
