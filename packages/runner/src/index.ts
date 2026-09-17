@@ -1277,6 +1277,8 @@ export function apply(ctx: Context): void {
 已知死路(前序思路已证不可行):
 ${dead}
 
+要求: 先或并行用 web_search 查公开资料(writeup/题源/CVE 库), 有出处的线索写进思路并附 URL; 不要只凭记忆猜。
+
 上下文缺口(前序执行者反馈缺的信息):
 ${gaps}
 
@@ -1496,8 +1498,12 @@ ${gaps}
         })
         if (ruling === undefined) continue
         const exclTxt = ff.excluded > 0 ? ` (故障过滤剔除 ${ff.excluded}: ${[...new Set(ff.excludedReasons)].join('+')})` : ''
-        if (ruling.action === 'escalate') escLines.push(`⚠️ ${code}: ${ruling.reasons[0] ?? ''}${exclTxt}`)
-        if (ruling.action === 'judge-dead') escLines.push(`⛔ ${code}: ${ruling.reasons[0] ?? ''}${exclTxt}`)
+        // v7.10: 升级链前置搜索钩子——卡题第一动作 = 搜公开资料, 不是硬磨(run19097 实锤: 全局只用 3 次搜索, 全在最后一小时)。
+        const descQ = (ch?.description ?? '').replace(/"/g, "'").slice(0, 80)
+        const searchHint = `
+   🔍 先搜公开资料再升级: web_search("${code} ${descQ}") → 结果写进账本③(xiaochang_knowledge_put artifacts)`
+        if (ruling.action === 'escalate') escLines.push(`⚠️ ${code}: ${ruling.reasons[0] ?? ''}${exclTxt}${searchHint}`)
+        if (ruling.action === 'judge-dead') escLines.push(`⛔ ${code}: ${ruling.reasons[0] ?? ''}${exclTxt}${searchHint}`)
       }
       // v6 末段自动 R2: 预算 ≤60min 且 hard 未破且该题本窗口未发过 → 插件直接发兵(机制默认动作)。
       if (remaining <= 60 * 60_000) {

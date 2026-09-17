@@ -1592,6 +1592,8 @@ ${text}`;
 \u5DF2\u77E5\u6B7B\u8DEF(\u524D\u5E8F\u601D\u8DEF\u5DF2\u8BC1\u4E0D\u53EF\u884C):
 ${dead}
 
+\u8981\u6C42: \u5148\u6216\u5E76\u884C\u7528 web_search \u67E5\u516C\u5F00\u8D44\u6599(writeup/\u9898\u6E90/CVE \u5E93), \u6709\u51FA\u5904\u7684\u7EBF\u7D22\u5199\u8FDB\u601D\u8DEF\u5E76\u9644 URL; \u4E0D\u8981\u53EA\u51ED\u8BB0\u5FC6\u731C\u3002
+
 \u4E0A\u4E0B\u6587\u7F3A\u53E3(\u524D\u5E8F\u6267\u884C\u8005\u53CD\u9988\u7F3A\u7684\u4FE1\u606F):
 ${gaps}
 
@@ -1838,8 +1840,11 @@ ${[...deadLines.map((l) => `- \u274C${l}`), ...entries.map((f) => `- \u{1F500}${
         });
         if (ruling === void 0) continue;
         const exclTxt = ff.excluded > 0 ? ` (\u6545\u969C\u8FC7\u6EE4\u5254\u9664 ${ff.excluded}: ${[...new Set(ff.excludedReasons)].join("+")})` : "";
-        if (ruling.action === "escalate") escLines.push(`\u26A0\uFE0F ${code}: ${ruling.reasons[0] ?? ""}${exclTxt}`);
-        if (ruling.action === "judge-dead") escLines.push(`\u26D4 ${code}: ${ruling.reasons[0] ?? ""}${exclTxt}`);
+        const descQ = (ch?.description ?? "").replace(/"/g, "'").slice(0, 80);
+        const searchHint = `
+   \u{1F50D} \u5148\u641C\u516C\u5F00\u8D44\u6599\u518D\u5347\u7EA7: web_search("${code} ${descQ}") \u2192 \u7ED3\u679C\u5199\u8FDB\u8D26\u672C\u2462(xiaochang_knowledge_put artifacts)`;
+        if (ruling.action === "escalate") escLines.push(`\u26A0\uFE0F ${code}: ${ruling.reasons[0] ?? ""}${exclTxt}${searchHint}`);
+        if (ruling.action === "judge-dead") escLines.push(`\u26D4 ${code}: ${ruling.reasons[0] ?? ""}${exclTxt}${searchHint}`);
       }
       if (remaining <= 60 * 6e4) {
         const hardOpen = [];
