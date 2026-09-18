@@ -228,13 +228,21 @@ describe('优先级与风险排序', () => {
     expect(neverDispatchedBoost(o, T0 + 120 * 60_000)).toBe(0)
   })
 
-  it('priorityOf = 分值×(1+0.5×档); 终态/待裁决不可入队', () => {
+  it('priorityOf 两段式: 首轮公平带(easy 先行) > 分值密度; 终态/待裁决不可入队', () => {
     const o = newOrch('e3-04', T0)
+    // 从未开工: 进首轮公平带(1_000_000 基线), 带内 easy 排前
+    expect(priorityOf(o, 250, T0)).toBe(1_000_000 + (2000 - 250) * 10)
+    // 已开工: 分值密度(提权档只属于从未开工的题, 已开工不再提权)
+    o.neverDispatched = false
     expect(priorityOf(o, 250, T0)).toBe(250)
-    expect(priorityOf(o, 250, T0 + 60 * 60_000)).toBe(500)
+    expect(priorityOf(o, 250, T0 + 60 * 60_000)).toBe(250)
     o.priorityOverride = 999
     expect(priorityOf(o, 250, T0)).toBe(999)
     o.priorityOverride = undefined
+    // 主 agent 覆盖在首轮带内也生效
+    const o2 = newOrch('e3-03', T0)
+    o2.priorityOverride = 777
+    expect(priorityOf(o2, 250, T0)).toBe(1_000_000 + 777)
     o.state = 'pending-adjudication'
     expect(priorityOf(o, 250, T0)).toBe(Number.NEGATIVE_INFINITY)
     o.state = 'dead'

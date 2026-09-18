@@ -274,6 +274,8 @@ interface CampaignState {
   orchVersion: number
   /** v8: 单次授予时间盒(ms; setup 可调, 默认 30min)。 */
   timeboxMs: number
+  /** v8: 编排心跳计数(仪表面包屑——托管失联时诊断宿主是否还活着)。 */
+  tickCount: number
 }
 
 let state: CampaignState | undefined
@@ -654,6 +656,29 @@ export function apply(ctx: Context): void {
     } catch { /* R2 失败不阻断派兵 */ }
   }
   const VERIFIER_DIRECTIVE = '[验证兵] 独立复验账本里的 blocker 结论("无攻击面/环境缺失/未发布"类): 不要信任前序判定, 重跑探测确认。输出开头一行 "复验: 确认" 或 "复验: 推翻", 附证据; 若推翻, 立即继续解题(先读知识账本, 从已知边界出发)。'
+  /** v8: 串行 spawn 泵——v7 的派单是单工具串行(回合上下文); v8 挪进分离链后必须恢复串行不变量。 */
+  const spawnQueue: string[] = []
+  let spawning = false
+  async function pumpSpawns(): Promise<void> {
+    if (spawning) return
+    spawning = true
+    try {
+      while (spawnQueue.length > 0) {
+        const code = spawnQueue.shift()!
+        await grantAndSpawn(code).catch(err => {
+          const s = requireState()
+          s.armed.delete(code)
+          audit(s.auditPath, { type: 'v8-spawn-error', code, error: String(err) })
+        })
+      }
+    } finally {
+      spawning = false
+    }
+  }
+  function requestSpawn(code: string): void {
+    spawnQueue.push(code)
+    void pumpSpawns()
+  }
   /** v8 原子授予: 队列授予 → 快照 → 生成执行者(带 addr) → 派发。 */
   async function grantAndSpawn(code: string): Promise<void> {
     const s = requireState()
@@ -711,12 +736,16 @@ export function apply(ctx: Context): void {
       persistV2(s)
       audit(s.auditPath, { type: 'v8-spawn', id: itemId, code, attempts: o.attempts, model, class: cls })
     }
-    // 授予即派兵: 立即派发(容器闸已在队列层).
+    // 授予即派兵: 立即派发(容器闸已在队列层). 有界循环 + 异常吸收(派单失败不炸宿主).
     let count = 0
-    while (true) {
-      const d2 = await c().dispatchNext()
-      if (d2 === undefined) break
-      count += 1
+    try {
+      while (count < 8) {
+        const d2 = await c().dispatchNext()
+        if (d2 === undefined) break
+        count += 1
+      }
+    } catch (error) {
+      audit(s.auditPath, { type: 'v8-dispatch-error', code, error: String(error) })
     }
     audit(s.auditPath, { type: 'v8-grant', code, spawn: picks.length, dispatched: count })
     bumpOrch(s)
@@ -744,17 +773,17 @@ export function apply(ctx: Context): void {
       if (ch === undefined) continue
       if (resourceClassOf(ch) === 'local') {
         s.armed.add(code)
-        void grantAndSpawn(code)
+        requestSpawn(code)
         continue
       }
       s.armed.add(code)
       void q.acquire(code).then(res => {
-        if (res.status === 'granted') { s.grantedCodes.add(code); void grantAndSpawn(code) }
+        if (res.status === 'granted') { s.grantedCodes.add(code); requestSpawn(code) }
         else {
           s.armed.delete(code)
           audit(s.auditPath, { type: 'v8-arm-drop', code, status: res.status, reason: res.reason })
         }
-      })
+      }).catch(err => audit(s.auditPath, { type: 'v8-arm-error', code, error: String(err) }))
     }
   }
   /** v8 settle 结算(事件 + collect 扫描双通道, settleProcessed 去重)。 */
@@ -968,6 +997,7 @@ export function apply(ctx: Context): void {
         settleProcessed: new Set(),
         orchVersion: 0,
         timeboxMs: (args.timeboxMinutes ?? 30) * 60_000,
+        tickCount: 0,
       }
       try {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
@@ -1043,10 +1073,16 @@ export function apply(ctx: Context): void {
       persistOrch(s)
       // v8: settle 结算钩子(执行者终态 → 进展分类 → 回队/升级梯/待决) + 编排心跳(时间盒/武装)。
       if (campaignId !== undefined && holder.onSettle !== undefined) {
-        holder.onSettle(campaignId, ev => { void settleClassify(ev.itemId, ev.text) })
+        holder.onSettle(campaignId, ev => {
+          void settleClassify(ev.itemId, ev.text).catch(err => audit(s.auditPath, { type: 'v8-settle-error', itemId: ev.itemId, error: String(err) }))
+        })
       }
       if (tickTimer !== undefined) clearInterval(tickTimer)
-      tickTimer = setInterval(() => { void tickOrch(); armQueue() }, 30_000)
+      tickTimer = setInterval(() => {
+        s.tickCount += 1
+        void tickOrch().catch(err => audit(s.auditPath, { type: 'v8-tick-error', error: String(err) }))
+        armQueue()
+      }, 30_000)
       ;(tickTimer as { unref?: () => void }).unref?.()
       armQueue()
       persistProgress(s)
@@ -1409,8 +1445,7 @@ export function apply(ctx: Context): void {
       persistOrch(s)
       persistProgress(s)
       audit(s.auditPath, { type: 'v8-enqueue', code: args.code, directive: trunc.text.slice(0, 80), priority: args.priority })
-      armQueue()
-      return `enqueued ${args.code} (directives=${o.directives.length}, 队列优先级=${priorityOf(o, ch.total_score, Date.now())}, 状态=${o.state})${truncNotice}`
+      return `enqueued ${args.code} (directives=${o.directives.length}, 队列优先级=${priorityOf(o, ch.total_score, Date.now())}, 状态=${o.state}; 授予由机制 tick 武装, 无需手动 dispatch)${truncNotice}`
     },
   }))
 
@@ -1485,7 +1520,7 @@ export function apply(ctx: Context): void {
         audit(s.auditPath, { type: 'terminal', id: v.item.id, state: v.state, round, detail: detail.slice(0, 300) })
         rows.push(`--- ${v.item.id} [${v.state}] round=${round} code=${code}\n${detail.slice(0, 6000)}`)
         // v8: settle 结算兜底扫描(事件通道之外的恢复面, settleProcessed 去重)。
-        void settleClassify(v.item.id, detail)
+        void settleClassify(v.item.id, detail).catch(err => audit(s.auditPath, { type: 'v8-settle-sweep-error', itemId: v.item.id, error: String(err) }))
       }
       persistProgress(s)
       persistProfile(s)
@@ -1942,6 +1977,7 @@ ${gaps}
         `campaign: open=${count(v => v.state === 'dispatched' || v.state === 'help')} queued=${count(v => v.state === 'queued')} done=${count(v => v.state === 'done')} failed=${count(v => v.state === 'failed')} blocked=${count(v => v.state === 'blocked')}`,
         `resourceClasses: ${usageTxt}`,
         `orch: queued=${orchCount('queued')} granted=${orchCount('granted')} pending-adjudication=${orchCount('pending-adjudication')} solved=${orchCount('solved')} dead=${orchCount('dead')}`,
+        `v8心跳: tick=${s.tickCount} armed=${s.armed.size} grantedCodes=${s.grantedCodes.size} spawnQueue=${spawnQueue.length} spawning=${spawning}`,
         qLine,
         `budgetRemainingMin=${Math.round(remaining / 60000)}`,
         `platformScore=${s.platformScore ?? 'n/a'}${s.platformScore !== undefined ? '(权威, 含 hint 扣分)' : ''}`,

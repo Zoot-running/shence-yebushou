@@ -249,11 +249,21 @@ export function neverDispatchedBoost(orch: ChallengeOrch, now: number): number {
   return Math.min(NEVER_DISPATCHED_BOOST_MAX, Math.floor(Math.max(0, now - orch.createdAt) / NEVER_DISPATCHED_BOOST_STEP_MS))
 }
 
-/** 队列优先级 = 主 agent 覆盖 > 分值密度 × (1 + 0.5×提权档)。终态/待裁决 = 不可入队。 */
+/**
+ * 队列优先级(两段式):
+ * - 首轮公平带: 从未开工的题全部排在已开工题之前(1_000_000 基线), 带内按分值升序(easy 先行清场,
+ *   校准本 run 旗值习惯; 主 agent 覆盖 +1_000_000 生效);
+ * - 此后: 主 agent 覆盖 > 分值密度 × (1 + 0.5×从未开工提权档)。
+ * 终态/待裁决 = 不可入队。
+ */
 export function priorityOf(orch: ChallengeOrch, totalScore: number, now: number): number {
   if (orch.state === 'solved' || orch.state === 'dead' || orch.state === 'pending-adjudication') return Number.NEGATIVE_INFINITY
-  if (orch.priorityOverride !== undefined) return orch.priorityOverride
   const base = totalScore > 0 ? totalScore : 300
+  if (orch.neverDispatched) {
+    const p = orch.priorityOverride ?? (2_000 - base) * 10
+    return 1_000_000 + p + neverDispatchedBoost(orch, now)
+  }
+  if (orch.priorityOverride !== undefined) return orch.priorityOverride
   return base * (1 + 0.5 * neverDispatchedBoost(orch, now))
 }
 

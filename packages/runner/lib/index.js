@@ -670,8 +670,12 @@ function neverDispatchedBoost(orch, now) {
 }
 function priorityOf(orch, totalScore, now) {
   if (orch.state === "solved" || orch.state === "dead" || orch.state === "pending-adjudication") return Number.NEGATIVE_INFINITY;
-  if (orch.priorityOverride !== void 0) return orch.priorityOverride;
   const base = totalScore > 0 ? totalScore : 300;
+  if (orch.neverDispatched) {
+    const p = orch.priorityOverride ?? (2e3 - base) * 10;
+    return 1e6 + p + neverDispatchedBoost(orch, now);
+  }
+  if (orch.priorityOverride !== void 0) return orch.priorityOverride;
   return base * (1 + 0.5 * neverDispatchedBoost(orch, now));
 }
 function compareRisk(a, b, scoreA, scoreB) {
@@ -1139,6 +1143,28 @@ function apply(ctx) {
     }
   }
   const VERIFIER_DIRECTIVE = '[\u9A8C\u8BC1\u5175] \u72EC\u7ACB\u590D\u9A8C\u8D26\u672C\u91CC\u7684 blocker \u7ED3\u8BBA("\u65E0\u653B\u51FB\u9762/\u73AF\u5883\u7F3A\u5931/\u672A\u53D1\u5E03"\u7C7B): \u4E0D\u8981\u4FE1\u4EFB\u524D\u5E8F\u5224\u5B9A, \u91CD\u8DD1\u63A2\u6D4B\u786E\u8BA4\u3002\u8F93\u51FA\u5F00\u5934\u4E00\u884C "\u590D\u9A8C: \u786E\u8BA4" \u6216 "\u590D\u9A8C: \u63A8\u7FFB", \u9644\u8BC1\u636E; \u82E5\u63A8\u7FFB, \u7ACB\u5373\u7EE7\u7EED\u89E3\u9898(\u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1)\u3002';
+  const spawnQueue = [];
+  let spawning = false;
+  async function pumpSpawns() {
+    if (spawning) return;
+    spawning = true;
+    try {
+      while (spawnQueue.length > 0) {
+        const code = spawnQueue.shift();
+        await grantAndSpawn(code).catch((err) => {
+          const s = requireState();
+          s.armed.delete(code);
+          audit(s.auditPath, { type: "v8-spawn-error", code, error: String(err) });
+        });
+      }
+    } finally {
+      spawning = false;
+    }
+  }
+  function requestSpawn(code) {
+    spawnQueue.push(code);
+    void pumpSpawns();
+  }
   async function grantAndSpawn(code) {
     const s = requireState();
     s.armed.delete(code);
@@ -1200,10 +1226,14 @@ function apply(ctx) {
       audit(s.auditPath, { type: "v8-spawn", id: itemId, code, attempts: o.attempts, model, class: cls });
     }
     let count = 0;
-    while (true) {
-      const d2 = await c().dispatchNext();
-      if (d2 === void 0) break;
-      count += 1;
+    try {
+      while (count < 8) {
+        const d2 = await c().dispatchNext();
+        if (d2 === void 0) break;
+        count += 1;
+      }
+    } catch (error) {
+      audit(s.auditPath, { type: "v8-dispatch-error", code, error: String(error) });
     }
     audit(s.auditPath, { type: "v8-grant", code, spawn: picks.length, dispatched: count });
     bumpOrch(s);
@@ -1230,19 +1260,19 @@ function apply(ctx) {
       if (ch === void 0) continue;
       if (resourceClassOf(ch) === "local") {
         s.armed.add(code);
-        void grantAndSpawn(code);
+        requestSpawn(code);
         continue;
       }
       s.armed.add(code);
       void q.acquire(code).then((res) => {
         if (res.status === "granted") {
           s.grantedCodes.add(code);
-          void grantAndSpawn(code);
+          requestSpawn(code);
         } else {
           s.armed.delete(code);
           audit(s.auditPath, { type: "v8-arm-drop", code, status: res.status, reason: res.reason });
         }
-      });
+      }).catch((err) => audit(s.auditPath, { type: "v8-arm-error", code, error: String(err) }));
     }
   }
   async function settleClassify(itemId, detail) {
@@ -1441,7 +1471,8 @@ function apply(ctx) {
         grantedCodes: /* @__PURE__ */ new Set(),
         settleProcessed: /* @__PURE__ */ new Set(),
         orchVersion: 0,
-        timeboxMs: (args.timeboxMinutes ?? 30) * 6e4
+        timeboxMs: (args.timeboxMinutes ?? 30) * 6e4,
+        tickCount: 0
       };
       try {
         if (existsSync(s.profilePath)) s.profile = parse(readFileSync(s.profilePath, "utf8"));
@@ -1510,12 +1541,13 @@ function apply(ctx) {
       persistOrch(s);
       if (campaignId !== void 0 && holder.onSettle !== void 0) {
         holder.onSettle(campaignId, (ev) => {
-          void settleClassify(ev.itemId, ev.text);
+          void settleClassify(ev.itemId, ev.text).catch((err) => audit(s.auditPath, { type: "v8-settle-error", itemId: ev.itemId, error: String(err) }));
         });
       }
       if (tickTimer !== void 0) clearInterval(tickTimer);
       tickTimer = setInterval(() => {
-        void tickOrch();
+        s.tickCount += 1;
+        void tickOrch().catch((err) => audit(s.auditPath, { type: "v8-tick-error", error: String(err) }));
         armQueue();
       }, 3e4);
       tickTimer.unref?.();
@@ -1884,8 +1916,7 @@ ${manifest.join("\n")}`;
       persistOrch(s);
       persistProgress(s);
       audit(s.auditPath, { type: "v8-enqueue", code: args.code, directive: trunc.text.slice(0, 80), priority: args.priority });
-      armQueue();
-      return `enqueued ${args.code} (directives=${o.directives.length}, \u961F\u5217\u4F18\u5148\u7EA7=${priorityOf(o, ch.total_score, Date.now())}, \u72B6\u6001=${o.state})${truncNotice}`;
+      return `enqueued ${args.code} (directives=${o.directives.length}, \u961F\u5217\u4F18\u5148\u7EA7=${priorityOf(o, ch.total_score, Date.now())}, \u72B6\u6001=${o.state}; \u6388\u4E88\u7531\u673A\u5236 tick \u6B66\u88C5, \u65E0\u9700\u624B\u52A8 dispatch)${truncNotice}`;
     }
   }));
   register(defineTool({
@@ -1951,7 +1982,7 @@ ${manifest.join("\n")}`;
         audit(s.auditPath, { type: "terminal", id: v.item.id, state: v.state, round, detail: detail.slice(0, 300) });
         rows.push(`--- ${v.item.id} [${v.state}] round=${round} code=${code}
 ${detail.slice(0, 6e3)}`);
-        void settleClassify(v.item.id, detail);
+        void settleClassify(v.item.id, detail).catch((err) => audit(s.auditPath, { type: "v8-settle-sweep-error", itemId: v.item.id, error: String(err) }));
       }
       persistProgress(s);
       persistProfile(s);
@@ -2428,6 +2459,7 @@ ${escLines.join("\n")}` : "";
         `campaign: open=${count((v) => v.state === "dispatched" || v.state === "help")} queued=${count((v) => v.state === "queued")} done=${count((v) => v.state === "done")} failed=${count((v) => v.state === "failed")} blocked=${count((v) => v.state === "blocked")}`,
         `resourceClasses: ${usageTxt}`,
         `orch: queued=${orchCount("queued")} granted=${orchCount("granted")} pending-adjudication=${orchCount("pending-adjudication")} solved=${orchCount("solved")} dead=${orchCount("dead")}`,
+        `v8\u5FC3\u8DF3: tick=${s.tickCount} armed=${s.armed.size} grantedCodes=${s.grantedCodes.size} spawnQueue=${spawnQueue.length} spawning=${spawning}`,
         qLine,
         `budgetRemainingMin=${Math.round(remaining / 6e4)}`,
         `platformScore=${s.platformScore ?? "n/a"}${s.platformScore !== void 0 ? "(\u6743\u5A01, \u542B hint \u6263\u5206)" : ""}`,
