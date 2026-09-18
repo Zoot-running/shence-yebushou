@@ -546,6 +546,175 @@ function attachmentFetchCandidates(code) {
   ];
 }
 
+// src/challenge-orch.ts
+var TIMEBOX_MS = 30 * 6e4;
+var SUBMIT_GRACE_MS = 15 * 6e4;
+var NEVER_DISPATCHED_BOOST_STEP_MS = 30 * 6e4;
+var NEVER_DISPATCHED_BOOST_MAX = 3;
+var BLOCKER_RE = /(攻击面\s*缺失|无攻击面|攻击面.*(?:不存在|缺失)|环境缺失|未随容器|平台.*未(?:发布|暴露)|未暴露|not exposed|no attack surface|unreachable|不可达|服务未启动|仅.*静态)/i;
+function blockerConcluded(text) {
+  return BLOCKER_RE.test(text);
+}
+function verifierVerdict(text) {
+  const confirm = /(blocker\s*成立|确认|confirmed|攻击面\s*确实|确无|verify\s*ok)/i;
+  const refute = /(推翻|不成立|refut|攻击面\s*存在|有攻击面|误判)/i;
+  const c = confirm.test(text);
+  const r = refute.test(text);
+  if (c && !r) return "confirm";
+  if (r && !c) return "refute";
+  return "unclear";
+}
+function zeroProgress(p) {
+  return !p.flagCandidate && p.findingsDelta <= 1 && p.forkDelta === 0 && p.artifactsDelta === 0;
+}
+function fingerprintOf(detail) {
+  return detail.replace(/\s+/g, " ").trim().slice(0, 80);
+}
+function settleAction(orch, p) {
+  if (p.flagCandidate) return "pending-flag";
+  if (p.blockerConcluded) {
+    if (orch.blockerCheck === "confirmed") return "adjudicate";
+    if (orch.blockerCheck === "in-flight" || orch.blockerCheck === "refuted") {
+    } else {
+      return "verify-blocker";
+    }
+  }
+  if (!zeroProgress(p)) return "rearm";
+  const streak = orch.zeroProgressStreak + 1;
+  if (streak === 1) return "rearm-all-in";
+  return "adjudicate";
+}
+function applyVerifierResult(orch, verdict) {
+  if (verdict === "confirm") orch.blockerCheck = "confirmed";
+  else if (verdict === "refute") orch.blockerCheck = "refuted";
+  else orch.blockerCheck = "none";
+}
+function applySettle(orch, action, detail, now) {
+  orch.lastSettleFingerprint = fingerprintOf(detail);
+  orch.grantedUntil = void 0;
+  switch (action) {
+    case "pending-flag":
+      orch.state = "pending-adjudication";
+      orch.grantedUntil = now + SUBMIT_GRACE_MS;
+      break;
+    case "rearm":
+      orch.state = "queued";
+      orch.zeroProgressStreak = 0;
+      orch.r2Due = false;
+      orch.multiSpawn = 0;
+      break;
+    case "rearm-all-in":
+      orch.state = "queued";
+      orch.zeroProgressStreak = 1;
+      orch.r2Due = true;
+      orch.multiSpawn = 3;
+      break;
+    case "adjudicate":
+      orch.state = "pending-adjudication";
+      orch.multiSpawn = 0;
+      break;
+    case "verify-blocker":
+      orch.state = "queued";
+      orch.blockerCheck = "in-flight";
+      orch.r2Due = false;
+      orch.multiSpawn = 1;
+      break;
+  }
+  return orch;
+}
+function rearmByTimebox(orch) {
+  orch.state = "queued";
+  orch.grantedUntil = void 0;
+  orch.multiSpawn = 0;
+  return orch;
+}
+function adjudicate(orch, verdict) {
+  switch (verdict) {
+    case "continue":
+    case "rotate":
+      orch.state = "queued";
+      orch.zeroProgressStreak = 0;
+      orch.r2Due = false;
+      orch.blockerCheck = "none";
+      orch.grantedUntil = void 0;
+      orch.lastSettleFingerprint = void 0;
+      break;
+    case "dead":
+      orch.state = "dead";
+      orch.grantedUntil = void 0;
+      break;
+    case "solved":
+      orch.state = "solved";
+      orch.grantedUntil = void 0;
+      break;
+  }
+  return orch;
+}
+function grant(orch, snapshot, now, timeboxMs = TIMEBOX_MS) {
+  orch.state = "granted";
+  orch.attempts += 1;
+  orch.lastGrantAt = now;
+  orch.grantedUntil = now + timeboxMs;
+  orch.neverDispatched = false;
+  orch.snapshot = snapshot;
+  orch.r2Due = false;
+  return orch;
+}
+function timeboxExpired(orch, now) {
+  if (orch.grantedUntil === void 0 || now <= orch.grantedUntil) return false;
+  return orch.state === "granted" || orch.state === "pending-adjudication";
+}
+function neverDispatchedBoost(orch, now) {
+  if (!orch.neverDispatched) return 0;
+  return Math.min(NEVER_DISPATCHED_BOOST_MAX, Math.floor(Math.max(0, now - orch.createdAt) / NEVER_DISPATCHED_BOOST_STEP_MS));
+}
+function priorityOf(orch, totalScore, now) {
+  if (orch.state === "solved" || orch.state === "dead" || orch.state === "pending-adjudication") return Number.NEGATIVE_INFINITY;
+  if (orch.priorityOverride !== void 0) return orch.priorityOverride;
+  const base = totalScore > 0 ? totalScore : 300;
+  return base * (1 + 0.5 * neverDispatchedBoost(orch, now));
+}
+function compareRisk(a, b, scoreA, scoreB) {
+  const queuedA = a.state === "queued" ? 0 : 1;
+  const queuedB = b.state === "queued" ? 0 : 1;
+  if (queuedA !== queuedB) return queuedA - queuedB;
+  const neverA = a.neverDispatched ? 0 : 1;
+  const neverB = b.neverDispatched ? 0 : 1;
+  if (neverA !== neverB) return neverA - neverB;
+  if (scoreB !== scoreA) return scoreB - scoreA;
+  return a.attempts - b.attempts;
+}
+function newOrch(code, now) {
+  return {
+    code,
+    state: "queued",
+    attempts: 0,
+    zeroProgressStreak: 0,
+    neverDispatched: true,
+    directives: [],
+    r2Due: false,
+    multiSpawn: 0,
+    settleNoFlag: 0,
+    blockerCheck: "none",
+    createdAt: now
+  };
+}
+function makePending(code, kind, summary, detailPath, now) {
+  return { code, kind, summary, detailPath, createdAt: now };
+}
+function serializeOrchState(orch, pending) {
+  return JSON.stringify({
+    orch: Object.fromEntries([...orch.entries()].map(([code, o]) => [code, o])),
+    pending
+  });
+}
+function parseOrchState(json) {
+  const d = JSON.parse(json);
+  const m = /* @__PURE__ */ new Map();
+  for (const [code, o] of Object.entries(d.orch ?? {})) m.set(code, o);
+  return { orch: m, pending: d.pending ?? [] };
+}
+
 // src/index.ts
 var name = "shence-xiaochang-runner";
 var inject = ["tools", "hufu", "jisi"];
@@ -590,6 +759,7 @@ function calibrateDifficulty(q) {
 }
 var state;
 var heartbeatTimer;
+var tickTimer;
 function requireState() {
   if (state === void 0) throw new Error("xiaochang: not set up \u2014 call xiaochang_setup first");
   return state;
@@ -630,7 +800,7 @@ function filteredFailedOf(code, campaign) {
   let excluded = 0;
   const excludedReasons = [];
   for (const v of campaign?.ledger.views() ?? []) {
-    if (v.state !== "failed" || codeOf(v.item.id) !== code) continue;
+    if (v.state !== "failed" && v.state !== "blocked" || codeOf(v.item.id) !== code) continue;
     const detail = v.terminalDetail ?? "";
     const provErr = /(TRANSPORT|MISSING_CREDENTIAL|rate limit|insufficient|余额|no API key)/i.test(detail);
     const inOutage = windows.some((w) => {
@@ -674,9 +844,6 @@ function openContainers(s) {
     if (c.container_status === "available" || c.container_status === "pending") open.add(c.unique_code);
   }
   return open;
-}
-function openCount(campaign) {
-  return campaign.ledger.views().filter((v) => v.state === "dispatched" || v.state === "help" || v.state === "stalled").length;
 }
 function walk(dir) {
   const out = [];
@@ -859,12 +1026,312 @@ function apply(ctx) {
       if (buckets[section].length > 0) appendKnowledgeFile(code, section, buckets[section]);
     }
   }
+  const orchFor = (code) => state?.orch.get(code);
+  function bumpOrch(s) {
+    s.orchVersion += 1;
+  }
+  function persistOrch(s) {
+    try {
+      writeFileSync(s.orchPath, serializeOrchState(s.orch, s.pendingAdj));
+    } catch {
+    }
+  }
+  function addPending(s, pa) {
+    s.pendingAdj = s.pendingAdj.filter((x) => !(x.code === pa.code && x.kind === pa.kind)).concat(pa);
+  }
+  function removePending(s, code, kind) {
+    s.pendingAdj = s.pendingAdj.filter((x) => x.code !== code || kind !== void 0 && x.kind !== kind);
+  }
+  async function releaseGrant(code) {
+    const s = requireState();
+    if (!s.grantedCodes.delete(code)) return;
+    try {
+      await s.containerQueue?.release();
+    } catch {
+    }
+  }
+  function findingsLines(code) {
+    try {
+      const p = c().boardPath(code);
+      return existsSync(p) ? readFileSync(p, "utf8").split("\n").length : 0;
+    } catch {
+      return 0;
+    }
+  }
+  function artifactCount(code) {
+    let n = 0;
+    for (const name2 of [code, code.replace(/-/g, "")]) {
+      try {
+        const dir = join2(process.cwd(), name2);
+        if (existsSync(dir)) {
+          for (const f of walk(dir)) if (!f.endsWith(".pyc")) n += 1;
+        }
+      } catch {
+      }
+    }
+    return n;
+  }
+  function snapshotProgress(code) {
+    return { at: Date.now(), findingsLines: findingsLines(code), forkCount: knowledgeOfCode(code).length, artifactCount: artifactCount(code) };
+  }
+  function ensureVq(code) {
+    const s = requireState();
+    const ch = s.challenges.get(code);
+    let vq = s.v2[code];
+    if (vq === void 0) {
+      vq = {
+        qtype: classifyQtype(ch?.description ?? ""),
+        difficulty: difficultyPrior(ch?.total_score ?? 300),
+        wins: 0,
+        fails: 0,
+        gaps: [],
+        triedModels: [],
+        ideaRound: 1,
+        deadIdeas: 0,
+        adopted: 0
+      };
+      s.v2[code] = vq;
+      persistV2(s);
+    }
+    return vq;
+  }
+  function gapsTxtOf(code) {
+    const s = requireState();
+    const vq = s.v2[code];
+    if (vq === void 0 || vq.gaps.length === 0) return "";
+    return "\n\n\u5DF2\u77E5\u4E0A\u4E0B\u6587\u7F3A\u53E3(\u524D\u5E8F\u6267\u884C\u8005\u53CD\u9988\u7F3A\u7684\u4FE1\u606F, \u82E5\u4F60\u80FD\u8865\u5219\u8865, \u4E0D\u80FD\u8865\u5219\u660E\u786E\u8BF4\u7F3A\u4EC0\u4E48):\n" + vq.gaps.slice(-5).map((g) => `- ${g}`).join("\n");
+  }
+  async function validateExecutorModel(model) {
+    const s = requireState();
+    if (jisi === void 0) return null;
+    try {
+      if (s.modelWhitelist.length > 0 && !s.modelWhitelist.includes(model)) return `\u767D\u540D\u5355\u5916`;
+      const listed = await jisi.listModels();
+      if (!listed.some((m) => m.id === model)) return `\u4E0D\u5728\u6A21\u578B\u76EE\u5F55`;
+      if (await jisi.isModelQuarantined?.(model)) return `provider \u4F59\u989D\u67AF\u7AED`;
+    } catch {
+    }
+    return null;
+  }
+  function pickSpawnModel(_code, idx) {
+    const s = requireState();
+    const allow = (m) => s.modelWhitelist.length === 0 || s.modelWhitelist.includes(m);
+    const mix = ["deepseek-v4-flash", "deepseek-flash", "glm-5.3"].filter(allow);
+    if (mix.length === 0) return s.executorPolicy.defaultModel;
+    return mix[idx % mix.length];
+  }
+  async function issueR2(code) {
+    const s = requireState();
+    if (jisi?.fanoutNotify === void 0 || parentAgent === void 0) return;
+    const ch = s.challenges.get(code);
+    if (ch === void 0) return;
+    const vq = ensureVq(code);
+    try {
+      const prompt = buildRefanoutPrompt(code);
+      const models = await pickRefanoutModels(vq);
+      const ticket = jisi.fanoutNotify(parentAgent, { prompt }, models);
+      vq.ideaRound += 1;
+      vq.triedModels.push(...models.filter((m) => !vq.triedModels.includes(m)));
+      s.v2[code] = vq;
+      persistV2(s);
+      audit(s.auditPath, { type: "v8-r2", code, models, ticket: ticket.id });
+    } catch {
+    }
+  }
+  const VERIFIER_DIRECTIVE = '[\u9A8C\u8BC1\u5175] \u72EC\u7ACB\u590D\u9A8C\u8D26\u672C\u91CC\u7684 blocker \u7ED3\u8BBA("\u65E0\u653B\u51FB\u9762/\u73AF\u5883\u7F3A\u5931/\u672A\u53D1\u5E03"\u7C7B): \u4E0D\u8981\u4FE1\u4EFB\u524D\u5E8F\u5224\u5B9A, \u91CD\u8DD1\u63A2\u6D4B\u786E\u8BA4\u3002\u8F93\u51FA\u5F00\u5934\u4E00\u884C "\u590D\u9A8C: \u786E\u8BA4" \u6216 "\u590D\u9A8C: \u63A8\u7FFB", \u9644\u8BC1\u636E; \u82E5\u63A8\u7FFB, \u7ACB\u5373\u7EE7\u7EED\u89E3\u9898(\u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1)\u3002';
+  async function grantAndSpawn(code) {
+    const s = requireState();
+    s.armed.delete(code);
+    const o = orchFor(code);
+    if (o === void 0 || o.state !== "queued") return;
+    try {
+      const fresh = await s.adapter.listChallenges();
+      for (const x of fresh) s.challenges.set(x.unique_code, x);
+    } catch {
+    }
+    const ch = s.challenges.get(code);
+    if (ch === void 0) return;
+    const cls = resourceClassOf(ch);
+    const prio = priorityOf(o, ch.total_score, Date.now());
+    const snapshot = snapshotProgress(code);
+    grant(o, snapshot, Date.now(), s.timeboxMs);
+    const nSpawn = Math.max(1, Math.min(o.multiSpawn, 3));
+    o.multiSpawn = 0;
+    if (o.r2Due) {
+      o.r2Due = false;
+      void issueR2(code);
+    }
+    const vq = ensureVq(code);
+    const picks = [];
+    if (o.blockerCheck === "in-flight") {
+      picks.push({ text: VERIFIER_DIRECTIVE });
+    } else {
+      const untried = o.directives.filter((d) => !d.tried);
+      for (let i = 0; i < nSpawn; i++) {
+        const d = untried.shift();
+        if (d !== void 0) picks.push(d);
+        else picks.push({ text: "\u6309\u8D26\u672C+\u753B\u50CF\u81EA\u7531\u7A81\u7834: \u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1, \u4E0D\u6253\u6B7B\u8DEF" });
+      }
+      for (const d of picks) {
+        const orig = o.directives.find((x) => x.text === d.text);
+        if (orig !== void 0) orig.tried = true;
+      }
+    }
+    for (let i = 0; i < picks.length; i++) {
+      const d = picks[i];
+      const workNo = (s.enqCounters.get(code) ?? 0) + 1;
+      s.enqCounters.set(code, workNo);
+      const itemId = `${code}#s${o.attempts}-w${workNo}`;
+      const executor = resolveExecutor({ model: d.model ?? pickSpawnModel(code, i), effort: d.effort }, s.executorPolicy);
+      const err = await validateExecutorModel(executor.model);
+      const model = err === null ? executor.model : s.executorPolicy.defaultModel;
+      const label = buildExecFrame(code, d.text) + gapsTxtOf(code);
+      c().add({
+        id: itemId,
+        label,
+        model,
+        reasoningEffort: executor.effort,
+        board: code,
+        resourceClass: cls,
+        priority: { tier: tierOf(ch.difficulty), score: prio }
+      });
+      if (!vq.triedModels.includes(model)) vq.triedModels.push(model);
+      persistV2(s);
+      audit(s.auditPath, { type: "v8-spawn", id: itemId, code, attempts: o.attempts, model, class: cls });
+    }
+    let count = 0;
+    while (true) {
+      const d2 = await c().dispatchNext();
+      if (d2 === void 0) break;
+      count += 1;
+    }
+    audit(s.auditPath, { type: "v8-grant", code, spawn: picks.length, dispatched: count });
+    bumpOrch(s);
+    persistOrch(s);
+    persistProgress(s);
+  }
+  function armQueue() {
+    const s = requireState();
+    const q = s.containerQueue;
+    if (q === void 0) return;
+    const now = Date.now();
+    const codes = [...s.challenges.keys()].sort((a, b) => {
+      const pa = priorityOf(s.orch.get(a) ?? newOrch(a, now), s.challenges.get(a)?.total_score ?? 300, now);
+      const pb = priorityOf(s.orch.get(b) ?? newOrch(b, now), s.challenges.get(b)?.total_score ?? 300, now);
+      return pb - pa;
+    });
+    for (const code of codes) {
+      const o = s.orch.get(code);
+      if (o === void 0 || o.state !== "queued") continue;
+      if (s.armed.has(code)) continue;
+      const p = s.progress.get(code);
+      if (p !== void 0 && (p.state === "complete" || p.state === "failed" || p.state === "skipped")) continue;
+      const ch = s.challenges.get(code);
+      if (ch === void 0) continue;
+      if (resourceClassOf(ch) === "local") {
+        s.armed.add(code);
+        void grantAndSpawn(code);
+        continue;
+      }
+      s.armed.add(code);
+      void q.acquire(code).then((res) => {
+        if (res.status === "granted") {
+          s.grantedCodes.add(code);
+          void grantAndSpawn(code);
+        } else {
+          s.armed.delete(code);
+          audit(s.auditPath, { type: "v8-arm-drop", code, status: res.status, reason: res.reason });
+        }
+      });
+    }
+  }
+  async function settleClassify(itemId, detail) {
+    const s = requireState();
+    const code = codeOf(itemId);
+    const o = s.orch.get(code);
+    if (o === void 0) return;
+    if (s.settleProcessed.has(itemId)) return;
+    s.settleProcessed.add(itemId);
+    if (o.state !== "granted") return;
+    const now = Date.now();
+    const sn = o.snapshot;
+    const knownFlags = new Set(s.progress.get(code)?.flags ?? []);
+    const boardHasNewFlag = (() => {
+      try {
+        const p2 = c().boardPath(code);
+        if (!existsSync(p2)) return false;
+        const text = readFileSync(p2, "utf8");
+        const found = [...text.matchAll(/FLAG_CANDIDATE:?\s*([^\s<]+)|flag\{[^}\s]{6,}\}|FLAG\{[^}\s]{6,}\}|mock\{[^}\s]{6,}\}/g)].map((m) => m[1] ?? m[0]);
+        return found.some((f) => !knownFlags.has(f));
+      } catch {
+        return false;
+      }
+    })();
+    const p = {
+      flagCandidate: /FLAG_CANDIDATE\s*:/.test(detail) || boardHasNewFlag,
+      findingsDelta: sn !== void 0 ? Math.max(0, findingsLines(code) - sn.findingsLines) : 0,
+      forkDelta: sn !== void 0 ? Math.max(0, knowledgeOfCode(code).length - sn.forkCount) : 0,
+      artifactsDelta: sn !== void 0 ? Math.max(0, artifactCount(code) - sn.artifactCount) : 0,
+      blockerConcluded: blockerConcluded(detail) || knowledgeOfCode(code).some((k) => k.kind === "dead-end" && blockerConcluded(`${k.path} ${k.conclusion ?? ""}`)),
+      detail
+    };
+    if (o.blockerCheck === "in-flight") applyVerifierResult(o, verifierVerdict(detail));
+    const action = settleAction(o, p);
+    applySettle(o, action, detail, now);
+    if (!p.flagCandidate) o.settleNoFlag += 1;
+    const board = c().boardPath(code);
+    if (action === "pending-flag") {
+      addPending(s, makePending(code, "flag-candidate", `${code} \u6709\u65D7\u5F85\u63D0\u4EA4: \u5C3D\u5FEB xiaochang_submit(\u5BB9\u5668\u5728\u7EBF\u5BBD\u9650 15min, \u8D85\u65F6\u5BB9\u5668\u5173/\u65D7\u503C\u53EF\u80FD\u8F6E\u6362)`, board, now));
+    } else if (action === "adjudicate") {
+      const kind = o.blockerCheck === "confirmed" ? "blocker-verified" : "needs-verdict";
+      const summary = kind === "blocker-verified" ? `${code} blocker \u5DF2\u88AB\u9A8C\u8BC1\u5175\u786E\u8BA4: \u4E3B agent \u88C1\u51B3 \u5224\u6B7B/\u7EED\u6253` : `${code} \u96F6\u8FDB\u5C55\xD7${o.zeroProgressStreak} \u6302\u88C1\u51B3: \u4E3B agent \u88C1\u51B3 \u5224\u6B7B/\u7EED\u6253/\u62C9hint(\u95F8\u5DF2\u5F00)`;
+      addPending(s, makePending(code, kind, summary, board, now));
+    }
+    const hasOthers = c().ledger.views().some((x) => x.item.id !== itemId && codeOf(x.item.id) === code && (x.state === "dispatched" || x.state === "help" || x.state === "stalled"));
+    if (action !== "pending-flag" && !hasOthers) {
+      try {
+        await s.adapter.close(code);
+      } catch {
+      }
+      await releaseGrant(code);
+      s.progress.update(code, { containerClosed: true });
+    }
+    audit(s.auditPath, { type: "v8-settle", itemId, code, action, flagCandidate: p.flagCandidate });
+    bumpOrch(s);
+    persistOrch(s);
+    persistProgress(s);
+    if (action !== "pending-flag") armQueue();
+  }
+  async function tickOrch() {
+    const s = requireState();
+    const now = Date.now();
+    let changed = false;
+    for (const [code, o] of s.orch) {
+      if (!timeboxExpired(o, now)) continue;
+      if (o.state === "pending-adjudication") removePending(s, code, "flag-candidate");
+      try {
+        await s.adapter.close(code);
+      } catch {
+      }
+      await releaseGrant(code);
+      rearmByTimebox(o);
+      s.progress.update(code, { containerClosed: true });
+      audit(s.auditPath, { type: "v8-timebox", code });
+      changed = true;
+    }
+    if (changed) {
+      bumpOrch(s);
+      persistOrch(s);
+      persistProgress(s);
+      armQueue();
+    }
+  }
   function buildExecFrame(code, directive) {
     const s = requireState();
     const ch = s.challenges.get(code);
     if (ch === void 0) return directive;
     const cls = resourceClassOf(ch);
-    const addrs = ch.container_addr.length > 0 ? ch.container_addr.join(",") : cls === "local" ? "\u65E0\u9700\u5BB9\u5668(\u672C\u5730\u6C42\u89E3: bash/python \u76F4\u5F00)" : "\u5BB9\u5668\u672A\u5F00: \u8BF7\u4E3B agent xiaochang_start_container, \u6216\u4F60\u81EA\u884C\u8C03\u7528(\u5E73\u53F0\u540C\u65F6\u6700\u591A 3 \u4E2A\u5BB9\u5668)";
+    const addrs = ch.container_addr.length > 0 ? ch.container_addr.join(",") : cls === "local" ? "\u65E0\u9700\u5BB9\u5668(\u672C\u5730\u6C42\u89E3: bash/python \u76F4\u5F00)" : "\u5BB9\u5668\u7531\u8C03\u5EA6\u673A\u5236\u6388\u4E88\u2014\u2014\u4F60\u6301\u69FD\u5F00\u5DE5, \u65E0\u9700\u81EA\u884C\u542F\u52A8/\u7B49\u5F85\u5BB9\u5668(\u6267\u884C\u8005\u6CA1\u6709 start_container \u5DE5\u5177)";
     const kn = ensureKnowledgeFile(code);
     return [
       `\u3010\u6821\u573A\u6267\u884C\u4EE4 \xB7 ${code}\u3011(${cls === "local" ? "\u9644\u4EF6\u9898\xB7\u5168\u5E76\u884C" : "\u5BB9\u5668\u9898\xB73\u69FD\u8F6E\u6362"}, ${ch.difficulty}, ${ch.total_score}pts, ${ch.flag_count} flags)`,
@@ -899,6 +1366,7 @@ function apply(ctx) {
       defaultEffort: { type: "string", description: "Executor default reasoning effort. Default low." },
       modelLock: { type: "boolean", description: "Lock: force ALL executors to defaultModel/defaultEffort, ignoring per-item overrides (user/parent-agent override). Default false (main agent may switch models per item)." },
       containerSlots: { type: "number", description: "v7 container-challenge concurrency slots (platform container cap). Default 3; attachment challenges are never constrained by this." },
+      timeboxMinutes: { type: "number", description: "v8 single-grant timebox in minutes (default 30). Local dry runs may pass a smaller value to exercise the timebox path." },
       modelWhitelist: { type: "string", description: "v7.8 model whitelist (comma-separated; empty = no restriction). Local dry runs should pass deepseek models \u2014 unreachable models are excluded from auto-R2 and enqueue validation." }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
@@ -965,7 +1433,15 @@ function apply(ctx) {
         containerSlots: args.containerSlots ?? 3,
         platformScore: void 0,
         enqCounters: /* @__PURE__ */ new Map(),
-        modelWhitelist: (typeof args.modelWhitelist === "string" ? args.modelWhitelist.split(",").map((m) => m.trim()) : args.modelWhitelist ?? []).filter((m) => m !== "")
+        modelWhitelist: (typeof args.modelWhitelist === "string" ? args.modelWhitelist.split(",").map((m) => m.trim()) : args.modelWhitelist ?? []).filter((m) => m !== ""),
+        orch: /* @__PURE__ */ new Map(),
+        pendingAdj: [],
+        orchPath: join2(home, "storages", `xiaochang-orch-${args.runId ?? "pending"}.json`),
+        armed: /* @__PURE__ */ new Set(),
+        grantedCodes: /* @__PURE__ */ new Set(),
+        settleProcessed: /* @__PURE__ */ new Set(),
+        orchVersion: 0,
+        timeboxMs: (args.timeboxMinutes ?? 30) * 6e4
       };
       try {
         if (existsSync(s.profilePath)) s.profile = parse(readFileSync(s.profilePath, "utf8"));
@@ -997,7 +1473,7 @@ function apply(ctx) {
         s.containerQueue = holder.resourceQueue({
           capacity: s.containerSlots,
           pollMs: 3e3,
-          defaultTimeoutMs: 5 * 6e4,
+          defaultTimeoutMs: Math.max(10 * 60 * 6e4, s.budgetMs + 60 * 6e4),
           canGrant: async () => {
             try {
               const fresh2 = await s.adapter.listChallenges();
@@ -1020,6 +1496,30 @@ function apply(ctx) {
           }
         });
       }
+      try {
+        if (existsSync(s.orchPath)) {
+          const back = parseOrchState(readFileSync(s.orchPath, "utf8"));
+          s.orch = back.orch;
+          s.pendingAdj = back.pending;
+        }
+        for (const ch of fresh) {
+          if (!s.orch.has(ch.unique_code)) s.orch.set(ch.unique_code, newOrch(ch.unique_code, s.startedAt));
+        }
+      } catch {
+      }
+      persistOrch(s);
+      if (campaignId !== void 0 && holder.onSettle !== void 0) {
+        holder.onSettle(campaignId, (ev) => {
+          void settleClassify(ev.itemId, ev.text);
+        });
+      }
+      if (tickTimer !== void 0) clearInterval(tickTimer);
+      tickTimer = setInterval(() => {
+        void tickOrch();
+        armQueue();
+      }, 3e4);
+      tickTimer.unref?.();
+      armQueue();
       persistProgress(s);
       try {
         if (existsSync(s.v2Path)) s.v2 = JSON.parse(readFileSync(s.v2Path, "utf8"));
@@ -1109,55 +1609,21 @@ ${rows.join("\n")}`;
     }
   }));
   register(defineTool({
-    name: "xiaochang_start_container",
-    description: "Start a challenge container (platform cap: 3). v7.6: waits in the resource queue with ZERO tokens \u2014 the call blocks here (polling platform state internally) until a slot frees, then starts automatically; same-challenge waiters share one container. Returns the addrs + board path. Timeout (5min) or challenge-terminal eviction return a message instead \u2014 do NOT spin your own retry loop.",
-    parameters: {
-      code: { type: "string", required: true, description: "Challenge unique_code." }
-    },
-    output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
-    isConcurrencySafe: () => false,
-    async execute(args) {
-      const s = requireState();
-      const fresh0 = await s.adapter.listChallenges();
-      for (const x of fresh0) s.challenges.set(x.unique_code, x);
-      const ch = s.challenges.get(args.code);
-      if (ch === void 0) return `xiaochang_start_container: unknown challenge ${args.code}`;
-      if (ch.container_status === "available" && ch.container_addr.length > 0) {
-        return `already available: addrs=${ch.container_addr.join(",")}
-boardPath=${c().boardPath(args.code)}`;
-      }
-      const q = s.containerQueue;
-      if (q === void 0) return "xiaochang_start_container: \u8D44\u6E90\u961F\u5217\u672A\u521D\u59CB\u5316\u2014\u2014\u5148 xiaochang_setup";
-      const res = await q.acquire(args.code, { timeoutMs: 5 * 6e4 });
-      if (res.status === "granted") {
-        const fresh = await s.adapter.listChallenges();
-        for (const x of fresh) s.challenges.set(x.unique_code, x);
-        const now = s.challenges.get(args.code);
-        const addrs = now?.container_addr ?? [];
-        return `started: addrs=${addrs.join(",")}
-boardPath=${c().boardPath(args.code)}`;
-      }
-      if (res.status === "timeout") {
-        return `xiaochang_start_container: \u6392\u961F\u4F4D ${res.position} \u5DF2\u7B49 5 \u5206\u949F\u4ECD\u65E0\u5BB9\u5668\u69FD\u2014\u2014\u628A"\u9700\u8981\u5BB9\u5668"\u5199\u8FDB\u6218\u62A5\u540E\u6536\u5DE5, \u7531\u4E3B agent \u8C03\u5EA6; \u4E0D\u8981\u81EA\u5DF1\u518D\u5199\u91CD\u8BD5\u5FAA\u73AF`;
-      }
-      return `xiaochang_start_container: ${res.reason ?? "\u5DF2\u51FA\u961F"}\u2014\u2014\u8BE5\u9898\u5DF2\u7EC8\u6001/\u88AB\u4E2D\u65AD, \u65E0\u9700\u5BB9\u5668; \u6536\u5DE5\u7B49\u4E3B agent \u5904\u7406`;
-    }
-  }));
-  register(defineTool({
     name: "xiaochang_close",
-    description: "Close a challenge container (release a platform slot; wakes the next waiter in the resource queue).",
+    description: 'Close a challenge container (release a platform slot; wakes the next challenge in the queue). v8: main agent ONLY \u2014 container scheduling decisions belong to the main agent; executors report "needs rotate" in their settle report instead.',
     parameters: { code: { type: "string", required: true } },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args) {
+    async execute(args, exec) {
+      if (parentAgent !== void 0 && exec.agent !== parentAgent) {
+        return 'xiaochang_close: \u62D2\u7EDD\u2014\u2014\u5BB9\u5668\u8C03\u5EA6\u662F\u4E3B agent \u4E13\u5C5E; \u6267\u884C\u8005\u9700\u8981\u6362\u5B9E\u4F8B\u8BF7\u5728\u7EC8\u6001\u62A5\u544A\u91CC\u5199"\u9700\u8981\u6362\u5B9E\u4F8B+\u7406\u7531"';
+      }
       const s = requireState();
       await s.adapter.close(args.code);
       s.progress.update(args.code, { containerClosed: true });
       persistProgress(s);
-      try {
-        await s.containerQueue?.release();
-      } catch {
-      }
+      await releaseGrant(args.code);
+      armQueue();
       return `closed ${args.code}`;
     }
   }));
@@ -1180,6 +1646,7 @@ boardPath=${c().boardPath(args.code)}`;
             manifest.push(`${code}: \u5BB9\u5668\u6392\u961F ${res.status === "timeout" ? "\u8D85\u65F6" : "\u51FA\u961F"}\u2014\u2014\u7559\u7ED9\u6267\u884C\u8005\u5904\u7406`);
             continue;
           }
+          s.grantedCodes.add(code);
           const fresh = await s.adapter.listChallenges();
           for (const x of fresh) s.challenges.set(x.unique_code, x);
           const addr = s.challenges.get(code)?.container_addr?.[0];
@@ -1211,10 +1678,7 @@ boardPath=${c().boardPath(args.code)}`;
             await s.adapter.close(code);
           } catch {
           }
-          try {
-            await s.containerQueue?.release();
-          } catch {
-          }
+          await releaseGrant(code);
           s.progress.update(code, { containerClosed: true });
           downloaded += saved;
           manifest.push(`${code}: \u4E0B\u8F7D ${saved} \u4EF6${saved === 0 ? "(\u5019\u9009\u8DEF\u5F84\u65E0\u547D\u4E2D, \u7559\u7ED9\u6267\u884C\u8005)" : ""}`);
@@ -1242,6 +1706,61 @@ ${manifest.join("\n")}`;
         return "xiaochang_submit: \u62D2\u7EDD\u2014\u2014submit \u662F\u4E3B agent \u4E13\u5C5E\u5355\u70B9(\u4EA4\u5377\u8DEF\u5F84\u4E32\u884C\u53EF\u5BA1\u8BA1); \u6267\u884C\u8005\u8BF7\u628A flag \u8F93\u51FA\u4E3A FLAG_CANDIDATE: <flag> \u4EA4\u7ED9\u4E3B agent \u63D0\u4EA4";
       }
       const s = requireState();
+      const v8AfterSubmit = async (correct) => {
+        const o = s.orch.get(args.code);
+        if (o === void 0) return;
+        if (correct) {
+          removePending(s, args.code, "flag-candidate");
+          const fresh = await s.adapter.listChallenges();
+          for (const x of fresh) s.challenges.set(x.unique_code, x);
+          const ch = s.challenges.get(args.code);
+          const allFlags = ch !== void 0 && ch.flag_count > 0 && (ch.correct_flag_count ?? 0) >= ch.flag_count;
+          if (allFlags) {
+            adjudicate(o, "solved");
+            removePending(s, args.code);
+            try {
+              await s.adapter.close(args.code);
+            } catch {
+            }
+            await releaseGrant(args.code);
+            try {
+              s.containerQueue?.evict(args.code, "solved");
+            } catch {
+            }
+            s.armed.delete(args.code);
+            s.progress.update(args.code, { state: "complete", containerClosed: true });
+            for (const v of c().ledger.views()) {
+              if (codeOf(v.item.id) === args.code && ["queued", "dispatched", "help", "stalled"].includes(v.state)) {
+                if (v.state !== "queued") {
+                  try {
+                    await c().interruptItem?.(v.item.id);
+                  } catch {
+                  }
+                }
+                try {
+                  c().cancel(v.item.id, "challenge solved");
+                } catch {
+                }
+              }
+            }
+            audit(s.auditPath, { type: "v8-submit-solved", code: args.code });
+          } else {
+            adjudicate(o, "continue");
+            armQueue();
+            audit(s.auditPath, { type: "v8-submit-partial", code: args.code });
+          }
+          bumpOrch(s);
+          persistOrch(s);
+          persistProgress(s);
+        } else {
+          adjudicate(o, "continue");
+          removePending(s, args.code, "flag-candidate");
+          bumpOrch(s);
+          persistOrch(s);
+          armQueue();
+          audit(s.auditPath, { type: "v8-submit-reject", code: args.code });
+        }
+      };
       try {
         const recordWin = (flag) => {
           const p = s.progress.get(args.code);
@@ -1260,6 +1779,7 @@ ${manifest.join("\n")}`;
         if (typeof res.cumulative_score === "number") s.platformScore = res.cumulative_score;
         if (res.correct) {
           recordWin(args.flag);
+          await v8AfterSubmit(true);
           return JSON.stringify(res);
         }
         const desc = s.challenges.get(args.code)?.description ?? "";
@@ -1269,10 +1789,13 @@ ${manifest.join("\n")}`;
           if (typeof res2.cumulative_score === "number") s.platformScore = res2.cumulative_score;
           if (res2.correct) {
             recordWin(wrapped);
+            await v8AfterSubmit(true);
             return `\u88F8\u4E32\u88AB\u62D2, \u81EA\u52A8\u56DE\u9000\u5305\u88C5\u63D0\u4EA4\u6210\u529F: ${JSON.stringify(res2)}`;
           }
+          await v8AfterSubmit(false);
           return `\u88F8\u4E32\u88AB\u62D2(${JSON.stringify(res)}); \u5305\u88C5\u56DE\u9000\u4E5F\u88AB\u62D2(${JSON.stringify(res2)})\u2014\u2014\u4EE5\u5E73\u53F0\u5224\u5B9A\u4E3A\u51C6, \u6362\u503C\u6216\u6362\u9898\u9762\u53E3\u5F84`;
         }
+        await v8AfterSubmit(false);
         return JSON.stringify(res);
       } catch (error) {
         return `submit error: ${String(error)}`;
@@ -1294,7 +1817,8 @@ ${manifest.join("\n")}`;
       if (used >= s.maxHints) return "xiaochang_hint: hint cap reached";
       const vq = s.v2[args.code];
       const ff = filteredFailedOf(args.code, campaign);
-      const gate = hintGate({ ideaRound: vq?.ideaRound ?? 1, filteredFailed: ff.failed });
+      const noFlagSettles = s.orch.get(args.code)?.settleNoFlag ?? 0;
+      const gate = hintGate({ ideaRound: vq?.ideaRound ?? 1, filteredFailed: ff.failed + noFlagSettles });
       if (!gate.allowed) {
         return `xiaochang_hint: \u62D2\u7EDD(hint \u6263\u8BE5\u9898\u5206\u503C, \u662F R2+\u5931\u8D25\u540E\u7684\u6700\u540E\u624B\u6BB5): ${gate.missing.join("; ")}\u3002\u5F53\u524D\u8BE5\u9898 hint \u5DF2\u7528 ${used}/${s.maxHints}\u3001\u5DF2\u6263 ${s.hintLedger.get(args.code)?.deducted ?? 0} \u5206\u3002`;
       }
@@ -1309,22 +1833,22 @@ ${manifest.join("\n")}`;
   }));
   register(defineTool({
     name: "xiaochang_enqueue",
-    description: "Enqueue one executor work item into the hufu campaign. v7 lean prompt: write ONLY the task directive (assigned idea/approach in one or two lines) \u2014 the mechanism wraps it with a fixed exec frame (challenge description, live container addrs, shared board path, per-challenge knowledge ledger path, org profile path, FLAG_CANDIDATE discipline). Executors read the knowledge ledger first (prior skeletons/dead-ends/artifacts/forks). resourceClass is auto-set by challenge type (attachment\u2192local full-parallel; container\u21923-slot rotation); override only when you know better. Optional dependsOn makes it a DAG node. v7.6 prompt rules: directive \u2264700 chars; do NOT paste CVE lists/default-credential dictionaries/product fingerprint tables \u2014 that knowledge already lives in the executor model and in the org profile; put reusable knowledge in the ledger (xiaochang_knowledge_put) and reference it. Overlong directives are truncated and you get a cut-point report to decide whether to rewrite.",
+    description: "v8: put a CHALLENGE into the challenge queue with a directive package (\u601D\u8DEF\u5305). The queue is the single scheduler: when a slot is granted, the mechanism starts the container (if needed) and spawns the executor bound to it \u2014 no manual start/dispatch. Re-call to add more directives (untried ones are consumed at each grant) or to raise priority. Executors never wait for containers; challenges wait, zero tokens.",
     parameters: {
       code: { type: "string", required: true },
-      round: { type: "number", required: true, description: "Round number (your own accounting)." },
-      prompt: { type: "string", required: true, description: "The lean directive: the assigned approach/idea for this executor (1-3 lines, \u2264700 chars). Do NOT paste the challenge description/addrs/board discipline \u2014 the frame injects those. Do NOT paste CVE/dictionary-style knowledge." },
-      model: { type: "string", description: "Executor model. Default deepseek-v4-flash (cheap fast path; override for hard challenges)." },
-      effort: { type: "string", description: "Reasoning effort (unsupported efforts are dropped per model)." },
-      dependsOn: { type: "array", description: "Item ids this item waits for (DAG)." },
-      priority: { type: "number", description: "Priority score (higher first within difficulty tier)." },
-      resourceClass: { type: "string", description: "Override the auto class: local (attachment-style, full parallel) or container (counts against the container slot cap). Auto by challenge type \u2014 override only when you know the container is already open or the type guess is wrong." }
+      prompt: { type: "string", required: true, description: "The lean directive: the assigned approach/idea for this challenge (1-3 lines, \u2264700 chars). Do NOT paste the challenge description/addrs/board discipline \u2014 the frame injects those. Do NOT paste CVE/dictionary-style knowledge." },
+      priority: { type: "number", description: "v8: explicit queue priority override (default = score density + never-dispatched boost)." },
+      model: { type: "string", description: "Preferred executor model for this directive (falls back to default if invalid/unlisted)." },
+      effort: { type: "string", description: "Reasoning effort for this directive." },
+      round: { type: "number", description: "v8: ignored (kept for compatibility) \u2014 rounds are managed by the mechanism." },
+      dependsOn: { type: "array", description: "v8: ignored (kept for compatibility)." },
+      resourceClass: { type: "string", description: "v8: ignored (kept for compatibility) \u2014 class is auto by challenge type." }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
     async execute(args, exec) {
       if (parentAgent !== void 0 && exec.agent !== parentAgent) {
-        return "xiaochang_enqueue: \u62D2\u7EDD\u2014\u2014\u6D3E\u5355\u662F\u4E3B agent \u4E13\u5C5E(\u5355\u8C03\u5EA6\u5668); \u6267\u884C\u8005\u53EA\u89E3\u81EA\u5DF1\u7684\u9898, \u6709\u53D1\u73B0\u7528 xiaochang_fork \u4E0A\u62A5";
+        return "xiaochang_enqueue: \u62D2\u7EDD\u2014\u2014\u5165\u9898\u961F\u5217\u662F\u4E3B agent \u4E13\u5C5E(\u5355\u8C03\u5EA6\u5668); \u6267\u884C\u8005\u53EA\u89E3\u81EA\u5DF1\u7684\u9898, \u6709\u53D1\u73B0\u7528 xiaochang_fork \u4E0A\u62A5";
       }
       const s = requireState();
       const ch = s.challenges.get(args.code);
@@ -1334,68 +1858,45 @@ ${manifest.join("\n")}`;
         syncKnowledgeFileFromLedger(args.code);
       } catch {
       }
-      const vq = s.v2[args.code];
-      let gapsTxt = "";
-      if (vq !== void 0 && vq.gaps.length > 0) {
-        gapsTxt = "\n\n\u5DF2\u77E5\u4E0A\u4E0B\u6587\u7F3A\u53E3(\u524D\u5E8F\u6267\u884C\u8005\u53CD\u9988\u7F3A\u7684\u4FE1\u606F, \u82E5\u4F60\u80FD\u8865\u5219\u8865, \u4E0D\u80FD\u8865\u5219\u660E\u786E\u8BF4\u7F3A\u4EC0\u4E48):\n" + vq.gaps.slice(-5).map((g) => `- ${g}`).join("\n");
-      }
       const DIRECTIVE_MAX = 700;
       const trunc = truncateDirective(args.prompt, DIRECTIVE_MAX);
       let truncNotice = "";
       if (trunc.truncated) {
         truncNotice = `
-\u26A0\uFE0F \u65B9\u5411\u6BB5\u622A\u65AD\u53CD\u9988: ${args.prompt.length}\u2192${DIRECTIVE_MAX} \u5B57\u7B26, \u622A\u70B9\u539F\u6587 "${trunc.cutTail}\u2026"\u3002\u88AB\u780D\u6389\u7684\u5185\u5BB9\u82E5\u662F\u5173\u952E\u9A8C\u8BC1\u70B9: \u2460\u7528 xiaochang_knowledge_put \u5199\u8FDB\u8BE5\u9898\u8D26\u672C\u2460/\u2462(\u6267\u884C\u8005\u5F00\u5DE5\u5FC5\u8BFB, \u4E0D\u5360 prompt), \u6216 \u2461\u62C6\u6210\u591A\u6761\u6D3E\u5355; \u82E5\u53EA\u662F CVE/\u53E3\u4EE4\u8BCD\u5178\u7C7B\u516C\u5171\u77E5\u8BC6, \u4E0D\u7528\u8865\u2014\u2014\u6267\u884C\u8005\u6A21\u578B\u81EA\u5E26\u3002\u9700\u8981\u6539\u5199\u8BF7\u91CD\u65B0 enqueue\u3002`;
+\u26A0\uFE0F \u65B9\u5411\u6BB5\u622A\u65AD\u53CD\u9988: ${args.prompt.length}\u2192${DIRECTIVE_MAX} \u5B57\u7B26, \u622A\u70B9\u539F\u6587 "${trunc.cutTail}\u2026"\u3002\u88AB\u780D\u6389\u7684\u5185\u5BB9\u82E5\u662F\u5173\u952E\u9A8C\u8BC1\u70B9: \u2460\u7528 xiaochang_knowledge_put \u5199\u8FDB\u8BE5\u9898\u8D26\u672C\u2460/\u2462(\u6267\u884C\u8005\u5F00\u5DE5\u5FC5\u8BFB, \u4E0D\u5360 prompt), \u6216 \u2461\u518D enqueue \u4E00\u6761; \u82E5\u53EA\u662F CVE/\u53E3\u4EE4\u8BCD\u5178\u7C7B\u516C\u5171\u77E5\u8BC6, \u4E0D\u7528\u8865\u2014\u2014\u6267\u884C\u8005\u6A21\u578B\u81EA\u5E26\u3002`;
       }
-      const cls = args.resourceClass ?? resourceClassOf(ch);
-      const label = buildExecFrame(args.code, trunc.text) + gapsTxt;
-      const workNo = (s.enqCounters.get(args.code) ?? 0) + 1;
-      s.enqCounters.set(args.code, workNo);
-      const itemId = `${args.code}#s${args.round}-w${workNo}`;
-      const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy);
-      if (jisi !== void 0) {
-        const listed = await jisi.listModels();
-        if (s.modelWhitelist.length > 0 && !s.modelWhitelist.includes(executor.model)) {
-          return `xiaochang_enqueue: model ${executor.model} \u4E0D\u5728\u672C\u5C40\u767D\u540D\u5355(${s.modelWhitelist.join(",")})\u2014\u2014\u6362\u767D\u540D\u5355\u5185\u6A21\u578B`;
-        }
-        if (!listed.some((m) => m.id === executor.model)) {
-          return `xiaochang_enqueue: model ${executor.model} is not in the registered model catalog (jisi listModels) \u2014 pick a listed model`;
-        }
-        if (await jisi.isModelQuarantined?.(executor.model)) {
-          return `xiaochang_enqueue: model ${executor.model} \u6240\u5C5E provider \u4F59\u989D\u5DF2\u67AF\u7AED(\u9694\u79BB\u4E2D)\u2014\u2014\u6362\u6A21\u578B; \u5E76\u628A"provider \u4F59\u989D\u4E0D\u8DB3"\u5199\u8FDB\u6218\u62A5/\u6700\u7EC8\u6D88\u606F\u63D0\u793A\u7528\u6237\u5145\u503C`;
-        }
+      const o = s.orch.get(args.code) ?? (() => {
+        const n = newOrch(args.code, s.startedAt);
+        s.orch.set(args.code, n);
+        return n;
+      })();
+      if (o.state === "solved" || o.state === "dead") {
+        return `xiaochang_enqueue: \u62D2\u7EDD\u2014\u2014${args.code} \u5DF2${o.state === "solved" ? "\u89E3\u51FA" : "\u5224\u6B7B"}, \u4E0D\u518D\u5165\u961F`;
       }
-      c().add({
-        id: itemId,
-        label,
-        model: executor.model,
-        reasoningEffort: executor.effort,
-        ...args.dependsOn !== void 0 && args.dependsOn.length > 0 ? { dependsOn: args.dependsOn } : {},
-        board: args.code,
-        resourceClass: cls,
-        priority: { tier: tierOf(ch.difficulty), score: args.priority ?? ch.total_score }
-      });
-      s.progress.update(args.code, { difficulty: ch.difficulty, rounds: Math.max(s.progress.get(args.code)?.rounds ?? 0, args.round) });
+      o.directives.push({ text: trunc.text, model: args.model, effort: args.effort, tried: false });
+      if (args.priority !== void 0) o.priorityOverride = args.priority;
+      if (o.state === "pending-adjudication") {
+        adjudicate(o, "continue");
+        removePending(s, args.code);
+      }
+      o.state = "queued";
+      bumpOrch(s);
+      persistOrch(s);
       persistProgress(s);
-      audit(s.auditPath, { type: "enqueue", id: itemId, code: args.code, round: args.round, model: executor.model, effort: executor.effort, class: cls });
-      return `enqueued ${itemId} (class=${cls}, executor=${executor.model}/${executor.effort}${executor.overriddenByLock ? ", OVERRIDDEN BY MODEL LOCK" : ""})${truncNotice}`;
+      audit(s.auditPath, { type: "v8-enqueue", code: args.code, directive: trunc.text.slice(0, 80), priority: args.priority });
+      armQueue();
+      return `enqueued ${args.code} (directives=${o.directives.length}, \u961F\u5217\u4F18\u5148\u7EA7=${priorityOf(o, ch.total_score, Date.now())}, \u72B6\u6001=${o.state})${truncNotice}`;
     }
   }));
   register(defineTool({
     name: "xiaochang_dispatch",
-    description: "Dispatch every READY queued item (DAG dependencies satisfied) while slots are free. Call this after enqueues and again each round \u2014 a finished item frees a slot immediately; no barrier ever waits for the slowest.",
+    description: "v8: REMOVED \u2014 dispatch is automatic. The challenge queue grants a container and spawns the executor in one atomic action; the main agent no longer dispatches manually. Call xiaochang_enqueue to put a challenge (with its directive package) into the queue.",
     parameters: {},
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
     async execute() {
-      const s = requireState();
-      let count = 0;
-      while (true) {
-        const dispatched = await c().dispatchNext();
-        if (dispatched === void 0) break;
-        count += 1;
-      }
-      audit(s.auditPath, { type: "dispatch-round", count, open: openCount(c()) });
-      return `dispatched ${count} item(s); open=${openCount(c())}`;
+      armQueue();
+      return "xiaochang_dispatch: v8 \u5DF2\u5E9F\u9664\u624B\u52A8\u6D3E\u5355\u2014\u2014\u6388\u4E88\u5373\u6D3E\u5175, \u7531\u9898\u961F\u5217\u673A\u5236\u81EA\u52A8\u6267\u884C\u3002\u7ED9\u9898\u6295\u601D\u8DEF\u5305\u7528 xiaochang_enqueue, \u770B\u961F\u5217/\u5F85\u51B3\u7528 xiaochang_status\u3002";
     }
   }));
   register(defineTool({
@@ -1420,16 +1921,9 @@ ${manifest.join("\n")}`;
         } catch {
         }
         audit(s.auditPath, { type: "interrupt", id: v.item.id, code: codeOf(v.item.id), reason: "round timeout" });
-        const timedCode = codeOf(v.item.id);
-        const hasOthers = c().ledger.views().some((x) => x.item.id !== v.item.id && codeOf(x.item.id) === timedCode && (x.state === "dispatched" || x.state === "help" || x.state === "stalled"));
-        if (!hasOthers) {
-          try {
-            s.containerQueue?.evict(timedCode, "last executor timed out");
-          } catch {
-          }
-        }
         c().report(v.item.id, "failed", "round timeout");
         s.processed.add(baseId(v.item.id));
+        void settleClassify(v.item.id, "round timeout");
       }
       for (const v of c().ledger.views()) {
         if (v.state !== "done" && v.state !== "failed" && v.state !== "blocked") continue;
@@ -1457,18 +1951,20 @@ ${manifest.join("\n")}`;
         audit(s.auditPath, { type: "terminal", id: v.item.id, state: v.state, round, detail: detail.slice(0, 300) });
         rows.push(`--- ${v.item.id} [${v.state}] round=${round} code=${code}
 ${detail.slice(0, 6e3)}`);
+        void settleClassify(v.item.id, detail);
       }
       persistProgress(s);
       persistProfile(s);
+      void tickOrch();
       return rows.length === 0 ? "xiaochang_collect: nothing settled yet" : rows.join("\n\n");
     }
   }));
   register(defineTool({
     name: "xiaochang_report",
-    description: "Report your judgment for a challenge: complete (flags captured) / failed (give up or rounds exhausted) / skipped. Closes the container and prunes the challenge's queued/in-flight sibling items (hufu cancel).",
+    description: "Adjudication (main agent ONLY). v8 verdicts: complete (flags captured, terminal) / failed (\u5224\u6B7B, terminal) / skipped (terminal) / continue (\u56DE\u961F\u7EED\u6253: re-queues the challenge, ladder reset) / rotate (\u6362\u5B9E\u4F8B: close + re-queue for a fresh container). Terminal verdicts close the container and prune the challenge's queued/in-flight sibling items; continue/rotate re-arm the challenge queue. Adjudicating removes the pending item from the dashboard.",
     parameters: {
       code: { type: "string", required: true },
-      verdict: { type: "string", required: true, description: "complete | failed | skipped" },
+      verdict: { type: "string", required: true, description: "complete | failed | skipped | continue | rotate" },
       reason: { type: "string", description: "Short reason (logged)." },
       deadEnds: { type: "array", description: "[{path, conclusion, evidence}] proven-infeasible paths." },
       forks: { type: "array", description: "[{path, conclusion, evidence}] untaken branches worth dispatching." },
@@ -1483,11 +1979,14 @@ ${detail.slice(0, 6e3)}`);
         return "xiaochang_report: \u62D2\u7EDD\u2014\u2014\u88C1\u51B3\u662F\u4E3B agent \u4E13\u5C5E(\u5355\u8C03\u5EA6\u5668); \u6267\u884C\u8005\u53EA\u62A5\u544A\u7ED3\u679C, \u4EA4\u4E3B agent \u5224\u65AD";
       }
       const s = requireState();
-      const verdict = args.verdict === "complete" ? "complete" : args.verdict === "failed" ? "failed" : "skipped";
+      const v8Verdicts = /* @__PURE__ */ new Set(["complete", "failed", "skipped", "continue", "rotate"]);
+      if (!v8Verdicts.has(args.verdict)) return `xiaochang_report: unknown verdict ${args.verdict} (complete|failed|skipped|continue|rotate)`;
+      const verdict = args.verdict;
+      const terminal = verdict === "complete" || verdict === "failed" || verdict === "skipped";
       const vq = s.v2[args.code] ?? { qtype: classifyQtype(s.challenges.get(args.code)?.description ?? ""), difficulty: difficultyPrior(s.challenges.get(args.code)?.total_score ?? 300), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 };
       const why = args.why;
       const win = verdict === "complete";
-      if (why !== "context-insufficient" && why !== "platform-issue") {
+      if (terminal && why !== "context-insufficient" && why !== "platform-issue") {
         vq.wins += win ? 1 : 0;
         vq.fails += win ? 0 : 1;
         vq.difficulty = calibrateDifficulty(vq);
@@ -1496,7 +1995,7 @@ ${detail.slice(0, 6e3)}`);
       if (args.gaps !== void 0 && args.gaps.length > 0) vq.gaps.push(...args.gaps);
       s.v2[args.code] = vq;
       persistV2(s);
-      if (jisi !== void 0) {
+      if (jisi !== void 0 && terminal) {
         jisi.settleAdoptions?.(args.code, win, why);
       }
       const entries = [
@@ -1516,37 +2015,49 @@ ${detail.slice(0, 6e3)}`);
         if ((args.forks?.length ?? 0) > 0) appendKnowledgeFile(args.code, "forks", args.forks.map(line));
       } catch {
       }
+      const o = s.orch.get(args.code);
+      if (o !== void 0) {
+        if (verdict === "complete") adjudicate(o, "solved");
+        else if (verdict === "failed" || verdict === "skipped") adjudicate(o, "dead");
+        else adjudicate(o, verdict === "rotate" ? "rotate" : "continue");
+      }
+      removePending(s, args.code);
       try {
         await s.adapter.close(args.code);
       } catch {
       }
-      try {
-        await s.containerQueue?.release();
-      } catch {
-      }
+      await releaseGrant(args.code);
       try {
         s.containerQueue?.evict(args.code, `challenge ${verdict}`);
       } catch {
       }
-      s.progress.update(args.code, { state: verdict, reason: args.reason, containerClosed: true });
-      for (const v of c().ledger.views()) {
-        if (codeOf(v.item.id) === args.code && (v.state === "queued" || v.state === "dispatched" || v.state === "help" || v.state === "stalled")) {
-          if (v.state !== "queued") {
+      s.armed.delete(args.code);
+      if (terminal) {
+        s.progress.update(args.code, { state: verdict === "complete" ? "complete" : verdict, reason: args.reason, containerClosed: true });
+        for (const v of c().ledger.views()) {
+          if (codeOf(v.item.id) === args.code && (v.state === "queued" || v.state === "dispatched" || v.state === "help" || v.state === "stalled")) {
+            if (v.state !== "queued") {
+              try {
+                await c().interruptItem?.(v.item.id);
+              } catch {
+              }
+              audit(s.auditPath, { type: "interrupt", id: v.item.id, code: args.code, reason: `challenge ${verdict}` });
+            }
             try {
-              await c().interruptItem?.(v.item.id);
+              c().cancel(v.item.id, `challenge ${verdict}: ${args.reason ?? ""}`);
             } catch {
             }
-            audit(s.auditPath, { type: "interrupt", id: v.item.id, code: args.code, reason: `challenge ${verdict}` });
-          }
-          try {
-            c().cancel(v.item.id, `challenge ${verdict}: ${args.reason ?? ""}`);
-          } catch {
           }
         }
+      } else {
+        s.progress.update(args.code, { containerClosed: true });
+        armQueue();
       }
+      bumpOrch(s);
+      persistOrch(s);
       persistProgress(s);
       audit(s.auditPath, { type: "verdict", code: args.code, state: verdict, reason: args.reason });
-      return `${args.code} \u2192 ${verdict}${args.reason !== void 0 ? ` (${args.reason})` : ""}`;
+      return `${args.code} \u2192 ${verdict}${args.reason !== void 0 ? ` (${args.reason})` : ""}${terminal ? "" : " (\u5DF2\u56DE\u961F)"}`;
     }
   }));
   register(defineTool({
@@ -1880,7 +2391,10 @@ ${escLines.join("\n")}` : "";
       const usage = c().classUsage?.() ?? {};
       const usageTxt = Object.entries(usage).map(([cls, u]) => `${cls} ${u.open}/${u.limit}`).join(", ") || "n/a";
       const q = s.containerQueue;
-      const qLine = q !== void 0 ? `containerQueue: started=${q.grantedCount?.() ?? "?"}/${s.containerSlots} queued=[${q.waiters().map((w) => w.holderId).join(",") || "\u65E0"}]` : "containerQueue: \u672A\u521D\u59CB\u5316";
+      const qLine = q !== void 0 ? `containerQueue: granted=${q.grantedCount?.() ?? "?"}/${s.containerSlots} waiters=[${q.waiters().map((w) => w.holderId).join(",") || "\u65E0"}]` : "containerQueue: \u672A\u521D\u59CB\u5316";
+      const now = Date.now();
+      const pendingTxt = s.pendingAdj.length === 0 ? "\u65E0" : s.pendingAdj.map((pa) => `  ${pa.code} [${pa.kind}] ${pa.summary}${now - pa.createdAt > 30 * 6e4 ? " \u26A0\uFE0F\u672A\u88C1\u51B3>30min" : ""}`).join("\n");
+      const orchCount = (st) => [...s.orch.values()].filter((o) => o.state === st).length;
       const openByCode = /* @__PURE__ */ new Map();
       for (const v of c().ledger.views()) {
         if (v.state !== "dispatched" && v.state !== "help" && v.state !== "stalled") continue;
@@ -1891,16 +2405,37 @@ ${escLines.join("\n")}` : "";
         const p = s.progress.get(code);
         return p === void 0 || p.state !== "complete" && p.state !== "failed" && p.state !== "skipped";
       });
-      const unsolvedTxt = unsolved.length === 0 ? "\u65E0" : unsolved.slice(0, 15).map((code) => `${code}(${openByCode.get(code) ?? 0}\u5728\u9014)`).join(" ") + (unsolved.length > 15 ? ` \u2026\u5171${unsolved.length}\u9898` : "");
+      unsolved.sort((a, b) => {
+        const oa = s.orch.get(a);
+        const ob = s.orch.get(b);
+        return compareRisk(
+          oa ?? newOrch(a, s.startedAt),
+          ob ?? newOrch(b, s.startedAt),
+          s.challenges.get(a)?.total_score ?? 300,
+          s.challenges.get(b)?.total_score ?? 300
+        );
+      });
+      const unsolvedTxt = unsolved.length === 0 ? "\u65E0" : unsolved.map((code) => {
+        const o = s.orch.get(code);
+        if (o === void 0) return `${code}(\u65E0\u7F16\u6392\u6001)`;
+        const inF = openByCode.get(code) ?? 0;
+        const box = o.grantedUntil !== void 0 ? `/\u76D2\u5269${Math.max(0, Math.round((o.grantedUntil - now) / 6e4))}m` : "";
+        const ladder = o.zeroProgressStreak > 0 ? `/\u68AF${o.zeroProgressStreak}` : "";
+        const never = o.neverDispatched ? "/\u4ECE\u672A\u5F00\u5DE5" : "";
+        return `${code}[${o.state}\xB7\u5728\u9014${inF}\xB7\u8BD5${o.attempts}${ladder}${box}${never}]`;
+      }).join(" ");
       return [
         `campaign: open=${count((v) => v.state === "dispatched" || v.state === "help")} queued=${count((v) => v.state === "queued")} done=${count((v) => v.state === "done")} failed=${count((v) => v.state === "failed")} blocked=${count((v) => v.state === "blocked")}`,
         `resourceClasses: ${usageTxt}`,
+        `orch: queued=${orchCount("queued")} granted=${orchCount("granted")} pending-adjudication=${orchCount("pending-adjudication")} solved=${orchCount("solved")} dead=${orchCount("dead")}`,
         qLine,
         `budgetRemainingMin=${Math.round(remaining / 6e4)}`,
         `platformScore=${s.platformScore ?? "n/a"}${s.platformScore !== void 0 ? "(\u6743\u5A01, \u542B hint \u6263\u5206)" : ""}`,
         `openContainers(\u5E73\u53F0\u89C6\u89D2, \u5F02\u6B65\u66F4\u65B0\u4F1A\u6EDE\u540E; \u69FD\u771F\u76F8\u4EE5 containerQueue \u884C\u4E3A\u51C6)=${[...openContainers(s)].join(",") || "none"}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
-        `\u672A\u7834\u9898(\u5728\u9014\u6570): ${unsolvedTxt}`,
+        `\u5F85\u88C1\u51B3(${s.pendingAdj.length}):
+${pendingTxt}`,
+        `\u672A\u7834\u9898(\u5168\u91CF\xB7\u98CE\u9669\u6392\u5E8F): ${unsolvedTxt}`,
         `progress: ${progress}`,
         escTxt
       ].join("\n");
@@ -1946,6 +2481,12 @@ ${escLines.join("\n")}` : "";
         const before = ledgerSnap();
         const iv = setInterval(() => {
           if (ledgerSnap() !== before) done("xiaochang_wait: campaign ledger changed");
+        }, 2e3);
+        const orchBefore = state?.orchVersion ?? 0;
+        const oiv = setInterval(() => {
+          if (state !== void 0 && state.orchVersion !== orchBefore) {
+            done("xiaochang_wait: \u7F16\u6392\u6001\u53D8\u5316(settle \u7ED3\u7B97/\u56DE\u961F/\u88C1\u51B3/\u65F6\u95F4\u76D2)\u2014\u2014\u8BFB xiaochang_status");
+          }
         }, 2e3);
         const seqBefore = agent?.session.seq ?? 0;
         const sv = setInterval(() => {
@@ -1996,6 +2537,7 @@ ${escLines.join("\n")}` : "";
         cleanup = () => {
           unsub();
           clearInterval(iv);
+          clearInterval(oiv);
           clearInterval(sv);
           clearInterval(fv);
           clearTimeout(to);
@@ -2031,18 +2573,20 @@ ${escLines.join("\n")}` : "";
         }
         s.progress.update(ch.unique_code, { containerClosed: true });
       }
-      for (let i = 0; i < closedCount; i++) {
-        try {
-          await s.containerQueue?.release();
-        } catch {
-        }
-      }
+      for (const code of [...s.grantedCodes]) await releaseGrant(code);
       for (const w of s.containerQueue?.waiters() ?? []) {
         try {
           s.containerQueue?.evict(w.holderId, "campaign finished");
         } catch {
         }
       }
+      if (tickTimer !== void 0) {
+        clearInterval(tickTimer);
+        tickTimer = void 0;
+      }
+      s.armed.clear();
+      bumpOrch(s);
+      persistOrch(s);
       persistProgress(s);
       if (campaignId !== void 0) holder.finish?.(campaignId);
       const final = await s.adapter.listChallenges();

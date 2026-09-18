@@ -34,8 +34,30 @@ import {
   roundOf,
   sweepLegacyWorkdir,
   truncateDirective,
+  type ExecutorPolicy,
   type KnowledgeSection,
 } from './orchestrator.ts'
+import {
+  applySettle,
+  applyVerifierResult,
+  adjudicate,
+  blockerConcluded,
+  compareRisk,
+  grant,
+  makePending,
+  newOrch,
+  parseOrchState,
+  priorityOf,
+  rearmByTimebox,
+  serializeOrchState,
+  settleAction,
+  timeboxExpired,
+  verifierVerdict,
+  type ChallengeOrch,
+  type PendingAdjudication,
+  type ProgressSnapshot,
+  type SettleProgress,
+} from './challenge-orch.ts'
 
 export const name = 'shence-xiaochang-runner'
 export const inject = ['tools', 'hufu', 'jisi']
@@ -152,6 +174,8 @@ interface SetupArgs {
   modelLock?: boolean
   /** v7: 容器题并发槽位(平台容器上限)。默认 3。 */
   containerSlots?: number
+  /** v8: 单次授予时间盒(分钟, 默认 30; 本地干跑可调小以验证时间盒路径)。 */
+  timeboxMinutes?: number
   /** v7.8: 模型白名单(逗号分隔字符串或省略)——空=不限制; 本地干跑局传 deepseek 系(网关不可达的模型不进自动 R2/派单校验)。 */
   modelWhitelist?: string | string[]
 }
@@ -234,10 +258,27 @@ interface CampaignState {
   enqCounters: Map<string, number>
   /** v7.8: 模型白名单(空 = 不限制; 本地干跑可配 deepseek 系)。 */
   modelWhitelist: string[]
+  /** v8: 题队列编排态(每 code; 机制唯一写者, 主 agent 裁决只经 report 工具)。 */
+  orch: Map<string, ChallengeOrch>
+  /** v8: 待决事项(未裁决持续置顶; >30min 加 ⚠️ 强化)。 */
+  pendingAdj: PendingAdjudication[]
+  /** v8: 编排态落盘路径(崩溃恢复)。 */
+  orchPath: string
+  /** v8: 已武装(acquire 在途)的题码。 */
+  armed: Set<string>
+  /** v8: 队列已授予(持槽)的题码——release 必须与 grant 配对(防 local 题误减队列计数)。 */
+  grantedCodes: Set<string>
+  /** v8: 已结算的 item id(settle 事件与 collect 扫描双通道去重)。 */
+  settleProcessed: Set<string>
+  /** v8: 编排态版本号(每次变化+1; wait/仪表感知变化)。 */
+  orchVersion: number
+  /** v8: 单次授予时间盒(ms; setup 可调, 默认 30min)。 */
+  timeboxMs: number
 }
 
 let state: CampaignState | undefined
 let heartbeatTimer: ReturnType<typeof setInterval> | undefined
+let tickTimer: ReturnType<typeof setInterval> | undefined
 
 function requireState(): CampaignState {
   if (state === undefined) throw new Error('xiaochang: not set up — call xiaochang_setup first')
@@ -269,14 +310,14 @@ function readOutageWindows(): Array<{ provider: string; from: number; to: number
   } catch { return [] }
 }
 
-/** v6: 该 code 的过滤失败计数——剔除故障窗口内与 provider 错误签名的失败(DS 故障夜实锤)。 */
+/** v6: 该 code 的过滤失败计数——剔除故障窗口内与 provider 错误签名的失败(DS 故障夜实锤)。v8: blocked 与"打过但未破"(orch.settleNoFlag 在调用方加)也算真实败绩。 */
 function filteredFailedOf(code: string, campaign: HufuLike | undefined): { failed: number; excluded: number; excludedReasons: string[] } {
   const windows = readOutageWindows()
   let failed = 0
   let excluded = 0
   const excludedReasons: string[] = []
   for (const v of campaign?.ledger.views() ?? []) {
-    if (v.state !== 'failed' || codeOf(v.item.id) !== code) continue
+    if ((v.state !== 'failed' && v.state !== 'blocked') || codeOf(v.item.id) !== code) continue
     const detail = v.terminalDetail ?? ''
     const provErr = /(TRANSPORT|MISSING_CREDENTIAL|rate limit|insufficient|余额|no API key)/i.test(detail)
     const inOutage = windows.some(w => {
@@ -515,6 +556,291 @@ export function apply(ctx: Context): void {
     }
   }
 
+  // ── v8 题队列编排内核接线 ──────────────────────────────────────
+  const orchFor = (code: string): ChallengeOrch | undefined => state?.orch.get(code)
+  function bumpOrch(s: CampaignState): void { s.orchVersion += 1 }
+  function persistOrch(s: CampaignState): void {
+    try { writeFileSync(s.orchPath, serializeOrchState(s.orch, s.pendingAdj)) } catch { /* 落盘失败不致命 */ }
+  }
+  function addPending(s: CampaignState, pa: PendingAdjudication): void {
+    s.pendingAdj = s.pendingAdj.filter(x => !(x.code === pa.code && x.kind === pa.kind)).concat(pa)
+  }
+  function removePending(s: CampaignState, code: string, kind?: PendingAdjudication['kind']): void {
+    s.pendingAdj = s.pendingAdj.filter(x => x.code !== code || (kind !== undefined && x.kind !== kind))
+  }
+  /** v8: release 与 grant 配对——只有真持槽的题才释放队列授权(防计数漂移)。 */
+  async function releaseGrant(code: string): Promise<void> {
+    const s = requireState()
+    if (!s.grantedCodes.delete(code)) return
+    try { await s.containerQueue?.release() } catch { /* 释放失败不阻断 */ }
+  }
+  function findingsLines(code: string): number {
+    try {
+      const p = c().boardPath(code)
+      return existsSync(p) ? readFileSync(p, 'utf8').split('\n').length : 0
+    } catch { return 0 }
+  }
+  /** 题号工件目录文件数(两种命名: f1-02 与 f102 都试)。 */
+  function artifactCount(code: string): number {
+    let n = 0
+    for (const name of [code, code.replace(/-/g, '')]) {
+      try {
+        const dir = join(process.cwd(), name)
+        if (existsSync(dir)) for (const f of walk(dir)) if (!f.endsWith('.pyc')) n += 1
+      } catch { /* 忽略 */ }
+    }
+    return n
+  }
+  function snapshotProgress(code: string): ProgressSnapshot {
+    return { at: Date.now(), findingsLines: findingsLines(code), forkCount: knowledgeOfCode(code).length, artifactCount: artifactCount(code) }
+  }
+  function ensureVq(code: string) {
+    const s = requireState()
+    const ch = s.challenges.get(code)
+    let vq = s.v2[code]
+    if (vq === undefined) {
+      vq = {
+        qtype: classifyQtype(ch?.description ?? ''),
+        difficulty: difficultyPrior(ch?.total_score ?? 300),
+        wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0,
+      }
+      s.v2[code] = vq
+      persistV2(s)
+    }
+    return vq
+  }
+  function gapsTxtOf(code: string): string {
+    const s = requireState()
+    const vq = s.v2[code]
+    if (vq === undefined || vq.gaps.length === 0) return ''
+    return '\n\n已知上下文缺口(前序执行者反馈缺的信息, 若你能补则补, 不能补则明确说缺什么):\n' + vq.gaps.slice(-5).map(g => `- ${g}`).join('\n')
+  }
+  /** 模型校验(与 enqueue 同一套护栏); 返回 null = 可派。 */
+  async function validateExecutorModel(model: string): Promise<string | null> {
+    const s = requireState()
+    if (jisi === undefined) return null
+    try {
+      if (s.modelWhitelist.length > 0 && !s.modelWhitelist.includes(model)) return `白名单外`
+      const listed = await jisi.listModels()
+      if (!listed.some(m => m.id === model)) return `不在模型目录`
+      if (await jisi.isModelQuarantined?.(model)) return `provider 余额枯竭`
+    } catch { /* 校验失败不阻断(兜底缺省模型) */ }
+    return null
+  }
+  /** 全开多路时的模型轮换(白名单过滤)。 */
+  function pickSpawnModel(_code: string, idx: number): string {
+    const s = requireState()
+    const allow = (m: string): boolean => s.modelWhitelist.length === 0 || s.modelWhitelist.includes(m)
+    const mix = ['deepseek-v4-flash', 'deepseek-flash', 'glm-5.3'].filter(allow)
+    if (mix.length === 0) return s.executorPolicy.defaultModel
+    return mix[idx % mix.length]!
+  }
+  /** 零进展×1 全开的 R2 二次征集(授予时发, 结果异步落账本)。 */
+  async function issueR2(code: string): Promise<void> {
+    const s = requireState()
+    if (jisi?.fanoutNotify === undefined || parentAgent === undefined) return
+    const ch = s.challenges.get(code)
+    if (ch === undefined) return
+    const vq = ensureVq(code)
+    try {
+      const prompt = buildRefanoutPrompt(code)
+      const models = await pickRefanoutModels(vq)
+      const ticket = jisi.fanoutNotify(parentAgent as unknown as object, { prompt }, models)
+      vq.ideaRound += 1
+      vq.triedModels.push(...models.filter(m => !vq.triedModels.includes(m)))
+      s.v2[code] = vq
+      persistV2(s)
+      audit(s.auditPath, { type: 'v8-r2', code, models, ticket: ticket.id })
+    } catch { /* R2 失败不阻断派兵 */ }
+  }
+  const VERIFIER_DIRECTIVE = '[验证兵] 独立复验账本里的 blocker 结论("无攻击面/环境缺失/未发布"类): 不要信任前序判定, 重跑探测确认。输出开头一行 "复验: 确认" 或 "复验: 推翻", 附证据; 若推翻, 立即继续解题(先读知识账本, 从已知边界出发)。'
+  /** v8 原子授予: 队列授予 → 快照 → 生成执行者(带 addr) → 派发。 */
+  async function grantAndSpawn(code: string): Promise<void> {
+    const s = requireState()
+    s.armed.delete(code)
+    const o = orchFor(code)
+    if (o === undefined || o.state !== 'queued') return
+    try {
+      const fresh = await s.adapter.listChallenges()
+      for (const x of fresh) s.challenges.set(x.unique_code, x)
+    } catch { /* 刷新失败继续(用缓存) */ }
+    const ch = s.challenges.get(code)
+    if (ch === undefined) return
+    const cls = resourceClassOf(ch)
+    const prio = priorityOf(o, ch.total_score, Date.now())
+    const snapshot = snapshotProgress(code)
+    grant(o, snapshot, Date.now(), s.timeboxMs)
+    const nSpawn = Math.max(1, Math.min(o.multiSpawn, 3))
+    o.multiSpawn = 0
+    if (o.r2Due) { o.r2Due = false; void issueR2(code) }
+    const vq = ensureVq(code)
+    const picks: Array<{ text: string; model?: string; effort?: string }> = []
+    if (o.blockerCheck === 'in-flight') {
+      picks.push({ text: VERIFIER_DIRECTIVE })
+    } else {
+      const untried = o.directives.filter(d => !d.tried)
+      for (let i = 0; i < nSpawn; i++) {
+        const d = untried.shift()
+        if (d !== undefined) picks.push(d)
+        else picks.push({ text: '按账本+画像自由突破: 先读知识账本, 从已知边界出发, 不打死路' })
+      }
+      for (const d of picks) {
+        const orig = o.directives.find(x => x.text === d.text)
+        if (orig !== undefined) orig.tried = true
+      }
+    }
+    for (let i = 0; i < picks.length; i++) {
+      const d = picks[i]!
+      const workNo = (s.enqCounters.get(code) ?? 0) + 1
+      s.enqCounters.set(code, workNo)
+      const itemId = `${code}#s${o.attempts}-w${workNo}`
+      const executor = resolveExecutor({ model: d.model ?? pickSpawnModel(code, i), effort: d.effort }, s.executorPolicy)
+      const err = await validateExecutorModel(executor.model)
+      const model = err === null ? executor.model : s.executorPolicy.defaultModel
+      const label = buildExecFrame(code, d.text) + gapsTxtOf(code)
+      c().add({
+        id: itemId,
+        label,
+        model,
+        reasoningEffort: executor.effort,
+        board: code,
+        resourceClass: cls,
+        priority: { tier: tierOf(ch.difficulty), score: prio },
+      })
+      if (!vq.triedModels.includes(model)) vq.triedModels.push(model)
+      persistV2(s)
+      audit(s.auditPath, { type: 'v8-spawn', id: itemId, code, attempts: o.attempts, model, class: cls })
+    }
+    // 授予即派兵: 立即派发(容器闸已在队列层).
+    let count = 0
+    while (true) {
+      const d2 = await c().dispatchNext()
+      if (d2 === undefined) break
+      count += 1
+    }
+    audit(s.auditPath, { type: 'v8-grant', code, spawn: picks.length, dispatched: count })
+    bumpOrch(s)
+    persistOrch(s)
+    persistProgress(s)
+  }
+  /** v8 武装循环: 把 queued 题按优先级武装进容器队列(题是队列单元, 执行者零等待)。 */
+  function armQueue(): void {
+    const s = requireState()
+    const q = s.containerQueue
+    if (q === undefined) return
+    const now = Date.now()
+    const codes = [...s.challenges.keys()].sort((a, b) => {
+      const pa = priorityOf(s.orch.get(a) ?? newOrch(a, now), s.challenges.get(a)?.total_score ?? 300, now)
+      const pb = priorityOf(s.orch.get(b) ?? newOrch(b, now), s.challenges.get(b)?.total_score ?? 300, now)
+      return pb - pa
+    })
+    for (const code of codes) {
+      const o = s.orch.get(code)
+      if (o === undefined || o.state !== 'queued') continue
+      if (s.armed.has(code)) continue
+      const p = s.progress.get(code)
+      if (p !== undefined && (p.state === 'complete' || p.state === 'failed' || p.state === 'skipped')) continue
+      const ch = s.challenges.get(code)
+      if (ch === undefined) continue
+      if (resourceClassOf(ch) === 'local') {
+        s.armed.add(code)
+        void grantAndSpawn(code)
+        continue
+      }
+      s.armed.add(code)
+      void q.acquire(code).then(res => {
+        if (res.status === 'granted') { s.grantedCodes.add(code); void grantAndSpawn(code) }
+        else {
+          s.armed.delete(code)
+          audit(s.auditPath, { type: 'v8-arm-drop', code, status: res.status, reason: res.reason })
+        }
+      })
+    }
+  }
+  /** v8 settle 结算(事件 + collect 扫描双通道, settleProcessed 去重)。 */
+  async function settleClassify(itemId: string, detail: string): Promise<void> {
+    const s = requireState()
+    const code = codeOf(itemId)
+    const o = s.orch.get(code)
+    if (o === undefined) return
+    if (s.settleProcessed.has(itemId)) return
+    s.settleProcessed.add(itemId)
+    if (o.state !== 'granted') return
+    const now = Date.now()
+    const sn = o.snapshot
+    // 旗候选双通道: 终态文本 FLAG_CANDIDATE + 战报里出现"未提交过的旗值"
+    // (执行者把旗写进战报但终态没提 → 也要走待提交, 容器保留; 提交需容器在线)。
+    const knownFlags = new Set(s.progress.get(code)?.flags ?? [])
+    const boardHasNewFlag = ((): boolean => {
+      try {
+        const p = c().boardPath(code)
+        if (!existsSync(p)) return false
+        const text = readFileSync(p, 'utf8')
+        const found = [...text.matchAll(/FLAG_CANDIDATE:?\s*([^\s<]+)|flag\{[^}\s]{6,}\}|FLAG\{[^}\s]{6,}\}|mock\{[^}\s]{6,}\}/g)]
+          .map(m => m[1] ?? m[0])
+        return found.some(f => !knownFlags.has(f))
+      } catch { return false }
+    })()
+    const p: SettleProgress = {
+      flagCandidate: /FLAG_CANDIDATE\s*:/.test(detail) || boardHasNewFlag,
+      findingsDelta: sn !== undefined ? Math.max(0, findingsLines(code) - sn.findingsLines) : 0,
+      forkDelta: sn !== undefined ? Math.max(0, knowledgeOfCode(code).length - sn.forkCount) : 0,
+      artifactsDelta: sn !== undefined ? Math.max(0, artifactCount(code) - sn.artifactCount) : 0,
+      blockerConcluded: blockerConcluded(detail)
+        || knowledgeOfCode(code).some(k => k.kind === 'dead-end' && blockerConcluded(`${k.path} ${k.conclusion ?? ''}`)),
+      detail,
+    }
+    if (o.blockerCheck === 'in-flight') applyVerifierResult(o, verifierVerdict(detail))
+    const action = settleAction(o, p)
+    applySettle(o, action, detail, now)
+    if (!p.flagCandidate) o.settleNoFlag += 1
+    const board = c().boardPath(code)
+    if (action === 'pending-flag') {
+      addPending(s, makePending(code, 'flag-candidate', `${code} 有旗待提交: 尽快 xiaochang_submit(容器在线宽限 15min, 超时容器关/旗值可能轮换)`, board, now))
+    } else if (action === 'adjudicate') {
+      const kind = o.blockerCheck === 'confirmed' ? 'blocker-verified' as const : 'needs-verdict' as const
+      const summary = kind === 'blocker-verified'
+        ? `${code} blocker 已被验证兵确认: 主 agent 裁决 判死/续打`
+        : `${code} 零进展×${o.zeroProgressStreak} 挂裁决: 主 agent 裁决 判死/续打/拉hint(闸已开)`
+      addPending(s, makePending(code, kind, summary, board, now))
+    }
+    // 关容器+释放槽(有旗待提交不关; 同题仍有在途不关)。
+    const hasOthers = c().ledger.views().some(x => x.item.id !== itemId && codeOf(x.item.id) === code
+      && (x.state === 'dispatched' || x.state === 'help' || x.state === 'stalled'))
+    if (action !== 'pending-flag' && !hasOthers) {
+      try { await s.adapter.close(code) } catch { /* 平台侧已关 */ }
+      await releaseGrant(code)
+      s.progress.update(code, { containerClosed: true })
+    }
+    audit(s.auditPath, { type: 'v8-settle', itemId, code, action, flagCandidate: p.flagCandidate })
+    bumpOrch(s)
+    persistOrch(s)
+    persistProgress(s)
+    if (action !== 'pending-flag') armQueue()
+  }
+  /** v8 编排心跳: 时间盒到期 → 关容器+回队(账本保留, 升级梯不动)。 */
+  async function tickOrch(): Promise<void> {
+    const s = requireState()
+    const now = Date.now()
+    let changed = false
+    for (const [code, o] of s.orch) {
+      if (!timeboxExpired(o, now)) continue
+      if (o.state === 'pending-adjudication') removePending(s, code, 'flag-candidate')
+      try { await s.adapter.close(code) } catch { /* 已关 */ }
+      await releaseGrant(code)
+      rearmByTimebox(o)
+      s.progress.update(code, { containerClosed: true })
+      audit(s.auditPath, { type: 'v8-timebox', code })
+      changed = true
+    }
+    if (changed) {
+      bumpOrch(s)
+      persistOrch(s)
+      persistProgress(s)
+      armQueue()
+    }
+  }
+
   // ── v7 极简执行令框架: 主 agent 只写指令, 机制注入题面/入口/账本/画像/纪律 ──
   function buildExecFrame(code: string, directive: string): string {
     const s = requireState()
@@ -525,7 +851,7 @@ export function apply(ctx: Context): void {
       ? ch.container_addr.join(',')
       : cls === 'local'
         ? '无需容器(本地求解: bash/python 直开)'
-        : '容器未开: 请主 agent xiaochang_start_container, 或你自行调用(平台同时最多 3 个容器)'
+        : '容器由调度机制授予——你持槽开工, 无需自行启动/等待容器(执行者没有 start_container 工具)'
     const kn = ensureKnowledgeFile(code)
     return [
       `【校场执行令 · ${code}】(${cls === 'local' ? '附件题·全并行' : '容器题·3槽轮换'}, ${ch.difficulty}, ${ch.total_score}pts, ${ch.flag_count} flags)`,
@@ -564,6 +890,7 @@ export function apply(ctx: Context): void {
       defaultEffort: { type: 'string', description: 'Executor default reasoning effort. Default low.' },
       modelLock: { type: 'boolean', description: 'Lock: force ALL executors to defaultModel/defaultEffort, ignoring per-item overrides (user/parent-agent override). Default false (main agent may switch models per item).' },
       containerSlots: { type: 'number', description: 'v7 container-challenge concurrency slots (platform container cap). Default 3; attachment challenges are never constrained by this.' },
+      timeboxMinutes: { type: 'number', description: 'v8 single-grant timebox in minutes (default 30). Local dry runs may pass a smaller value to exercise the timebox path.' },
       modelWhitelist: { type: 'string', description: 'v7.8 model whitelist (comma-separated; empty = no restriction). Local dry runs should pass deepseek models — unreachable models are excluded from auto-R2 and enqueue validation.' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
@@ -633,6 +960,14 @@ export function apply(ctx: Context): void {
         modelWhitelist: (typeof args.modelWhitelist === 'string'
           ? args.modelWhitelist.split(',').map(m => m.trim())
           : (args.modelWhitelist ?? [])).filter(m => m !== ''),
+        orch: new Map(),
+        pendingAdj: [],
+        orchPath: join(home, 'storages', `xiaochang-orch-${args.runId ?? 'pending'}.json`),
+        armed: new Set(),
+        grantedCodes: new Set(),
+        settleProcessed: new Set(),
+        orchVersion: 0,
+        timeboxMs: (args.timeboxMinutes ?? 30) * 60_000,
       }
       try {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
@@ -666,13 +1001,13 @@ export function apply(ctx: Context): void {
         campaign = created.campaign
         campaignId = created.id
       }
-      // v7.6: 容器资源队列——虎符原语管排队/公平/单一授权点, 校场注入平台判定与 start 动作。
-      // 执行者 start_container 阻塞在 acquire 上(零 token), 不再 LLM 热轮询; 同 code 合并等待位(共享容器)。
+      // v8: 容器资源队列——题队列(武装的是题码, 授予即派兵); 队列原语不变, 授权点唯一。
+      // 武装方是 runner 机制(armQueue), 执行者/主 agent 都不直接 acquire; 缺省超时拉满(题该等多久等多久)。
       if (s.containerQueue === undefined && holder.resourceQueue !== undefined) {
         s.containerQueue = holder.resourceQueue({
           capacity: s.containerSlots,
           pollMs: 3000,
-          defaultTimeoutMs: 5 * 60_000,
+          defaultTimeoutMs: Math.max(10 * 60 * 60_000, s.budgetMs + 60 * 60_000),
           canGrant: async () => {
             try {
               const fresh = await s.adapter.listChallenges()
@@ -694,6 +1029,26 @@ export function apply(ctx: Context): void {
           },
         })
       }
+      // v8: 编排态恢复(崩溃/重启幂等)。
+      try {
+        if (existsSync(s.orchPath)) {
+          const back = parseOrchState(readFileSync(s.orchPath, 'utf8'))
+          s.orch = back.orch
+          s.pendingAdj = back.pending
+        }
+        for (const ch of fresh) {
+          if (!s.orch.has(ch.unique_code)) s.orch.set(ch.unique_code, newOrch(ch.unique_code, s.startedAt))
+        }
+      } catch { /* 编排态损坏: 全量重建 */ }
+      persistOrch(s)
+      // v8: settle 结算钩子(执行者终态 → 进展分类 → 回队/升级梯/待决) + 编排心跳(时间盒/武装)。
+      if (campaignId !== undefined && holder.onSettle !== undefined) {
+        holder.onSettle(campaignId, ev => { void settleClassify(ev.itemId, ev.text) })
+      }
+      if (tickTimer !== undefined) clearInterval(tickTimer)
+      tickTimer = setInterval(() => { void tickOrch(); armQueue() }, 30_000)
+      ;(tickTimer as { unref?: () => void }).unref?.()
+      armQueue()
       persistProgress(s)
       try {
         if (existsSync(s.v2Path)) s.v2 = JSON.parse(readFileSync(s.v2Path, 'utf8')) as V2State
@@ -779,57 +1134,25 @@ export function apply(ctx: Context): void {
     },
   }))
 
-  // ── 平台六原语 ────────────────────────────────────────────────────
-  register(defineTool({
-    name: 'xiaochang_start_container',
-    description:
-      'Start a challenge container (platform cap: 3). v7.6: waits in the resource queue with ZERO tokens — the call blocks here (polling platform state internally) until a slot frees, then starts automatically; same-challenge waiters share one container. Returns the addrs + board path. Timeout (5min) or challenge-terminal eviction return a message instead — do NOT spin your own retry loop.',
-    parameters: {
-      code: { type: 'string', required: true, description: 'Challenge unique_code.' },
-    },
-    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
-    isConcurrencySafe: () => false,
-    async execute(args: { code: string }) {
-      const s = requireState()
-      // F27：开容器前先刷新平台状态——close 后平台异步更新，本地缓存会误判。
-      const fresh0 = await s.adapter.listChallenges()
-      for (const x of fresh0) s.challenges.set(x.unique_code, x)
-      const ch = s.challenges.get(args.code)
-      if (ch === undefined) return `xiaochang_start_container: unknown challenge ${args.code}`
-      // 共享容器短路: 该题容器已在 → 直接拿地址(同题多执行者不重复开)。
-      if (ch.container_status === 'available' && ch.container_addr.length > 0) {
-        return `already available: addrs=${ch.container_addr.join(',')}\nboardPath=${c().boardPath(args.code)}`
-      }
-      const q = s.containerQueue
-      if (q === undefined) return 'xiaochang_start_container: 资源队列未初始化——先 xiaochang_setup'
-      const res = await q.acquire(args.code, { timeoutMs: 5 * 60_000 })
-      if (res.status === 'granted') {
-        const fresh = await s.adapter.listChallenges()
-        for (const x of fresh) s.challenges.set(x.unique_code, x)
-        const now = s.challenges.get(args.code)
-        const addrs = now?.container_addr ?? []
-        return `started: addrs=${addrs.join(',')}\nboardPath=${c().boardPath(args.code)}`
-      }
-      if (res.status === 'timeout') {
-        return `xiaochang_start_container: 排队位 ${res.position} 已等 5 分钟仍无容器槽——把"需要容器"写进战报后收工, 由主 agent 调度; 不要自己再写重试循环`
-      }
-      return `xiaochang_start_container: ${res.reason ?? '已出队'}——该题已终态/被中断, 无需容器; 收工等主 agent 处理`
-    },
-  }))
-
+  // ── 平台六原语(v8: start_container 已删除——开容器唯一路径 = 题队列授予) ──
   register(defineTool({
     name: 'xiaochang_close',
-    description: 'Close a challenge container (release a platform slot; wakes the next waiter in the resource queue).',
+    description: 'Close a challenge container (release a platform slot; wakes the next challenge in the queue). v8: main agent ONLY — container scheduling decisions belong to the main agent; executors report "needs rotate" in their settle report instead.',
     parameters: { code: { type: 'string', required: true } },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args: { code: string }) {
+    async execute(args: { code: string }, exec) {
+      // v8: 容器调度决策权归主 agent; 执行者零容器工具。
+      if (parentAgent !== undefined && exec.agent !== parentAgent) {
+        return 'xiaochang_close: 拒绝——容器调度是主 agent 专属; 执行者需要换实例请在终态报告里写"需要换实例+理由"'
+      }
       const s = requireState()
       await s.adapter.close(args.code)
       s.progress.update(args.code, { containerClosed: true })
       persistProgress(s)
-      // v7.6: 释放队列授权并唤醒队首(释放归机制, 不靠 agent 自觉)。
-      try { await s.containerQueue?.release() } catch { /* 释放失败不阻断 */ }
+      // v8: 释放队列授权并唤醒队首(释放归机制, 不靠 agent 自觉)。
+      await releaseGrant(args.code)
+      armQueue()
       return `closed ${args.code}`
     },
   }))
@@ -857,6 +1180,7 @@ export function apply(ctx: Context): void {
             manifest.push(`${code}: 容器排队 ${res.status === 'timeout' ? '超时' : '出队'}——留给执行者处理`)
             continue
           }
+          s.grantedCodes.add(code)
           const fresh = await s.adapter.listChallenges()
           for (const x of fresh) s.challenges.set(x.unique_code, x)
           const addr = s.challenges.get(code)?.container_addr?.[0]
@@ -881,7 +1205,7 @@ export function apply(ctx: Context): void {
             }
           }
           try { await s.adapter.close(code) } catch { /* 平台侧已关 */ }
-          try { await s.containerQueue?.release() } catch { /* 释放失败不阻断 */ }
+          await releaseGrant(code)
           s.progress.update(code, { containerClosed: true })
           downloaded += saved
           manifest.push(`${code}: 下载 ${saved} 件${saved === 0 ? '(候选路径无命中, 留给执行者)' : ''}`)
@@ -912,6 +1236,50 @@ export function apply(ctx: Context): void {
         return 'xiaochang_submit: 拒绝——submit 是主 agent 专属单点(交卷路径串行可审计); 执行者请把 flag 输出为 FLAG_CANDIDATE: <flag> 交给主 agent 提交'
       }
       const s = requireState()
+      // v8: 提交后编排路由——正确: 全旗= solved+关容器+剪枝; 部分旗= 回队续打下一旗。
+      // 被拒: 旗值不对 → 回队重打(拿到候选值本身就是进展, 梯清零)。
+      const v8AfterSubmit = async (correct: boolean): Promise<void> => {
+        const o = s.orch.get(args.code)
+        if (o === undefined) return
+        if (correct) {
+          removePending(s, args.code, 'flag-candidate')
+          const fresh = await s.adapter.listChallenges()
+          for (const x of fresh) s.challenges.set(x.unique_code, x)
+          const ch = s.challenges.get(args.code)
+          const allFlags = ch !== undefined && ch.flag_count > 0 && (ch.correct_flag_count ?? 0) >= ch.flag_count
+          if (allFlags) {
+            adjudicate(o, 'solved')
+            removePending(s, args.code)
+            try { await s.adapter.close(args.code) } catch { /* 已关 */ }
+            await releaseGrant(args.code)
+            try { s.containerQueue?.evict(args.code, 'solved') } catch { /* 不阻断 */ }
+            s.armed.delete(args.code)
+            s.progress.update(args.code, { state: 'complete', containerClosed: true })
+            for (const v of c().ledger.views()) {
+              if (codeOf(v.item.id) === args.code && ['queued', 'dispatched', 'help', 'stalled'].includes(v.state)) {
+                if (v.state !== 'queued') { try { await c().interruptItem?.(v.item.id) } catch { /* 不阻断 */ } }
+                try { c().cancel(v.item.id, 'challenge solved') } catch { /* 不阻断 */ }
+              }
+            }
+            audit(s.auditPath, { type: 'v8-submit-solved', code: args.code })
+          } else {
+            // 多旗题: 已吃一旗, 续打下一旗(容器保留, 账本已有旗值)。
+            adjudicate(o, 'continue')
+            armQueue()
+            audit(s.auditPath, { type: 'v8-submit-partial', code: args.code })
+          }
+          bumpOrch(s)
+          persistOrch(s)
+          persistProgress(s)
+        } else {
+          adjudicate(o, 'continue')
+          removePending(s, args.code, 'flag-candidate')
+          bumpOrch(s)
+          persistOrch(s)
+          armQueue()
+          audit(s.auditPath, { type: 'v8-submit-reject', code: args.code })
+        }
+      }
       try {
         const recordWin = (flag: string): void => {
           const p = s.progress.get(args.code)
@@ -931,6 +1299,7 @@ export function apply(ctx: Context): void {
         if (typeof res.cumulative_score === 'number') s.platformScore = res.cumulative_score
         if (res.correct) {
           recordWin(args.flag)
+          await v8AfterSubmit(true)
           return JSON.stringify(res)
         }
         // v7.8: 提交口径自动回退——裸串被拒且题面口径疑似带壳时, 自动试一次 flag{...} 包装(干跑实锤: 口径歧义)。
@@ -941,10 +1310,13 @@ export function apply(ctx: Context): void {
           if (typeof res2.cumulative_score === 'number') s.platformScore = res2.cumulative_score
           if (res2.correct) {
             recordWin(wrapped)
+            await v8AfterSubmit(true)
             return `裸串被拒, 自动回退包装提交成功: ${JSON.stringify(res2)}`
           }
+          await v8AfterSubmit(false)
           return `裸串被拒(${JSON.stringify(res)}); 包装回退也被拒(${JSON.stringify(res2)})——以平台判定为准, 换值或换题面口径`
         }
+        await v8AfterSubmit(false)
         return JSON.stringify(res)
       } catch (error) {
         return `submit error: ${String(error)}`
@@ -969,9 +1341,11 @@ export function apply(ctx: Context): void {
       if (used >= s.maxHints) return 'xiaochang_hint: hint cap reached'
       // v7.4 时机门禁: hint 是扣分的最后手段——必须先走过 R2 二次征集且已有过滤后失败
       // (V1 实锤: 两条 hint 吃掉 180 分, agent 还浑然不知)。
+      // v8: "打过但未破"(orch.settleNoFlag)计入真实败绩——资源阻塞收工不再堵死救援通道。
       const vq = s.v2[args.code]
       const ff = filteredFailedOf(args.code, campaign)
-      const gate = hintGate({ ideaRound: vq?.ideaRound ?? 1, filteredFailed: ff.failed })
+      const noFlagSettles = s.orch.get(args.code)?.settleNoFlag ?? 0
+      const gate = hintGate({ ideaRound: vq?.ideaRound ?? 1, filteredFailed: ff.failed + noFlagSettles })
       if (!gate.allowed) {
         return `xiaochang_hint: 拒绝(hint 扣该题分值, 是 R2+失败后的最后手段): ${gate.missing.join('; ')}。当前该题 hint 已用 ${used}/${s.maxHints}、已扣 ${s.hintLedger.get(args.code)?.deducted ?? 0} 分。`
       }
@@ -988,102 +1362,68 @@ export function apply(ctx: Context): void {
   register(defineTool({
     name: 'xiaochang_enqueue',
     description:
-      'Enqueue one executor work item into the hufu campaign. v7 lean prompt: write ONLY the task directive (assigned idea/approach in one or two lines) — the mechanism wraps it with a fixed exec frame (challenge description, live container addrs, shared board path, per-challenge knowledge ledger path, org profile path, FLAG_CANDIDATE discipline). Executors read the knowledge ledger first (prior skeletons/dead-ends/artifacts/forks). resourceClass is auto-set by challenge type (attachment→local full-parallel; container→3-slot rotation); override only when you know better. Optional dependsOn makes it a DAG node. v7.6 prompt rules: directive ≤700 chars; do NOT paste CVE lists/default-credential dictionaries/product fingerprint tables — that knowledge already lives in the executor model and in the org profile; put reusable knowledge in the ledger (xiaochang_knowledge_put) and reference it. Overlong directives are truncated and you get a cut-point report to decide whether to rewrite.',
+      'v8: put a CHALLENGE into the challenge queue with a directive package (思路包). The queue is the single scheduler: when a slot is granted, the mechanism starts the container (if needed) and spawns the executor bound to it — no manual start/dispatch. Re-call to add more directives (untried ones are consumed at each grant) or to raise priority. Executors never wait for containers; challenges wait, zero tokens.',
     parameters: {
       code: { type: 'string', required: true },
-      round: { type: 'number', required: true, description: 'Round number (your own accounting).' },
-      prompt: { type: 'string', required: true, description: 'The lean directive: the assigned approach/idea for this executor (1-3 lines, ≤700 chars). Do NOT paste the challenge description/addrs/board discipline — the frame injects those. Do NOT paste CVE/dictionary-style knowledge.' },
-      model: { type: 'string', description: 'Executor model. Default deepseek-v4-flash (cheap fast path; override for hard challenges).' },
-      effort: { type: 'string', description: 'Reasoning effort (unsupported efforts are dropped per model).' },
-      dependsOn: { type: 'array', description: 'Item ids this item waits for (DAG).' },
-      priority: { type: 'number', description: 'Priority score (higher first within difficulty tier).' },
-      resourceClass: { type: 'string', description: 'Override the auto class: local (attachment-style, full parallel) or container (counts against the container slot cap). Auto by challenge type — override only when you know the container is already open or the type guess is wrong.' },
+      prompt: { type: 'string', required: true, description: 'The lean directive: the assigned approach/idea for this challenge (1-3 lines, ≤700 chars). Do NOT paste the challenge description/addrs/board discipline — the frame injects those. Do NOT paste CVE/dictionary-style knowledge.' },
+      priority: { type: 'number', description: 'v8: explicit queue priority override (default = score density + never-dispatched boost).' },
+      model: { type: 'string', description: 'Preferred executor model for this directive (falls back to default if invalid/unlisted).' },
+      effort: { type: 'string', description: 'Reasoning effort for this directive.' },
+      round: { type: 'number', description: 'v8: ignored (kept for compatibility) — rounds are managed by the mechanism.' },
+      dependsOn: { type: 'array', description: 'v8: ignored (kept for compatibility).' },
+      resourceClass: { type: 'string', description: 'v8: ignored (kept for compatibility) — class is auto by challenge type.' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args: { code: string; round: number; prompt: string; model?: string; effort?: string; dependsOn?: string[]; priority?: number; resourceClass?: string }, exec) {
-      // v7.6: 调度权单点——只有主 agent 可派单(单调度器架构; 执行者无权改写战役)。
+    async execute(args: { code: string; prompt: string; priority?: number; model?: string; effort?: string; round?: number; dependsOn?: string[]; resourceClass?: string }, exec) {
+      // v7.6: 调度权单点——只有主 agent 可入题队列(单调度器架构; 执行者无权改写战役)。
       if (parentAgent !== undefined && exec.agent !== parentAgent) {
-        return 'xiaochang_enqueue: 拒绝——派单是主 agent 专属(单调度器); 执行者只解自己的题, 有发现用 xiaochang_fork 上报'
+        return 'xiaochang_enqueue: 拒绝——入题队列是主 agent 专属(单调度器); 执行者只解自己的题, 有发现用 xiaochang_fork 上报'
       }
       const s = requireState()
       const ch = s.challenges.get(args.code)
       if (ch === undefined) return `xiaochang_enqueue: unknown challenge ${args.code}`
       // v7: 账本文件就绪 + restore/迁移兜底镜像(账本知识全量进文件, 行去重幂等)。
-      try { ensureKnowledgeFile(args.code); syncKnowledgeFileFromLedger(args.code) } catch { /* 账本失败不阻断派单 */ }
-      // v2: 上下文缺口自动附带(contextGaps)——缺啥补啥, 不罚模型只补题。
-      const vq = s.v2[args.code]
-      let gapsTxt = ''
-      if (vq !== undefined && vq.gaps.length > 0) {
-        gapsTxt = '\n\n已知上下文缺口(前序执行者反馈缺的信息, 若你能补则补, 不能补则明确说缺什么):\n' + vq.gaps.slice(-5).map(g => `- ${g}`).join('\n')
-      }
-      // v7.6: 方向段截断(700 字符, 阈值按 run18728 真局派单分布 p50≈623 定)——超长截断并给主 agent 截点反馈。
+      try { ensureKnowledgeFile(args.code); syncKnowledgeFileFromLedger(args.code) } catch { /* 账本失败不阻断 */ }
+      // v7.6: 方向段截断(700 字符, 阈值按 run18728 真局派单分布 p50≈623 定)。
       const DIRECTIVE_MAX = 700
       const trunc = truncateDirective(args.prompt, DIRECTIVE_MAX)
       let truncNotice = ''
       if (trunc.truncated) {
-        truncNotice = `\n⚠️ 方向段截断反馈: ${args.prompt.length}→${DIRECTIVE_MAX} 字符, 截点原文 "${trunc.cutTail}…"。被砍掉的内容若是关键验证点: ①用 xiaochang_knowledge_put 写进该题账本①/③(执行者开工必读, 不占 prompt), 或 ②拆成多条派单; 若只是 CVE/口令词典类公共知识, 不用补——执行者模型自带。需要改写请重新 enqueue。`
+        truncNotice = `\n⚠️ 方向段截断反馈: ${args.prompt.length}→${DIRECTIVE_MAX} 字符, 截点原文 "${trunc.cutTail}…"。被砍掉的内容若是关键验证点: ①用 xiaochang_knowledge_put 写进该题账本①/③(执行者开工必读, 不占 prompt), 或 ②再 enqueue 一条; 若只是 CVE/口令词典类公共知识, 不用补——执行者模型自带。`
       }
-      // v7: 极简执行令框架(题面/入口/账本/画像/纪律由机制注入); 资源类自动按题类打, 可覆盖。
-      const cls = args.resourceClass ?? resourceClassOf(ch)
-      const label = buildExecFrame(args.code, trunc.text) + gapsTxt
-      // v7.8: item id 唯一性归机制——per-code 单调计数器(同 round 重派不再吞单, 干跑实锤)。
-      const workNo = (s.enqCounters.get(args.code) ?? 0) + 1
-      s.enqCounters.set(args.code, workNo)
-      const itemId = `${args.code}#s${args.round}-w${workNo}`
-      // 执行者模型/强度：主 agent 逐项覆盖优先，缺省兜底；模型锁定时强制缺省。
-      const executor = resolveExecutor({ model: args.model, effort: args.effort }, s.executorPolicy)
-      // F8 护栏：模型必须出现在集思目录（能解析到 provider），否则拒绝入队——
-      // 防"目录外模型"被静默送到默认 provider 后无声失败。
-      if (jisi !== undefined) {
-        const listed = await jisi.listModels()
-        if (s.modelWhitelist.length > 0 && !s.modelWhitelist.includes(executor.model)) {
-          return `xiaochang_enqueue: model ${executor.model} 不在本局白名单(${s.modelWhitelist.join(',')})——换白名单内模型`
-        }
-        if (!listed.some(m => m.id === executor.model)) {
-          return `xiaochang_enqueue: model ${executor.model} is not in the registered model catalog (jisi listModels) — pick a listed model`
-        }
-        // F35: 余额枯竭隔离——不让派单把 token 砸进没钱的口袋(会在 spawn 层无声失败)。
-        if (await jisi.isModelQuarantined?.(executor.model)) {
-          return `xiaochang_enqueue: model ${executor.model} 所属 provider 余额已枯竭(隔离中)——换模型; 并把"provider 余额不足"写进战报/最终消息提示用户充值`
-        }
+      const o = s.orch.get(args.code) ?? ((): ChallengeOrch => { const n = newOrch(args.code, s.startedAt); s.orch.set(args.code, n); return n })()
+      // v8: 终态题拒绝入队(出队仅 solved/dead 两条路)。
+      if (o.state === 'solved' || o.state === 'dead') {
+        return `xiaochang_enqueue: 拒绝——${args.code} 已${o.state === 'solved' ? '解出' : '判死'}, 不再入队`
       }
-      c().add({
-        id: itemId,
-        label,
-        model: executor.model,
-        reasoningEffort: executor.effort,
-        ...(args.dependsOn !== undefined && args.dependsOn.length > 0 ? { dependsOn: args.dependsOn } : {}),
-        board: args.code,
-        resourceClass: cls,
-        priority: { tier: tierOf(ch.difficulty), score: args.priority ?? ch.total_score },
-      })
-      s.progress.update(args.code, { difficulty: ch.difficulty, rounds: Math.max(s.progress.get(args.code)?.rounds ?? 0, args.round) })
+      o.directives.push({ text: trunc.text, model: args.model, effort: args.effort, tried: false })
+      if (args.priority !== undefined) o.priorityOverride = args.priority
+      // 已挂裁决的题: 主 agent 主动再给思路 = 视为续打裁决(梯清零)。
+      if (o.state === 'pending-adjudication') {
+        adjudicate(o, 'continue')
+        removePending(s, args.code)
+      }
+      o.state = 'queued'
+      bumpOrch(s)
+      persistOrch(s)
       persistProgress(s)
-      audit(s.auditPath, { type: 'enqueue', id: itemId, code: args.code, round: args.round, model: executor.model, effort: executor.effort, class: cls })
-      return `enqueued ${itemId} (class=${cls}, executor=${executor.model}/${executor.effort}${executor.overriddenByLock ? ', OVERRIDDEN BY MODEL LOCK' : ''})${truncNotice}`
+      audit(s.auditPath, { type: 'v8-enqueue', code: args.code, directive: trunc.text.slice(0, 80), priority: args.priority })
+      armQueue()
+      return `enqueued ${args.code} (directives=${o.directives.length}, 队列优先级=${priorityOf(o, ch.total_score, Date.now())}, 状态=${o.state})${truncNotice}`
     },
   }))
 
   register(defineTool({
     name: 'xiaochang_dispatch',
     description:
-      'Dispatch every READY queued item (DAG dependencies satisfied) while slots are free. Call this after enqueues and again each round — a finished item frees a slot immediately; no barrier ever waits for the slowest.',
+      'v8: REMOVED — dispatch is automatic. The challenge queue grants a container and spawns the executor in one atomic action; the main agent no longer dispatches manually. Call xiaochang_enqueue to put a challenge (with its directive package) into the queue.',
     parameters: {},
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
     async execute() {
-      const s = requireState()
-      let count = 0
-      // v7: 循环以 dispatchNext 返回 undefined 为准——类闸饱和(容器 3 槽满)时
-      // freeSlots()>0 但顶部排队项全类饱和, 旧式 while 条件会死转。
-      while (true) {
-        const dispatched = await c().dispatchNext()
-        if (dispatched === undefined) break
-        count += 1
-      }
-      audit(s.auditPath, { type: 'dispatch-round', count, open: openCount(c()) })
-      return `dispatched ${count} item(s); open=${openCount(c())}`
+      armQueue()
+      return 'xiaochang_dispatch: v8 已废除手动派单——授予即派兵, 由题队列机制自动执行。给题投思路包用 xiaochang_enqueue, 看队列/待决用 xiaochang_status。'
     },
   }))
 
@@ -1111,16 +1451,10 @@ export function apply(ctx: Context): void {
         // v7.5: 超时判负前真杀——账本级超时 ≠ 进程已停, 执行者可能还在烧 token。
         try { await c().interruptItem?.(v.item.id) } catch { /* 中断失败不阻断判负 */ }
         audit(s.auditPath, { type: 'interrupt', id: v.item.id, code: codeOf(v.item.id), reason: 'round timeout' })
-        // v7.9: 僵尸排队位收口——该 code 除本项外已无其他在途执行者时, 摘除它在容器队列的排队位
-        // (否则槽空后会把容器授给已死的执行者; 若还有活人同题等待, 不摘——容器留给活人)。
-        const timedCode = codeOf(v.item.id)
-        const hasOthers = c().ledger.views().some(x => x.item.id !== v.item.id && codeOf(x.item.id) === timedCode
-          && (x.state === 'dispatched' || x.state === 'help' || x.state === 'stalled'))
-        if (!hasOthers) {
-          try { s.containerQueue?.evict(timedCode, 'last executor timed out') } catch { /* 摘位失败不阻断 */ }
-        }
         c().report(v.item.id, 'failed', 'round timeout')
         s.processed.add(baseId(v.item.id))
+        // v8: 超时也走 settle 结算(零进展/有进展分类 → 回队/升级梯); 队列位置归题, 不摘除。
+        void settleClassify(v.item.id, 'round timeout')
       }
       for (const v of c().ledger.views()) {
         if (v.state !== 'done' && v.state !== 'failed' && v.state !== 'blocked') continue
@@ -1150,9 +1484,12 @@ export function apply(ctx: Context): void {
         for (const note of parseObservations(detail)) addFact(s.profile, { kind: 'other', note })
         audit(s.auditPath, { type: 'terminal', id: v.item.id, state: v.state, round, detail: detail.slice(0, 300) })
         rows.push(`--- ${v.item.id} [${v.state}] round=${round} code=${code}\n${detail.slice(0, 6000)}`)
+        // v8: settle 结算兜底扫描(事件通道之外的恢复面, settleProcessed 去重)。
+        void settleClassify(v.item.id, detail)
       }
       persistProgress(s)
       persistProfile(s)
+      void tickOrch()
       return rows.length === 0 ? 'xiaochang_collect: nothing settled yet' : rows.join('\n\n')
     },
   }))
@@ -1160,10 +1497,10 @@ export function apply(ctx: Context): void {
   register(defineTool({
     name: 'xiaochang_report',
     description:
-      'Report your judgment for a challenge: complete (flags captured) / failed (give up or rounds exhausted) / skipped. Closes the container and prunes the challenge\'s queued/in-flight sibling items (hufu cancel).',
+      'Adjudication (main agent ONLY). v8 verdicts: complete (flags captured, terminal) / failed (判死, terminal) / skipped (terminal) / continue (回队续打: re-queues the challenge, ladder reset) / rotate (换实例: close + re-queue for a fresh container). Terminal verdicts close the container and prune the challenge\'s queued/in-flight sibling items; continue/rotate re-arm the challenge queue. Adjudicating removes the pending item from the dashboard.',
     parameters: {
       code: { type: 'string', required: true },
-      verdict: { type: 'string', required: true, description: 'complete | failed | skipped' },
+      verdict: { type: 'string', required: true, description: 'complete | failed | skipped | continue | rotate' },
       reason: { type: 'string', description: 'Short reason (logged).' },
       deadEnds: { type: 'array', description: '[{path, conclusion, evidence}] proven-infeasible paths.' },
       forks: { type: 'array', description: '[{path, conclusion, evidence}] untaken branches worth dispatching.' },
@@ -1179,12 +1516,15 @@ export function apply(ctx: Context): void {
         return 'xiaochang_report: 拒绝——裁决是主 agent 专属(单调度器); 执行者只报告结果, 交主 agent 判断'
       }
       const s = requireState()
-      const verdict = args.verdict === 'complete' ? 'complete' as const : args.verdict === 'failed' ? 'failed' as const : 'skipped' as const
+      const v8Verdicts = new Set(['complete', 'failed', 'skipped', 'continue', 'rotate'])
+      if (!v8Verdicts.has(args.verdict)) return `xiaochang_report: unknown verdict ${args.verdict} (complete|failed|skipped|continue|rotate)`
+      const verdict = args.verdict as 'complete' | 'failed' | 'skipped' | 'continue' | 'rotate'
+      const terminal = verdict === 'complete' || verdict === 'failed' || verdict === 'skipped'
       // v2: 归因门控的难度校准 + 终局对账 + 加权入账。
       const vq = s.v2[args.code] ?? { qtype: classifyQtype(s.challenges.get(args.code)?.description ?? ''), difficulty: difficultyPrior(s.challenges.get(args.code)?.total_score ?? 300), wins: 0, fails: 0, gaps: [], triedModels: [], ideaRound: 1, deadIdeas: 0, adopted: 0 }
       const why = args.why
       const win = verdict === 'complete'
-      if (why !== 'context-insufficient' && why !== 'platform-issue') {
+      if (terminal && why !== 'context-insufficient' && why !== 'platform-issue') {
         vq.wins += win ? 1 : 0
         vq.fails += win ? 0 : 1
         vq.difficulty = calibrateDifficulty(vq)
@@ -1193,7 +1533,7 @@ export function apply(ctx: Context): void {
       if (args.gaps !== undefined && args.gaps.length > 0) vq.gaps.push(...args.gaps)
       s.v2[args.code] = vq
       persistV2(s)
-      if (jisi !== undefined) {
+      if (jisi !== undefined && terminal) {
         // 终局对账: 采纳的思路, 题胜不加; 题败且归因 approach-dead-end → 罚思路模型(第 0 层)。
         jisi.settleAdoptions?.(args.code, win, why)
       }
@@ -1212,25 +1552,41 @@ export function apply(ctx: Context): void {
         if ((args.observations?.length ?? 0) > 0) appendKnowledgeFile(args.code, 'artifacts', args.observations!.map(line))
         if ((args.forks?.length ?? 0) > 0) appendKnowledgeFile(args.code, 'forks', args.forks!.map(line))
       } catch { /* 账本文件失败不阻断 */ }
-      try { await s.adapter.close(args.code) } catch { /* 平台侧已关 */ }
-      // v7.6: 释放队列授权 + 终态出队(该题所有排队者摘除, 轮给下一家)。
-      try { await s.containerQueue?.release() } catch { /* 释放失败不阻断 */ }
-      try { s.containerQueue?.evict(args.code, `challenge ${verdict}`) } catch { /* 出队失败不阻断 */ }
-      s.progress.update(args.code, { state: verdict, reason: args.reason, containerClosed: true })
-      for (const v of c().ledger.views()) {
-        if (codeOf(v.item.id) === args.code
-          && (v.state === 'queued' || v.state === 'dispatched' || v.state === 'help' || v.state === 'stalled')) {
-          // v7.5: 剪枝前真杀在途执行者——题已解(终态), 同题执行者继续跑就是空烧 token。
-          if (v.state !== 'queued') {
-            try { await c().interruptItem?.(v.item.id) } catch { /* 中断失败不阻断剪枝 */ }
-            audit(s.auditPath, { type: 'interrupt', id: v.item.id, code: args.code, reason: `challenge ${verdict}` })
-          }
-          try { c().cancel(v.item.id, `challenge ${verdict}: ${args.reason ?? ''}`) } catch { /* 终态竞争 */ }
-        }
+      // v8: 编排态路由——终态=solved/dead; continue/rotate=重新入队(梯清零)。
+      const o = s.orch.get(args.code)
+      if (o !== undefined) {
+        if (verdict === 'complete') adjudicate(o, 'solved')
+        else if (verdict === 'failed' || verdict === 'skipped') adjudicate(o, 'dead')
+        else adjudicate(o, verdict === 'rotate' ? 'rotate' : 'continue')
       }
+      removePending(s, args.code)
+      try { await s.adapter.close(args.code) } catch { /* 平台侧已关 */ }
+      // v8: 释放队列授权; 终态摘除该题排队位(continue/rotate 会在 armQueue 重新武装)。
+      await releaseGrant(args.code)
+      try { s.containerQueue?.evict(args.code, `challenge ${verdict}`) } catch { /* 出队失败不阻断 */ }
+      s.armed.delete(args.code)
+      if (terminal) {
+        s.progress.update(args.code, { state: verdict === 'complete' ? 'complete' : verdict, reason: args.reason, containerClosed: true })
+        for (const v of c().ledger.views()) {
+          if (codeOf(v.item.id) === args.code
+            && (v.state === 'queued' || v.state === 'dispatched' || v.state === 'help' || v.state === 'stalled')) {
+            // v7.5: 剪枝前真杀在途执行者——题已解(终态), 同题执行者继续跑就是空烧 token。
+            if (v.state !== 'queued') {
+              try { await c().interruptItem?.(v.item.id) } catch { /* 中断失败不阻断剪枝 */ }
+              audit(s.auditPath, { type: 'interrupt', id: v.item.id, code: args.code, reason: `challenge ${verdict}` })
+            }
+            try { c().cancel(v.item.id, `challenge ${verdict}: ${args.reason ?? ''}`) } catch { /* 终态竞争 */ }
+          }
+        }
+      } else {
+        s.progress.update(args.code, { containerClosed: true })
+        armQueue()
+      }
+      bumpOrch(s)
+      persistOrch(s)
       persistProgress(s)
       audit(s.auditPath, { type: 'verdict', code: args.code, state: verdict, reason: args.reason })
-      return `${args.code} → ${verdict}${args.reason !== undefined ? ` (${args.reason})` : ''}`
+      return `${args.code} → ${verdict}${args.reason !== undefined ? ` (${args.reason})` : ''}${terminal ? '' : ' (已回队)'}`
     },
   }))
 
@@ -1541,11 +1897,18 @@ ${gaps}
       // v7 类闸可见性: 主 agent 一眼看清哪条资源线饱和。
       const usage = c().classUsage?.() ?? {}
       const usageTxt = Object.entries(usage).map(([cls, u]) => `${cls} ${u.open}/${u.limit}`).join(', ') || 'n/a'
-      // v7.8 资源盘点: 容器队列(启动/排队) + 未破题在途清单——饱和仪表, 不看 3 车道假饱和。
+      // v8 题队列仪表: 待决事项置顶(未裁决持续重渲染) + 题队列(题是队列单元) + 未破题全量风险排序。
       const q = s.containerQueue
       const qLine = q !== undefined
-        ? `containerQueue: started=${q.grantedCount?.() ?? '?'}/${s.containerSlots} queued=[${q.waiters().map(w => w.holderId).join(',') || '无'}]`
+        ? `containerQueue: granted=${q.grantedCount?.() ?? '?'}/${s.containerSlots} waiters=[${q.waiters().map(w => w.holderId).join(',') || '无'}]`
         : 'containerQueue: 未初始化'
+      // 待决事项(未裁决持续置顶; >30min 加 ⚠️)
+      const now = Date.now()
+      const pendingTxt = s.pendingAdj.length === 0
+        ? '无'
+        : s.pendingAdj.map(pa => `  ${pa.code} [${pa.kind}] ${pa.summary}${now - pa.createdAt > 30 * 60_000 ? ' ⚠️未裁决>30min' : ''}`).join('\n')
+      // 编排态计数
+      const orchCount = (st: string): number => [...s.orch.values()].filter(o => o.state === st).length
       const openByCode = new Map<string, number>()
       for (const v of c().ledger.views()) {
         if (v.state !== 'dispatched' && v.state !== 'help' && v.state !== 'stalled') continue
@@ -1556,19 +1919,36 @@ ${gaps}
         const p = s.progress.get(code)
         return p === undefined || (p.state !== 'complete' && p.state !== 'failed' && p.state !== 'skipped')
       })
+      unsolved.sort((a, b) => {
+        const oa = s.orch.get(a)
+        const ob = s.orch.get(b)
+        return compareRisk(
+          oa ?? newOrch(a, s.startedAt), ob ?? newOrch(b, s.startedAt),
+          s.challenges.get(a)?.total_score ?? 300, s.challenges.get(b)?.total_score ?? 300,
+        )
+      })
       const unsolvedTxt = unsolved.length === 0
         ? '无'
-        : unsolved.slice(0, 15).map(code => `${code}(${openByCode.get(code) ?? 0}在途)`).join(' ')
-          + (unsolved.length > 15 ? ` …共${unsolved.length}题` : '')
+        : unsolved.map(code => {
+          const o = s.orch.get(code)
+          if (o === undefined) return `${code}(无编排态)`
+          const inF = openByCode.get(code) ?? 0
+          const box = o.grantedUntil !== undefined ? `/盒剩${Math.max(0, Math.round((o.grantedUntil - now) / 60000))}m` : ''
+          const ladder = o.zeroProgressStreak > 0 ? `/梯${o.zeroProgressStreak}` : ''
+          const never = o.neverDispatched ? '/从未开工' : ''
+          return `${code}[${o.state}·在途${inF}·试${o.attempts}${ladder}${box}${never}]`
+        }).join(' ')
       return [
         `campaign: open=${count(v => v.state === 'dispatched' || v.state === 'help')} queued=${count(v => v.state === 'queued')} done=${count(v => v.state === 'done')} failed=${count(v => v.state === 'failed')} blocked=${count(v => v.state === 'blocked')}`,
         `resourceClasses: ${usageTxt}`,
+        `orch: queued=${orchCount('queued')} granted=${orchCount('granted')} pending-adjudication=${orchCount('pending-adjudication')} solved=${orchCount('solved')} dead=${orchCount('dead')}`,
         qLine,
         `budgetRemainingMin=${Math.round(remaining / 60000)}`,
         `platformScore=${s.platformScore ?? 'n/a'}${s.platformScore !== undefined ? '(权威, 含 hint 扣分)' : ''}`,
         `openContainers(平台视角, 异步更新会滞后; 槽真相以 containerQueue 行为准)=${[...openContainers(s)].join(',') || 'none'}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
-        `未破题(在途数): ${unsolvedTxt}`,
+        `待裁决(${s.pendingAdj.length}):\n${pendingTxt}`,
+        `未破题(全量·风险排序): ${unsolvedTxt}`,
         `progress: ${progress}`, escTxt,
       ].join('\n')
     },
@@ -1614,6 +1994,13 @@ ${gaps}
         // ② 账本轮询兜底（超时判失败/主 agent 自己 report 等）——同按 code 过滤。
         const before = ledgerSnap()
         const iv = setInterval(() => { if (ledgerSnap() !== before) done('xiaochang_wait: campaign ledger changed') }, 2000)
+        // ⑥ v8: 编排态变化(settle 结算/回队/裁决/时间盒到期) → 唤醒
+        const orchBefore = state?.orchVersion ?? 0
+        const oiv = setInterval(() => {
+          if (state !== undefined && state.orchVersion !== orchBefore) {
+            done('xiaochang_wait: 编排态变化(settle 结算/回队/裁决/时间盒)——读 xiaochang_status')
+          }
+        }, 2000)
         // ③ 会话新消息（continuable settle 通知等）
         const seqBefore = agent?.session.seq ?? 0
         const sv = setInterval(() => { if (agent !== undefined && agent.session.seq > seqBefore) done('xiaochang_wait: session message arrived') }, 2000)
@@ -1658,7 +2045,7 @@ ${gaps}
         }, 2000)
         // ④ 超时
         const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1000)}s, no event`), timeoutMs)
-        cleanup = () => { unsub(); clearInterval(iv); clearInterval(sv); clearInterval(fv); clearTimeout(to) }
+        cleanup = () => { unsub(); clearInterval(iv); clearInterval(oiv); clearInterval(sv); clearInterval(fv); clearTimeout(to) }
         // v7.1 wait 入口评估: 两次 wait 之间写入的 fork 不落盲区——终态题归档(不唤醒), 活跃题立即唤醒。
         if (state !== undefined && evaluateInbox(codeFilter)) {
           inboxBefore = inboxSnap()
@@ -1691,11 +2078,16 @@ ${gaps}
         }
         s.progress.update(ch.unique_code, { containerClosed: true })
       }
-      // v7.6: 收尾释放全部授权并清空排队者。
-      for (let i = 0; i < closedCount; i++) { try { await s.containerQueue?.release() } catch { /* 忽略 */ } }
+      // v8: 收尾按配对账释放全部授予并清空排队者。
+      for (const code of [...s.grantedCodes]) await releaseGrant(code)
       for (const w of s.containerQueue?.waiters() ?? []) {
         try { s.containerQueue?.evict(w.holderId, 'campaign finished') } catch { /* 忽略 */ }
       }
+      // v8: 停编排心跳, 清武装, 落盘编排态。
+      if (tickTimer !== undefined) { clearInterval(tickTimer); tickTimer = undefined }
+      s.armed.clear()
+      bumpOrch(s)
+      persistOrch(s)
       persistProgress(s)
       // 虎符收尾：终态快照落盘并移入归档（防下个进程误恢复本战役）。
       if (campaignId !== undefined) holder.finish?.(campaignId)
