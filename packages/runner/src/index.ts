@@ -1859,7 +1859,7 @@ ${gaps}
         // v7.10: 升级链前置搜索钩子——卡题第一动作 = 搜公开资料, 不是硬磨(run19097 实锤: 全局只用 3 次搜索, 全在最后一小时)。
         const descQ = (ch?.description ?? '').replace(/"/g, "'").slice(0, 80)
         const searchHint = `
-   🔍 先搜公开资料再升级: web_search("${code} ${descQ}") → 结果写进账本③(xiaochang_knowledge_put artifacts)`
+   🔍 先搜公开资料再升级: web_search("${code} ${descQ}") → 结果写进账本③(xiaochang_knowledge_put artifacts); 若搜索报错(托管沙箱无外网)则跳过, 直接 xiaochang_refanout, 不要重试搜索`
         if (ruling.action === 'escalate') escLines.push(`⚠️ ${code}: ${ruling.reasons[0] ?? ''}${exclTxt}${searchHint}`)
         if (ruling.action === 'judge-dead') escLines.push(`⛔ ${code}: ${ruling.reasons[0] ?? ''}${exclTxt}${searchHint}`)
       }

@@ -2353,7 +2353,7 @@ ${[...deadLines.map((l) => `- \u274C${l}`), ...entries.map((f) => `- \u{1F500}${
         const exclTxt = ff.excluded > 0 ? ` (\u6545\u969C\u8FC7\u6EE4\u5254\u9664 ${ff.excluded}: ${[...new Set(ff.excludedReasons)].join("+")})` : "";
         const descQ = (ch?.description ?? "").replace(/"/g, "'").slice(0, 80);
         const searchHint = `
-   \u{1F50D} \u5148\u641C\u516C\u5F00\u8D44\u6599\u518D\u5347\u7EA7: web_search("${code} ${descQ}") \u2192 \u7ED3\u679C\u5199\u8FDB\u8D26\u672C\u2462(xiaochang_knowledge_put artifacts)`;
+   \u{1F50D} \u5148\u641C\u516C\u5F00\u8D44\u6599\u518D\u5347\u7EA7: web_search("${code} ${descQ}") \u2192 \u7ED3\u679C\u5199\u8FDB\u8D26\u672C\u2462(xiaochang_knowledge_put artifacts); \u82E5\u641C\u7D22\u62A5\u9519(\u6258\u7BA1\u6C99\u7BB1\u65E0\u5916\u7F51)\u5219\u8DF3\u8FC7, \u76F4\u63A5 xiaochang_refanout, \u4E0D\u8981\u91CD\u8BD5\u641C\u7D22`;
         if (ruling.action === "escalate") escLines.push(`\u26A0\uFE0F ${code}: ${ruling.reasons[0] ?? ""}${exclTxt}${searchHint}`);
         if (ruling.action === "judge-dead") escLines.push(`\u26D4 ${code}: ${ruling.reasons[0] ?? ""}${exclTxt}${searchHint}`);
       }
