@@ -1193,7 +1193,10 @@ export function apply(ctx: Context): void {
     },
   }))
 
-  // ── v7.8 附件清道(一键, 零 LLM turn 的 开容器→下附件→关 循环) ──────
+  // ── v8 附件清道(已废弃为 no-op): v8 题队列把全部题武装成 10h 等待位,
+  // sweep 的短超时 acquire 会合并进武装等待(长超时) → 低优先级题的容器迟迟不授
+  // → 工具永久阻塞 → 整批工具结果不回传 → 主回合冻结(run 20065/20069 实锤)。
+  // 附件下载归持槽执行者: 授予即开工, 执行者自行处理附件。 ──────────────────
   register(defineTool({
     name: 'xiaochang_sweep_attachments',
     description:
@@ -1203,6 +1206,10 @@ export function apply(ctx: Context): void {
     isConcurrencySafe: () => false,
     async execute() {
       const s = requireState()
+      audit(s.auditPath, { type: 'v8-sweep-noop' })
+      return 'xiaochang_sweep_attachments: v8 已废弃(附件下载并入题队列授予——执行者持槽开工时自行处理附件, 无需手动清道)。直接进入下一步即可。'
+      // 以下为 v7.8 旧实现(v8 不再执行; 保留注释防误恢复)。
+      /* eslint-disable no-unreachable */
       const targets = [...s.challenges.values()].filter(ch => attachmentLikely(ch.description))
       const manifest: string[] = []
       let downloaded = 0

@@ -76,7 +76,7 @@ goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goa
 
 1. **开题四步——先侦察后突击（P 阶段）**：
    ① **通读题面**：`xiaochang_list` 一次拿全 40 题题面与平台难度标签；
-   ② **附件清道（v7.8 一键化）**：直接调 `xiaochang_sweep_attachments`——机制对全部疑似附件题跑"开容器→下附件→关"循环（零 LLM turn、走资源队列），工件落 `<cwd>/att/<code>/`；清单里"候选路径无命中"的题留给执行者手工下；
+   ② **附件随题授予（v8）**：没有清道工具——附件下载由持槽执行者开工后自行处理（授予即注入容器地址，执行者 bash 下载）；
    ③ **思路总扫（v7.8 已机制化 + 手动补强）**：fresh 局 `xiaochang_setup` 已自动按题发全量暖账 fanout（deepseek-flash, 每题一路）——你收到信封后裁决入队；**hard 题与已卡题再用 `jisi_fanout_bulk` 加模型补征**：
       托管环境用 `jisi_fanout_bulk` **一次调用发完全部征思路任务**（specs 数组,
       每题一个 prompt,可指定模型/effort）——主 agent 每轮 LLM 往返在网关下 ~20s,

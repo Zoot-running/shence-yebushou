@@ -1667,6 +1667,8 @@ ${rows.join("\n")}`;
     isConcurrencySafe: () => false,
     async execute() {
       const s = requireState();
+      audit(s.auditPath, { type: "v8-sweep-noop" });
+      return "xiaochang_sweep_attachments: v8 \u5DF2\u5E9F\u5F03(\u9644\u4EF6\u4E0B\u8F7D\u5E76\u5165\u9898\u961F\u5217\u6388\u4E88\u2014\u2014\u6267\u884C\u8005\u6301\u69FD\u5F00\u5DE5\u65F6\u81EA\u884C\u5904\u7406\u9644\u4EF6, \u65E0\u9700\u624B\u52A8\u6E05\u9053)\u3002\u76F4\u63A5\u8FDB\u5165\u4E0B\u4E00\u6B65\u5373\u53EF\u3002";
       const targets = [...s.challenges.values()].filter((ch) => attachmentLikely(ch.description));
       const manifest = [];
       let downloaded = 0;
