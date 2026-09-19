@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   SUBMIT_GRACE_MS,
+  clusterMapOf,
   flagLine,
   foldFlags,
   parseFlagLines,
@@ -295,6 +296,23 @@ describe('指纹与序列化', () => {
     expect(back.pending[0]!.kind).toBe('blocker-verified')
     expect(back.scoreTable['f1-02']).toBe(600)
     expect(back.scoreTable['a-01']).toBe(100)
+  })
+})
+
+describe('同靶场簇', () => {
+  it('clusterMapOf: 同 addr 聚簇, 异 addr/空 addr 不入簇', () => {
+    const m = new Map<string, string[]>([
+      ['a-18', ['10.0.1.5']],
+      ['d-02', ['10.0.1.5']],
+      ['b-01', ['10.0.2.1']],
+      ['c-01', []],
+      ['e-01', ['10.0.1.5']],
+    ])
+    const clusters = clusterMapOf(m)
+    expect(clusters.get('a-18')!.sort()).toEqual(['d-02', 'e-01'])
+    expect(clusters.get('d-02')!.sort()).toEqual(['a-18', 'e-01'])
+    expect(clusters.has('b-01')).toBe(false)
+    expect(clusters.has('c-01')).toBe(false)
   })
 })
 

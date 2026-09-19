@@ -42,6 +42,7 @@ import {
   applyVerifierResult,
   adjudicate,
   blockerConcluded,
+  clusterMapOf,
   compareRisk,
   flagLine,
   foldFlags,
@@ -729,6 +730,27 @@ export function apply(ctx: Context): void {
     const cls = resourceClassOf(ch)
     const prio = priorityOf(o, ch.total_score, Date.now())
     const snapshot = snapshotProgress(code)
+    // v8.3c 同靶场簇: 按 addr 聚簇(平台共享实例), 簇主码一兵多题签。
+    const addrMap = new Map<string, string[]>()
+    for (const c2 of s.challenges.values()) {
+      if (c2.container_addr.length > 0) addrMap.set(c2.unique_code, c2.container_addr)
+    }
+    const clusters = clusterMapOf(addrMap)
+    const detected = clusters.get(code) ?? []
+    // 簇身份持久化: addr 探测为空(实例未分配)时沿用历史簇, 不丢身份。
+    const siblings = detected.length > 0 ? detected : o.cluster
+    for (const sb of siblings) {
+      const so = s.orch.get(sb)
+      if (so !== undefined && so.state === 'queued') {
+        // 兄弟题随簇授予(共享容器): 同态标注, 摘除其队列等待位, 不再单独开容器。
+        grant(so, snapshot, Date.now(), s.timeboxMs)
+        so.cluster = [code, ...siblings.filter(x => x !== sb)]
+        s.armed.delete(sb)
+        try { s.containerQueue?.evict(sb, 'cluster-granted (共享容器, 随簇主码派兵)') } catch { /* 摘位失败不阻断 */ }
+        audit(s.auditPath, { type: 'v8-cluster-absorb', code, sibling: sb })
+      }
+    }
+    o.cluster = siblings
     grant(o, snapshot, Date.now(), s.timeboxMs)
     const nSpawn = Math.max(1, Math.min(o.multiSpawn, 3))
     o.multiSpawn = 0
@@ -738,15 +760,22 @@ export function apply(ctx: Context): void {
     if (o.blockerCheck === 'in-flight') {
       picks.push({ text: VERIFIER_DIRECTIVE })
     } else {
-      const untried = o.directives.filter(d => !d.tried)
+      // v8.3c 簇调度: 思路取簇内全体成员未试思路的并集(对任一成员投的思路都生效)。
+      const memberCodes = [code, ...o.cluster]
+      const untried = memberCodes.flatMap(c2 => {
+        const oo = s.orch.get(c2)
+        return (oo?.directives ?? []).filter(d => !d.tried)
+      })
       for (let i = 0; i < nSpawn; i++) {
         const d = untried.shift()
         if (d !== undefined) picks.push(d)
         else picks.push({ text: '按账本+画像自由突破: 先读知识账本, 从已知边界出发, 不打死路' })
       }
       for (const d of picks) {
-        const orig = o.directives.find(x => x.text === d.text)
-        if (orig !== undefined) orig.tried = true
+        for (const c2 of memberCodes) {
+          const orig = s.orch.get(c2)?.directives.find(x => x.text === d.text)
+          if (orig !== undefined) orig.tried = true
+        }
       }
     }
     for (let i = 0; i < picks.length; i++) {
@@ -757,7 +786,13 @@ export function apply(ctx: Context): void {
       const executor = resolveExecutor({ model: d.model ?? pickSpawnModel(code, i), effort: d.effort }, s.executorPolicy)
       const err = await validateExecutorModel(executor.model)
       const model = err === null ? executor.model : s.executorPolicy.defaultModel
-      const label = buildExecFrame(code, d.text) + gapsTxtOf(code)
+      const clusterTxt = o.cluster.length > 0
+        ? `\n\n【同靶场兄弟题(共享此容器, 一并收旗)】${o.cluster.map(c2 => {
+          const ch2 = s.challenges.get(c2)
+          return `${c2}(${ch2?.total_score ?? '?'}pts): 题面 ${(ch2?.description ?? '').slice(0, 80)}; 战报 ${c().boardPath(c2)}; 拿到该题旗同样调 xiaochang_flag_report('${c2}', flag)`
+        }).join('\n')}`
+        : ''
+      const label = buildExecFrame(code, d.text) + clusterTxt + gapsTxtOf(code)
       c().add({
         id: itemId,
         label,
@@ -864,6 +899,20 @@ export function apply(ctx: Context): void {
       try { await s.adapter.close(code) } catch { /* 平台侧已关 */ }
       await releaseGrant(code)
       s.progress.update(code, { containerClosed: true })
+    }
+    // v8.3c 簇内同态: 兄弟题执行同一结算动作(簇=单调度单元, 不分裂)。
+    for (const sb of o.cluster) {
+      const so2 = s.orch.get(sb)
+      if (so2 !== undefined && so2.state === 'granted') {
+        const p2: SettleProgress = { ...p, flagCandidate: pendingFlagsOf(readFlagEntries(), sb).length > 0 }
+        const action2 = settleAction(so2, p2)
+        applySettle(so2, action2, detail, now)
+        if (!p2.flagCandidate) so2.settleNoFlag += 1
+        if (action2 === 'pending-flag') {
+          addPending(s, makePending(sb, 'flag-candidate', `${sb} 有旗待提交: 尽快 xiaochang_submit(容器在线宽限 15min)`, c().boardPath(sb), now))
+        }
+        audit(s.auditPath, { type: 'v8-settle-cluster', itemId, code, sibling: sb, action: action2 })
+      }
     }
     audit(s.auditPath, { type: 'v8-settle', itemId, code, action, flagCandidate: p.flagCandidate })
     bumpOrch(s)
@@ -1323,7 +1372,7 @@ export function apply(ctx: Context): void {
             s.progress.update(args.code, { state: 'complete', containerClosed: true })
             for (const v of c().ledger.views()) {
               if (codeOf(v.item.id) === args.code && ['queued', 'dispatched', 'help', 'stalled'].includes(v.state)) {
-                if (v.state !== 'queued') { try { await c().interruptItem?.(v.item.id) } catch { /* 不阻断 */ } }
+                // v8.3c: 只 cancel 排队项; 在途不 interrupt(abort 传播打崩主 driver——簇干跑实锤; 在途 settle 时题已 solved 被吸收)。
                 try { c().cancel(v.item.id, 'challenge solved') } catch { /* 不阻断 */ }
               }
             }
@@ -1526,10 +1575,16 @@ export function apply(ctx: Context): void {
       }
       o.directives.push({ text: trunc.text, model: args.model, effort: args.effort, tried: false })
       if (args.priority !== undefined) o.priorityOverride = args.priority
-      // 已挂裁决的题: 主 agent 主动再给思路 = 视为续打裁决(梯清零)。
-      if (o.state === 'pending-adjudication') {
-        adjudicate(o, 'continue')
-        removePending(s, args.code)
+      // v8.3c 簇调度: 入队/续打对簇内全体成员生效(簇=单调度单元)。
+      const memberCodes = [args.code, ...o.cluster]
+      for (const c2 of memberCodes) {
+        const mo = s.orch.get(c2)
+        if (mo === undefined) continue
+        if (mo.state === 'pending-adjudication') {
+          adjudicate(mo, 'continue')
+          removePending(s, c2)
+        }
+        if (mo.state !== 'solved' && mo.state !== 'dead') mo.state = 'queued'
       }
       o.state = 'queued'
       bumpOrch(s)
@@ -1679,24 +1734,32 @@ export function apply(ctx: Context): void {
         if ((args.forks?.length ?? 0) > 0) appendKnowledgeFile(args.code, 'forks', args.forks!.map(line))
       } catch { /* 账本文件失败不阻断 */ }
       // v8: 编排态路由——终态=solved/dead; continue/rotate=重新入队(梯清零)。
+      // v8.3c 簇调度: 裁决对簇内全体成员执行。
       const o = s.orch.get(args.code)
-      if (o !== undefined) {
-        if (verdict === 'complete') adjudicate(o, 'solved')
-        else if (verdict === 'failed' || verdict === 'skipped') adjudicate(o, 'dead')
-        else adjudicate(o, verdict === 'rotate' ? 'rotate' : 'continue')
+      const memberCodes = [args.code, ...(o?.cluster ?? [])]
+      for (const c2 of memberCodes) {
+        const mo = s.orch.get(c2)
+        if (mo === undefined) continue
+        if (verdict === 'complete') adjudicate(mo, 'solved')
+        else if (verdict === 'failed' || verdict === 'skipped') adjudicate(mo, 'dead')
+        else adjudicate(mo, verdict === 'rotate' ? 'rotate' : 'continue')
       }
-      removePending(s, args.code)
-      try { await s.adapter.close(args.code) } catch { /* 平台侧已关 */ }
-      // v8: 释放队列授权; 终态摘除该题排队位(continue/rotate 会在 armQueue 重新武装)。
-      await releaseGrant(args.code)
-      try { s.containerQueue?.evict(args.code, `challenge ${verdict}`) } catch { /* 出队失败不阻断 */ }
-      s.armed.delete(args.code)
+      for (const c2 of memberCodes) removePending(s, c2)
+      // v8.3c 簇调度: 关容器/摘队/剪枝覆盖簇内全体成员。
+      for (const c2 of memberCodes) {
+        try { await s.adapter.close(c2) } catch { /* 平台侧已关 */ }
+        await releaseGrant(c2)
+        try { s.containerQueue?.evict(c2, `challenge ${verdict}`) } catch { /* 出队失败不阻断 */ }
+        s.armed.delete(c2)
+      }
       if (terminal) {
-        s.progress.update(args.code, { state: verdict === 'complete' ? 'complete' : verdict, reason: args.reason, containerClosed: true })
+        for (const c2 of memberCodes) {
+          s.progress.update(c2, { state: verdict === 'complete' ? 'complete' : verdict, reason: args.reason, containerClosed: true })
+        }
         for (const v of c().ledger.views()) {
-          if (codeOf(v.item.id) === args.code
+          if (memberCodes.includes(codeOf(v.item.id))
             && (v.state === 'queued' || v.state === 'dispatched' || v.state === 'help' || v.state === 'stalled')) {
-            // v7.5: 剪枝前真杀在途执行者——题已解(终态), 同题执行者继续跑就是空烧 token。
+            // v7.5: 剪枝前真杀在途执行者(report 是主 agent 显式裁决, abort 风险已由 A 修复避开 submit 路径)。
             if (v.state !== 'queued') {
               try { await c().interruptItem?.(v.item.id) } catch { /* 中断失败不阻断剪枝 */ }
               audit(s.auditPath, { type: 'interrupt', id: v.item.id, code: args.code, reason: `challenge ${verdict}` })
@@ -1705,7 +1768,7 @@ export function apply(ctx: Context): void {
           }
         }
       } else {
-        s.progress.update(args.code, { containerClosed: true })
+        for (const c2 of memberCodes) s.progress.update(c2, { containerClosed: true })
         armQueue()
       }
       bumpOrch(s)

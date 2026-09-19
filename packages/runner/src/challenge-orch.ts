@@ -64,6 +64,8 @@ export interface ChallengeOrch {
   settleNoFlag: number
   /** blocker 类结论（无攻击面/环境缺失…）核验状态。 */
   blockerCheck: 'none' | 'in-flight' | 'confirmed' | 'refuted'
+  /** v8.3c 同靶场簇: 与本码共享容器实例的兄弟题码(不含自身); 簇内同态结算。 */
+  cluster: string[]
   /** 上次 settle 结论指纹（同结论检测）。 */
   lastSettleFingerprint?: string
   snapshot?: ProgressSnapshot
@@ -264,6 +266,24 @@ export function neverDispatchedBoost(orch: ChallengeOrch, now: number): number {
   return Math.min(NEVER_DISPATCHED_BOOST_MAX, Math.floor(Math.max(0, now - orch.createdAt) / NEVER_DISPATCHED_BOOST_STEP_MS))
 }
 
+/** v8.3c 同靶场簇: addr(非空) 相同的题归为一簇; 返回 code → 兄弟码列表(不含自身)。 */
+export function clusterMapOf(addrs: ReadonlyMap<string, string[]>): Map<string, string[]> {
+  const byAddr = new Map<string, string[]>()
+  for (const [code, list] of addrs) {
+    const key = [...list].sort().join('|')
+    if (key === '') continue
+    const members = byAddr.get(key) ?? []
+    members.push(code)
+    byAddr.set(key, members)
+  }
+  const out = new Map<string, string[]>()
+  for (const members of byAddr.values()) {
+    if (members.length < 2) continue
+    for (const code of members) out.set(code, members.filter(c => c !== code).sort())
+  }
+  return out
+}
+
 /**
  * 队列优先级(两段式):
  * - 首轮公平带: 从未开工的题全部排在已开工题之前(1_000_000 基线), 带内按分值升序(easy 先行清场,
@@ -310,6 +330,7 @@ export function newOrch(code: string, now: number): ChallengeOrch {
     multiSpawn: 0,
     settleNoFlag: 0,
     blockerCheck: 'none',
+    cluster: [],
     createdAt: now,
   }
 }

@@ -675,6 +675,22 @@ function neverDispatchedBoost(orch, now) {
   if (!orch.neverDispatched) return 0;
   return Math.min(NEVER_DISPATCHED_BOOST_MAX, Math.floor(Math.max(0, now - orch.createdAt) / NEVER_DISPATCHED_BOOST_STEP_MS));
 }
+function clusterMapOf(addrs) {
+  const byAddr = /* @__PURE__ */ new Map();
+  for (const [code, list] of addrs) {
+    const key = [...list].sort().join("|");
+    if (key === "") continue;
+    const members = byAddr.get(key) ?? [];
+    members.push(code);
+    byAddr.set(key, members);
+  }
+  const out = /* @__PURE__ */ new Map();
+  for (const members of byAddr.values()) {
+    if (members.length < 2) continue;
+    for (const code of members) out.set(code, members.filter((c) => c !== code).sort());
+  }
+  return out;
+}
 function priorityOf(orch, totalScore, now) {
   if (orch.state === "solved" || orch.state === "dead" || orch.state === "pending-adjudication") return Number.NEGATIVE_INFINITY;
   const base = totalScore > 0 ? totalScore : 300;
@@ -708,6 +724,7 @@ function newOrch(code, now) {
     multiSpawn: 0,
     settleNoFlag: 0,
     blockerCheck: "none",
+    cluster: [],
     createdAt: now
   };
 }
@@ -1252,6 +1269,27 @@ function apply(ctx) {
     const cls = resourceClassOf(ch);
     const prio = priorityOf(o, ch.total_score, Date.now());
     const snapshot = snapshotProgress(code);
+    const addrMap = /* @__PURE__ */ new Map();
+    for (const c2 of s.challenges.values()) {
+      if (c2.container_addr.length > 0) addrMap.set(c2.unique_code, c2.container_addr);
+    }
+    const clusters = clusterMapOf(addrMap);
+    const detected = clusters.get(code) ?? [];
+    const siblings = detected.length > 0 ? detected : o.cluster;
+    for (const sb of siblings) {
+      const so = s.orch.get(sb);
+      if (so !== void 0 && so.state === "queued") {
+        grant(so, snapshot, Date.now(), s.timeboxMs);
+        so.cluster = [code, ...siblings.filter((x) => x !== sb)];
+        s.armed.delete(sb);
+        try {
+          s.containerQueue?.evict(sb, "cluster-granted (\u5171\u4EAB\u5BB9\u5668, \u968F\u7C07\u4E3B\u7801\u6D3E\u5175)");
+        } catch {
+        }
+        audit(s.auditPath, { type: "v8-cluster-absorb", code, sibling: sb });
+      }
+    }
+    o.cluster = siblings;
     grant(o, snapshot, Date.now(), s.timeboxMs);
     const nSpawn = Math.max(1, Math.min(o.multiSpawn, 3));
     o.multiSpawn = 0;
@@ -1264,15 +1302,21 @@ function apply(ctx) {
     if (o.blockerCheck === "in-flight") {
       picks.push({ text: VERIFIER_DIRECTIVE });
     } else {
-      const untried = o.directives.filter((d) => !d.tried);
+      const memberCodes = [code, ...o.cluster];
+      const untried = memberCodes.flatMap((c2) => {
+        const oo = s.orch.get(c2);
+        return (oo?.directives ?? []).filter((d) => !d.tried);
+      });
       for (let i = 0; i < nSpawn; i++) {
         const d = untried.shift();
         if (d !== void 0) picks.push(d);
         else picks.push({ text: "\u6309\u8D26\u672C+\u753B\u50CF\u81EA\u7531\u7A81\u7834: \u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1, \u4E0D\u6253\u6B7B\u8DEF" });
       }
       for (const d of picks) {
-        const orig = o.directives.find((x) => x.text === d.text);
-        if (orig !== void 0) orig.tried = true;
+        for (const c2 of memberCodes) {
+          const orig = s.orch.get(c2)?.directives.find((x) => x.text === d.text);
+          if (orig !== void 0) orig.tried = true;
+        }
       }
     }
     for (let i = 0; i < picks.length; i++) {
@@ -1283,7 +1327,13 @@ function apply(ctx) {
       const executor = resolveExecutor({ model: d.model ?? pickSpawnModel(code, i), effort: d.effort }, s.executorPolicy);
       const err = await validateExecutorModel(executor.model);
       const model = err === null ? executor.model : s.executorPolicy.defaultModel;
-      const label = buildExecFrame(code, d.text) + gapsTxtOf(code);
+      const clusterTxt = o.cluster.length > 0 ? `
+
+\u3010\u540C\u9776\u573A\u5144\u5F1F\u9898(\u5171\u4EAB\u6B64\u5BB9\u5668, \u4E00\u5E76\u6536\u65D7)\u3011${o.cluster.map((c2) => {
+        const ch2 = s.challenges.get(c2);
+        return `${c2}(${ch2?.total_score ?? "?"}pts): \u9898\u9762 ${(ch2?.description ?? "").slice(0, 80)}; \u6218\u62A5 ${c().boardPath(c2)}; \u62FF\u5230\u8BE5\u9898\u65D7\u540C\u6837\u8C03 xiaochang_flag_report('${c2}', flag)`;
+      }).join("\n")}` : "";
+      const label = buildExecFrame(code, d.text) + clusterTxt + gapsTxtOf(code);
       c().add({
         id: itemId,
         label,
@@ -1386,6 +1436,19 @@ function apply(ctx) {
       }
       await releaseGrant(code);
       s.progress.update(code, { containerClosed: true });
+    }
+    for (const sb of o.cluster) {
+      const so2 = s.orch.get(sb);
+      if (so2 !== void 0 && so2.state === "granted") {
+        const p2 = { ...p, flagCandidate: pendingFlagsOf(readFlagEntries(), sb).length > 0 };
+        const action2 = settleAction(so2, p2);
+        applySettle(so2, action2, detail, now);
+        if (!p2.flagCandidate) so2.settleNoFlag += 1;
+        if (action2 === "pending-flag") {
+          addPending(s, makePending(sb, "flag-candidate", `${sb} \u6709\u65D7\u5F85\u63D0\u4EA4: \u5C3D\u5FEB xiaochang_submit(\u5BB9\u5668\u5728\u7EBF\u5BBD\u9650 15min)`, c().boardPath(sb), now));
+        }
+        audit(s.auditPath, { type: "v8-settle-cluster", itemId, code, sibling: sb, action: action2 });
+      }
     }
     audit(s.auditPath, { type: "v8-settle", itemId, code, action, flagCandidate: p.flagCandidate });
     bumpOrch(s);
@@ -1827,12 +1890,6 @@ ${manifest.join("\n")}`;
             s.progress.update(args.code, { state: "complete", containerClosed: true });
             for (const v of c().ledger.views()) {
               if (codeOf(v.item.id) === args.code && ["queued", "dispatched", "help", "stalled"].includes(v.state)) {
-                if (v.state !== "queued") {
-                  try {
-                    await c().interruptItem?.(v.item.id);
-                  } catch {
-                  }
-                }
                 try {
                   c().cancel(v.item.id, "challenge solved");
                 } catch {
@@ -2029,9 +2086,15 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
       }
       o.directives.push({ text: trunc.text, model: args.model, effort: args.effort, tried: false });
       if (args.priority !== void 0) o.priorityOverride = args.priority;
-      if (o.state === "pending-adjudication") {
-        adjudicate(o, "continue");
-        removePending(s, args.code);
+      const memberCodes = [args.code, ...o.cluster];
+      for (const c2 of memberCodes) {
+        const mo = s.orch.get(c2);
+        if (mo === void 0) continue;
+        if (mo.state === "pending-adjudication") {
+          adjudicate(mo, "continue");
+          removePending(s, c2);
+        }
+        if (mo.state !== "solved" && mo.state !== "dead") mo.state = "queued";
       }
       o.state = "queued";
       bumpOrch(s);
@@ -2169,26 +2232,33 @@ ${detail.slice(0, 6e3)}`);
       } catch {
       }
       const o = s.orch.get(args.code);
-      if (o !== void 0) {
-        if (verdict === "complete") adjudicate(o, "solved");
-        else if (verdict === "failed" || verdict === "skipped") adjudicate(o, "dead");
-        else adjudicate(o, verdict === "rotate" ? "rotate" : "continue");
+      const memberCodes = [args.code, ...o?.cluster ?? []];
+      for (const c2 of memberCodes) {
+        const mo = s.orch.get(c2);
+        if (mo === void 0) continue;
+        if (verdict === "complete") adjudicate(mo, "solved");
+        else if (verdict === "failed" || verdict === "skipped") adjudicate(mo, "dead");
+        else adjudicate(mo, verdict === "rotate" ? "rotate" : "continue");
       }
-      removePending(s, args.code);
-      try {
-        await s.adapter.close(args.code);
-      } catch {
+      for (const c2 of memberCodes) removePending(s, c2);
+      for (const c2 of memberCodes) {
+        try {
+          await s.adapter.close(c2);
+        } catch {
+        }
+        await releaseGrant(c2);
+        try {
+          s.containerQueue?.evict(c2, `challenge ${verdict}`);
+        } catch {
+        }
+        s.armed.delete(c2);
       }
-      await releaseGrant(args.code);
-      try {
-        s.containerQueue?.evict(args.code, `challenge ${verdict}`);
-      } catch {
-      }
-      s.armed.delete(args.code);
       if (terminal) {
-        s.progress.update(args.code, { state: verdict === "complete" ? "complete" : verdict, reason: args.reason, containerClosed: true });
+        for (const c2 of memberCodes) {
+          s.progress.update(c2, { state: verdict === "complete" ? "complete" : verdict, reason: args.reason, containerClosed: true });
+        }
         for (const v of c().ledger.views()) {
-          if (codeOf(v.item.id) === args.code && (v.state === "queued" || v.state === "dispatched" || v.state === "help" || v.state === "stalled")) {
+          if (memberCodes.includes(codeOf(v.item.id)) && (v.state === "queued" || v.state === "dispatched" || v.state === "help" || v.state === "stalled")) {
             if (v.state !== "queued") {
               try {
                 await c().interruptItem?.(v.item.id);
@@ -2203,7 +2273,7 @@ ${detail.slice(0, 6e3)}`);
           }
         }
       } else {
-        s.progress.update(args.code, { containerClosed: true });
+        for (const c2 of memberCodes) s.progress.update(c2, { containerClosed: true });
         armQueue();
       }
       bumpOrch(s);

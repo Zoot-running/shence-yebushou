@@ -165,7 +165,10 @@ function route(req, res) {
     const ch = challenges.find(c => c.unique_code === code)
     if (!ch) return json(res, 404, { detail: 'unknown challenge' })
     ch.container_status = 'available'
-    ch.container_addr = [`10.0.100.${20 + challenges.indexOf(ch)}`]
+    // v8.3c 簇测试: xb-071 与 xb-056 共享同一实例 addr(同靶场簇)。
+    ch.container_addr = ch.unique_code === 'xb-071' || ch.unique_code === 'xb-056'
+      ? ['10.0.100.88']
+      : [`10.0.100.${20 + challenges.indexOf(ch)}`]
     return json(res, 200, { container_addr: ch.container_addr })
   }
   if (p === '/openapi/v1/challenges/submit' && req.method === 'POST') {
