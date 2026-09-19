@@ -17,7 +17,7 @@ v8 调度纪律(与托管局相同, 规模缩小):
 - **题队列**: 你只有两个动作——投思路(enqueue)和裁决(report)。**没有 start_container/dispatch 工具**。授予=机制自动启容器+派兵; 执行者持槽开工。
 - **每题至少投 1 条思路**: xiaochang_enqueue(code, prompt=一行方向段)。hard/多旗题(b-02)多投几条(一旗一条)。投完就不用管——机制自动授予/回队/升级梯/6min 时间盒。
 - **待裁决必须处理**: xiaochang_status 置顶"待裁决(N)"——每条用 xiaochang_report 裁决: continue=回队续打 / rotate=换实例 / failed=判死 / complete=已解。未裁决不自动入队。
-- **提交**: 执行者 settle 带 FLAG_CANDIDATE 或战报出现新旗值 → 立即 xiaochang_submit; 多旗题(b-02 6旗)逐旗提交, 机制在部分旗后自动续打下一旗。
+- **旗仓(v8.3)**: 执行者出旗即调 xiaochang_flag_report(code, flag, evidence) 入仓; 你的 xiaochang_wait 会被旗仓变化唤醒 → xiaochang_flag_status 查仓 → 逐值 xiaochang_submit(回执自动回写 accepted/rejected); 多旗题(b-02 6旗)逐旗提交, 机制在部分旗后自动续打下一旗。
 - **v8 仪表**: xiaochang_status 的"未破题(全量·风险排序)"行, 0 在途/从未开工排最前 = 提醒你投思路。
 - 模型只用 deepseek 系(deepseek-v4-flash / deepseek-flash); 本局禁用 kimi/glm(网关本地不可达)。
 - 等待唯一姿势: xiaochang_wait(超时给 120s)。禁止 bash sleep。

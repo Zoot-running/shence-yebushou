@@ -2678,6 +2678,7 @@ ${pendingTxt}`,
         };
         let flagsBefore = flagSnap();
         const fgv = setInterval(() => {
+          if (state === void 0) return;
           const nowSnap = flagSnap();
           if (nowSnap !== flagsBefore) {
             flagsBefore = nowSnap;

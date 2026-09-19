@@ -5,6 +5,10 @@
 import { describe, expect, it } from 'vitest'
 import {
   SUBMIT_GRACE_MS,
+  flagLine,
+  foldFlags,
+  parseFlagLines,
+  pendingFlagsOf,
   TIMEBOX_MS,
   adjudicate,
   applySettle,
@@ -291,6 +295,20 @@ describe('指纹与序列化', () => {
     expect(back.pending[0]!.kind).toBe('blocker-verified')
     expect(back.scoreTable['f1-02']).toBe(600)
     expect(back.scoreTable['a-01']).toBe(100)
+  })
+})
+
+describe('旗仓纯函数', () => {
+  it('parseFlagLines 坏行跳过 / foldFlags 同键后行覆盖', () => {
+    const e1 = flagLine({ code: 'b-02', flag: 'flag{a}', by: 'x', status: 'pending', at: 1 })
+    const e2 = flagLine({ code: 'b-02', flag: 'flag{a}', by: 'submit', status: 'accepted', at: 2 })
+    const e3 = flagLine({ code: 'b-02', flag: 'flag{b}', by: 'x', status: 'pending', at: 3 })
+    const entries = parseFlagLines([e1, e2, 'bad-line', e3].join('\n'))
+    expect(entries).toHaveLength(3)
+    const folded = foldFlags(entries).get('b-02')!
+    expect(folded.get('flag{a}')!.status).toBe('accepted') // 后行覆盖
+    expect(pendingFlagsOf(entries, 'b-02').map(e => e.flag)).toEqual(['flag{b}'])
+    expect(pendingFlagsOf(entries, 'a-01')).toEqual([])
   })
 })
 

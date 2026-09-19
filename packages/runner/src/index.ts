@@ -2161,6 +2161,7 @@ ${gaps}
         }
         let flagsBefore = flagSnap()
         const fgv = setInterval(() => {
+          if (state === undefined) return // 执行者会话不轮询旗仓(主 agent 专属提交通道)
           const nowSnap = flagSnap()
           if (nowSnap !== flagsBefore) {
             flagsBefore = nowSnap
