@@ -8,11 +8,13 @@ DEV_HOME="${DEV_HOME:-/home/zrn/.dsh-dev}"
 MOCK_PORT="${MOCK_PORT:-8399}"
 DSK="$(grep -oE 'sk-[A-Za-z0-9]+' "$REPO/../.secrets/api-keys.md" | head -1)"
 
-node "$REPO/tools/mock-tsecbench.mjs" "$MOCK_PORT" > /tmp/dryrun-ab-mock.log 2>&1 &
-MOCK_PID=$!
-trap 'kill $MOCK_PID 2>/dev/null || true' EXIT
-sleep 1
-curl -sf "http://127.0.0.1:$MOCK_PORT/health" >/dev/null || { echo "mock not up"; exit 1; }
+start_mock() {
+  node "$REPO/tools/mock-tsecbench.mjs" "$MOCK_PORT" > "/tmp/dryrun-ab-mock-$1.log" 2>&1 &
+  MOCK_PID=$!
+  sleep 1
+  curl -sf "http://127.0.0.1:$MOCK_PORT/health" >/dev/null || { echo "mock not up"; exit 1; }
+}
+stop_mock() { kill $MOCK_PID 2>/dev/null || true; wait $MOCK_PID 2>/dev/null || true; }
 
 for spec in "$REPO/packages/runner" "$REPO/../shence-jisi" "$REPO/../shence-hufu" "$REPO/../shence-dsh-compat"; do
   pkg="$(node -e "console.log(require('$spec/package.json').name)")"
@@ -23,6 +25,8 @@ done
 run_arm() {
   local ARM="$1"   # A | B
   local OUT="/tmp/dryrun-ab-$ARM"
+  stop_mock
+  start_mock "$ARM"   # 每臂全新 mock 状态——旗已交状态不得跨臂污染(A/B 观测前提)
   sudo rm -rf "$DEV_HOME/storages/xiaochang-fork-inbox" "$DEV_HOME/storages/hufu-campaigns"
   sudo rm -f "$DEV_HOME/storages/xiaochang-run-pending.jsonl" "$DEV_HOME/storages/xiaochang-v2-pending.json" \
              "$DEV_HOME/storages/xiaochang-orch-pending.json" "$DEV_HOME/storages/xiaochang-run-audit.jsonl"
@@ -41,4 +45,5 @@ run_arm() {
 
 run_arm A
 run_arm B
+stop_mock
 echo "── A/B 两臂完成, 汇总见 tools/ab-report.mjs"
