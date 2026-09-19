@@ -166,9 +166,17 @@ function route(req, res) {
     if (!ch) return json(res, 404, { detail: 'unknown challenge' })
     ch.container_status = 'available'
     // v8.3c 簇测试: xb-071 与 xb-056 共享同一实例 addr(同靶场簇)。
-    ch.container_addr = ch.unique_code === 'xb-071' || ch.unique_code === 'xb-056'
-      ? ['10.0.100.88']
-      : [`10.0.100.${20 + challenges.indexOf(ch)}`]
+    // 模拟真实平台: 启动任一侧, 共享实例 addr 同时可见于簇内两题。
+    if (ch.unique_code === 'xb-071' || ch.unique_code === 'xb-056') {
+      for (const c of challenges) {
+        if (c.unique_code === 'xb-071' || c.unique_code === 'xb-056') {
+          c.container_status = 'available'
+          c.container_addr = ['10.0.100.88']
+        }
+      }
+    } else {
+      ch.container_addr = [`10.0.100.${20 + challenges.indexOf(ch)}`]
+    }
     return json(res, 200, { container_addr: ch.container_addr })
   }
   if (p === '/openapi/v1/challenges/submit' && req.method === 'POST') {
