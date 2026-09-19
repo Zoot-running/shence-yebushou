@@ -21,7 +21,7 @@ done
 # 清理上次干跑残留(dev home 的 storages)——进度快照也要清: setup 从它恢复 startedAt,
 # 旧快照会让 budget 起点在"过去" → 预算瞬间过期 → freeSlots=0 派不出单(2026-09-15 实锤)。
 sudo rm -rf "$DEV_HOME/storages/xiaochang-fork-inbox" "$DEV_HOME/storages/hufu-campaigns"
-sudo rm -f "$DEV_HOME/storages/xiaochang-run-pending.jsonl" "$DEV_HOME/storages/xiaochang-v2-pending.json"
+sudo rm -f "$DEV_HOME/storages/xiaochang-run-pending.jsonl" "$DEV_HOME/storages/xiaochang-v2-pending.json" "$DEV_HOME/storages/xiaochang-orch-pending.json" "$DEV_HOME/storages/xiaochang-flags.jsonl"
 # 关键: driver 必须在专用 workdir 跑——runner 的 pre-run sweep 会清扫 cwd 的"旧工件",
 # 从仓库目录开跑会把整个仓库扫进 .archive(2026-09-14 实锤, 已修)。
 WORK="/tmp/dryrun-work"; sudo rm -rf "$WORK"; mkdir -p "$WORK"

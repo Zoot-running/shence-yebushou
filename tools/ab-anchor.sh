@@ -28,7 +28,7 @@ run_arm() {
   stop_mock
   start_mock "$ARM"   # 每臂全新 mock 状态——旗已交状态不得跨臂污染(A/B 观测前提)
   sudo rm -rf "$DEV_HOME/storages/xiaochang-fork-inbox" "$DEV_HOME/storages/hufu-campaigns"
-  sudo rm -f "$DEV_HOME/storages/xiaochang-run-pending.jsonl" "$DEV_HOME/storages/xiaochang-v2-pending.json" \
+  sudo rm -f "$DEV_HOME/storages/xiaochang-run-pending.jsonl" "$DEV_HOME/storages/xiaochang-v2-pending.json" "$DEV_HOME/storages/xiaochang-orch-pending.json" "$DEV_HOME/storages/xiaochang-flags.jsonl" \
              "$DEV_HOME/storages/xiaochang-orch-pending.json" "$DEV_HOME/storages/xiaochang-run-audit.jsonl"
   mkdir -p "$OUT"
   sudo cp "$REPO/skills/xiaochang/SKILL.md" /opt/xiaochang-skill.md
