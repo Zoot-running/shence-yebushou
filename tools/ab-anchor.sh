@@ -14,7 +14,7 @@ start_mock() {
   sleep 1
   curl -sf "http://127.0.0.1:$MOCK_PORT/health" >/dev/null || { echo "mock not up"; exit 1; }
 }
-stop_mock() { kill $MOCK_PID 2>/dev/null || true; wait $MOCK_PID 2>/dev/null || true; }
+stop_mock() { [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null || true; wait 2>/dev/null || true; }
 
 for spec in "$REPO/packages/runner" "$REPO/../shence-jisi" "$REPO/../shence-hufu" "$REPO/../shence-dsh-compat"; do
   pkg="$(node -e "console.log(require('$spec/package.json').name)")"
