@@ -47,6 +47,8 @@ export interface ChallengeOrch {
   attempts: number
   /** 连续零进展次数（升级梯刻度）。 */
   zeroProgressStreak: number
+  /** 连续"有进展但未出旗"回队次数（v8.3 阈值 2 → 视同升级全开）。 */
+  progressStreak: number
   lastGrantAt?: number
   /** 时间盒到期墙钟（grantedUntil = lastGrantAt + TIMEBOX_MS）。 */
   grantedUntil?: number
@@ -118,9 +120,13 @@ export function verifierVerdict(text: string): 'confirm' | 'refute' | 'unclear' 
   return 'unclear'
 }
 
-/** 零进展 = settle 无旗 AND 战报新增发现行≤1 AND 新 fork=0 AND 无新工件。 */
+/** v8.3 进展定义(用户定稿): 新 fork 或新工件文件才算进展; 战报文字行数不算。
+ *  零进展 = 无旗 AND 无新 fork AND 无新工件。 */
+export function realProgress(p: SettleProgress): boolean {
+  return p.forkDelta > 0 || p.artifactsDelta > 0
+}
 export function zeroProgress(p: SettleProgress): boolean {
-  return !p.flagCandidate && p.findingsDelta <= 1 && p.forkDelta === 0 && p.artifactsDelta === 0
+  return !p.flagCandidate && !realProgress(p)
 }
 
 /** settle 结论指纹：首段文本压平截断（同结论检测, 如"攻击面缺失"×2）。 */
@@ -143,7 +149,11 @@ export function settleAction(orch: ChallengeOrch, p: SettleProgress): SettleActi
       return 'verify-blocker'
     }
   }
-  if (!zeroProgress(p)) return 'rearm'
+  if (realProgress(p)) {
+    // 有进展: 回队不加路; 但连续 2 次"有进展未出旗" = 进展是死路归档噪音 → 全开升级。
+    if (orch.progressStreak + 1 >= 2) return 'rearm-all-in'
+    return 'rearm'
+  }
   const streak = orch.zeroProgressStreak + 1
   if (streak === 1) return 'rearm-all-in'
   return 'adjudicate'
@@ -165,16 +175,20 @@ export function applySettle(orch: ChallengeOrch, action: SettleAction, detail: s
       // 有旗待提交: 给主 agent 提交宽限(提交需容器在线), 宽限后时间盒照常切。
       orch.state = 'pending-adjudication'
       orch.grantedUntil = now + SUBMIT_GRACE_MS
+      orch.progressStreak = 0
       break
     case 'rearm':
       orch.state = 'queued'
       orch.zeroProgressStreak = 0
+      orch.progressStreak += 1
       orch.r2Due = false
       orch.multiSpawn = 0
       break
     case 'rearm-all-in':
+      // 全开(零进展×1 或 有进展×2): 两类连击清零重计。
       orch.state = 'queued'
       orch.zeroProgressStreak = 1
+      orch.progressStreak = 0
       orch.r2Due = true
       orch.multiSpawn = 3
       break
@@ -208,6 +222,7 @@ export function adjudicate(orch: ChallengeOrch, verdict: AdjudicationVerdict): C
       // 裁决 = 主 agent 明确再投资源: 重新入队, 升级梯清零, attempts 保留。
       orch.state = 'queued'
       orch.zeroProgressStreak = 0
+      orch.progressStreak = 0
       orch.r2Due = false
       orch.blockerCheck = 'none'
       orch.grantedUntil = undefined
@@ -288,6 +303,7 @@ export function newOrch(code: string, now: number): ChallengeOrch {
     state: 'queued',
     attempts: 0,
     zeroProgressStreak: 0,
+    progressStreak: 0,
     neverDispatched: true,
     directives: [],
     r2Due: false,
@@ -300,6 +316,57 @@ export function newOrch(code: string, now: number): ChallengeOrch {
 
 export function makePending(code: string, kind: PendingKind, summary: string, detailPath: string, now: number): PendingAdjudication {
   return { code, kind, summary, detailPath, createdAt: now }
+}
+
+// ── v8.3 旗仓(纯函数层): 单文件 JSONL 追加日志, 同 code+flag 后行覆盖(折叠加和) ──
+
+export type FlagStatus = 'pending' | 'accepted' | 'rejected'
+
+export interface FlagEntry {
+  code: string
+  flag: string
+  /** 上报来源(item id 或 'main-agent')。 */
+  by: string
+  status: FlagStatus
+  /** rejected 时的平台判定原文(可选)。 */
+  verdict?: string
+  at: number
+}
+
+/** 追加一行(调用方负责写文件; O_APPEND 单行原子)。 */
+export function flagLine(e: FlagEntry): string {
+  return JSON.stringify(e)
+}
+
+/** 折叠视图: code → flag → 最终状态条目(同键后行覆盖)。 */
+export function foldFlags(entries: FlagEntry[]): Map<string, Map<string, FlagEntry>> {
+  const byCode = new Map<string, Map<string, FlagEntry>>()
+  for (const e of entries) {
+    let m = byCode.get(e.code)
+    if (m === undefined) { m = new Map(); byCode.set(e.code, m) }
+    m.set(e.flag, e)
+  }
+  return byCode
+}
+
+/** 解析 JSONL(坏行跳过)。 */
+export function parseFlagLines(text: string): FlagEntry[] {
+  const out: FlagEntry[] = []
+  for (const line of text.split('\n')) {
+    if (line.trim() === '') continue
+    try {
+      const e = JSON.parse(line) as FlagEntry
+      if (typeof e.code === 'string' && typeof e.flag === 'string') out.push(e)
+    } catch { /* 坏行跳过 */ }
+  }
+  return out
+}
+
+/** 某题未提交(pending)候选值。 */
+export function pendingFlagsOf(entries: FlagEntry[], code: string): FlagEntry[] {
+  const folded = foldFlags(entries).get(code)
+  if (folded === undefined) return []
+  return [...folded.values()].filter(e => e.status === 'pending')
 }
 
 /** 编排态 + 待决事项 序列化（JSON 文件, 崩溃恢复）。 */

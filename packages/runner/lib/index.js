@@ -564,8 +564,8 @@ function verifierVerdict(text) {
   if (r && !c) return "refute";
   return "unclear";
 }
-function zeroProgress(p) {
-  return !p.flagCandidate && p.findingsDelta <= 1 && p.forkDelta === 0 && p.artifactsDelta === 0;
+function realProgress(p) {
+  return p.forkDelta > 0 || p.artifactsDelta > 0;
 }
 function fingerprintOf(detail) {
   return detail.replace(/\s+/g, " ").trim().slice(0, 80);
@@ -579,7 +579,10 @@ function settleAction(orch, p) {
       return "verify-blocker";
     }
   }
-  if (!zeroProgress(p)) return "rearm";
+  if (realProgress(p)) {
+    if (orch.progressStreak + 1 >= 2) return "rearm-all-in";
+    return "rearm";
+  }
   const streak = orch.zeroProgressStreak + 1;
   if (streak === 1) return "rearm-all-in";
   return "adjudicate";
@@ -596,16 +599,19 @@ function applySettle(orch, action, detail, now) {
     case "pending-flag":
       orch.state = "pending-adjudication";
       orch.grantedUntil = now + SUBMIT_GRACE_MS;
+      orch.progressStreak = 0;
       break;
     case "rearm":
       orch.state = "queued";
       orch.zeroProgressStreak = 0;
+      orch.progressStreak += 1;
       orch.r2Due = false;
       orch.multiSpawn = 0;
       break;
     case "rearm-all-in":
       orch.state = "queued";
       orch.zeroProgressStreak = 1;
+      orch.progressStreak = 0;
       orch.r2Due = true;
       orch.multiSpawn = 3;
       break;
@@ -634,6 +640,7 @@ function adjudicate(orch, verdict) {
     case "rotate":
       orch.state = "queued";
       orch.zeroProgressStreak = 0;
+      orch.progressStreak = 0;
       orch.r2Due = false;
       orch.blockerCheck = "none";
       orch.grantedUntil = void 0;
@@ -694,6 +701,7 @@ function newOrch(code, now) {
     state: "queued",
     attempts: 0,
     zeroProgressStreak: 0,
+    progressStreak: 0,
     neverDispatched: true,
     directives: [],
     r2Due: false,
@@ -705,6 +713,38 @@ function newOrch(code, now) {
 }
 function makePending(code, kind, summary, detailPath, now) {
   return { code, kind, summary, detailPath, createdAt: now };
+}
+function flagLine(e) {
+  return JSON.stringify(e);
+}
+function foldFlags(entries) {
+  const byCode = /* @__PURE__ */ new Map();
+  for (const e of entries) {
+    let m = byCode.get(e.code);
+    if (m === void 0) {
+      m = /* @__PURE__ */ new Map();
+      byCode.set(e.code, m);
+    }
+    m.set(e.flag, e);
+  }
+  return byCode;
+}
+function parseFlagLines(text) {
+  const out = [];
+  for (const line of text.split("\n")) {
+    if (line.trim() === "") continue;
+    try {
+      const e = JSON.parse(line);
+      if (typeof e.code === "string" && typeof e.flag === "string") out.push(e);
+    } catch {
+    }
+  }
+  return out;
+}
+function pendingFlagsOf(entries, code) {
+  const folded = foldFlags(entries).get(code);
+  if (folded === void 0) return [];
+  return [...folded.values()].filter((e) => e.status === "pending");
 }
 function serializeOrchState(orch, pending, scoreTable = {}) {
   return JSON.stringify({
@@ -1031,6 +1071,29 @@ function apply(ctx) {
       if (buckets[section].length > 0) appendKnowledgeFile(code, section, buckets[section]);
     }
   }
+  const flagsPath = () => join2(process.env.DSH_HOME ?? ".", "storages", "xiaochang-flags.jsonl");
+  function readFlagEntries() {
+    try {
+      const p = flagsPath();
+      return existsSync(p) ? parseFlagLines(readFileSync(p, "utf8")) : [];
+    } catch {
+      return [];
+    }
+  }
+  function appendFlagEntry(e) {
+    try {
+      mkdirSync2(dirname(flagsPath()), { recursive: true });
+      appendFileSync(flagsPath(), flagLine(e) + "\n");
+    } catch {
+    }
+  }
+  function recordFlagVerdict(code, flag, status, verdict) {
+    appendFlagEntry({ code, flag, by: "submit", status, verdict, at: Date.now() });
+    const s = state;
+    if (s !== void 0) {
+      s.orchVersion += 1;
+    }
+  }
   const orchFor = (code) => state?.orch.get(code);
   function bumpOrch(s) {
     s.orchVersion += 1;
@@ -1294,20 +1357,9 @@ function apply(ctx) {
     if (o.state !== "granted") return;
     const now = Date.now();
     const sn = o.snapshot;
-    const knownFlags = new Set(s.progress.get(code)?.flags ?? []);
-    const boardHasNewFlag = (() => {
-      try {
-        const p2 = c().boardPath(code);
-        if (!existsSync(p2)) return false;
-        const text = readFileSync(p2, "utf8");
-        const found = [...text.matchAll(/FLAG_CANDIDATE:?\s*([^\s<]+)|flag\{[^}\s]{6,}\}|FLAG\{[^}\s]{6,}\}|mock\{[^}\s]{6,}\}/g)].map((m) => m[1] ?? m[0]);
-        return found.some((f) => !knownFlags.has(f));
-      } catch {
-        return false;
-      }
-    })();
+    const pendingFlags = pendingFlagsOf(readFlagEntries(), code);
     const p = {
-      flagCandidate: /FLAG_CANDIDATE\s*:/.test(detail) || boardHasNewFlag,
+      flagCandidate: pendingFlags.length > 0,
       findingsDelta: sn !== void 0 ? Math.max(0, findingsLines(code) - sn.findingsLines) : 0,
       forkDelta: sn !== void 0 ? Math.max(0, knowledgeOfCode(code).length - sn.forkCount) : 0,
       artifactsDelta: sn !== void 0 ? Math.max(0, artifactCount(code) - sn.artifactCount) : 0,
@@ -1381,7 +1433,7 @@ function apply(ctx) {
       `\u753B\u50CF(\u5FEB\u901F\u8BFB): ${s.profilePath}`,
       `\u4F60\u7684\u4EFB\u52A1: ${directive}`,
       "\u7EAA\u5F8B: \u2460\u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1, \u4E0D\u91CD\u590D\u6B7B\u8DEF, \u4F18\u5148\u7528\u56DE\u6536\u5DE5\u4EF6;",
-      "      \u2461\u627E\u5230 flag \u7ACB\u5373\u8F93\u51FA FLAG_CANDIDATE: <flag>(\u4E3B agent \u8D1F\u8D23\u63D0\u4EA4);",
+      "      \u2461\u627E\u5230 flag \u7ACB\u5373\u8C03 xiaochang_flag_report(code, flag) \u4E0A\u62A5\u5165\u65D7\u4ED3(\u4E3B agent \u8D1F\u8D23\u63D0\u4EA4);",
       "      \u2462\u6B7B\u8DEF/\u65B0\u5206\u53C9\u8C03 xiaochang_fork \u4E0A\u62A5; \u7EC8\u6001\u524D\u628A\u6B7B\u8DEF\u539F\u56E0\u5199\u6E05\u3002"
     ].join("\n");
   }
@@ -1823,6 +1875,7 @@ ${manifest.join("\n")}`;
         if (typeof res.cumulative_score === "number") recordScore(s, args.code, res.cumulative_score);
         if (res.correct) {
           recordWin(args.flag);
+          recordFlagVerdict(args.code, args.flag, "accepted");
           await v8AfterSubmit(true);
           return JSON.stringify(res);
         }
@@ -1833,17 +1886,74 @@ ${manifest.join("\n")}`;
           if (typeof res2.cumulative_score === "number") recordScore(s, args.code, res2.cumulative_score);
           if (res2.correct) {
             recordWin(wrapped);
+            recordFlagVerdict(args.code, wrapped, "accepted");
+            recordFlagVerdict(args.code, args.flag, "rejected", "\u88F8\u4E32\u53E3\u5F84\u4E0D\u5BF9");
             await v8AfterSubmit(true);
             return `\u88F8\u4E32\u88AB\u62D2, \u81EA\u52A8\u56DE\u9000\u5305\u88C5\u63D0\u4EA4\u6210\u529F: ${JSON.stringify(res2)}`;
           }
+          recordFlagVerdict(args.code, args.flag, "rejected", JSON.stringify(res).slice(0, 80));
+          recordFlagVerdict(args.code, wrapped, "rejected", JSON.stringify(res2).slice(0, 80));
           await v8AfterSubmit(false);
           return `\u88F8\u4E32\u88AB\u62D2(${JSON.stringify(res)}); \u5305\u88C5\u56DE\u9000\u4E5F\u88AB\u62D2(${JSON.stringify(res2)})\u2014\u2014\u4EE5\u5E73\u53F0\u5224\u5B9A\u4E3A\u51C6, \u6362\u503C\u6216\u6362\u9898\u9762\u53E3\u5F84`;
         }
+        recordFlagVerdict(args.code, args.flag, "rejected", JSON.stringify(res).slice(0, 80));
         await v8AfterSubmit(false);
         return JSON.stringify(res);
       } catch (error) {
         return `submit error: ${String(error)}`;
       }
+    }
+  }));
+  register(defineTool({
+    name: "xiaochang_flag_report",
+    description: "v8.3 flag depot report (executor): report a captured flag candidate into the per-run flag depot file (single JSONL, tool-only writer, dedup by code+value). A NEW pending value wakes the main agent immediately (its xiaochang_wait polls the depot) \u2014 the main agent submits and the verdict (accepted/rejected) is written back by xiaochang_submit automatically. Do NOT put flag values in your settle text; just call this tool.",
+    parameters: {
+      code: { type: "string", required: true },
+      flag: { type: "string", required: true, description: "Flag value verbatim (platform format)." },
+      evidence: { type: "string", description: "One line: where/how it was captured (for the main agent)." }
+    },
+    output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      const entries = readFlagEntries();
+      const folded = foldFlags(entries).get(args.code);
+      const exist = folded?.get(args.flag);
+      if (exist !== void 0) {
+        return `xiaochang_flag_report: \u8BE5\u503C\u5DF2\u5728\u65D7\u4ED3(\u72B6\u6001=${exist.status}${exist.verdict !== void 0 ? "/" + exist.verdict : ""})\u2014\u2014\u4E0D\u91CD\u590D\u5199\u5165, \u65E0\u9700\u518D\u62A5`;
+      }
+      appendFlagEntry({ code: args.code, flag: args.flag, by: "executor", status: "pending", at: Date.now() });
+      if (state !== void 0) {
+        state.orchVersion += 1;
+      }
+      audit(state?.auditPath ?? join2(process.env.DSH_HOME ?? ".", "storages", "xiaochang-run-audit.jsonl"), { type: "v8-flag-report", code: args.code, evidence: (args.evidence ?? "").slice(0, 120) });
+      return `xiaochang_flag_report: \u5DF2\u5165\u65D7\u4ED3(pending), \u4E3B agent \u5C06\u88AB\u5524\u9192\u63D0\u4EA4${args.evidence !== void 0 ? `; \u8BC1\u636E: ${args.evidence.slice(0, 100)}` : ""}`;
+    }
+  }));
+  register(defineTool({
+    name: "xiaochang_flag_status",
+    description: "v8.3 flag depot view: folded per-challenge flag status (pending / accepted / rejected). Main agent reads this before submitting; executors read it to avoid re-reporting/re-submitting known values.",
+    parameters: {
+      code: { type: "string", description: "One challenge code; omit for the full depot summary." }
+    },
+    output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const folded = foldFlags(readFlagEntries());
+      const lines = [];
+      let pending = 0;
+      let accepted = 0;
+      let rejected = 0;
+      for (const [code, m] of [...folded.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        if (args.code !== void 0 && code !== args.code) continue;
+        for (const [flag, e] of m) {
+          if (e.status === "pending") pending += 1;
+          else if (e.status === "accepted") accepted += 1;
+          else rejected += 1;
+          lines.push(`  ${code} [${e.status}] ${flag.slice(0, 40)}${e.verdict !== void 0 ? " \u2014 " + e.verdict.slice(0, 60) : ""}${e.by !== "" ? " (by " + e.by + ")" : ""}`);
+        }
+      }
+      return `\u65D7\u4ED3: pending=${pending} accepted=${accepted} rejected=${rejected}
+${lines.join("\n") || "  (\u7A7A)"}`;
     }
   }));
   register(defineTool({
@@ -2475,6 +2585,30 @@ ${escLines.join("\n")}` : "";
         qLine,
         `budgetRemainingMin=${Math.round(remaining / 6e4)}`,
         `runScore(\u8BA1\u5206\u8868)=${runScoreOf(s)}${s.hintLedger.totalHints() > 0 ? `(hint \u5DF2\u6263\u7EA6 ${s.hintLedger.totalDeducted()} \u5206, \u5DF2\u542B)` : ""}`,
+        `${(() => {
+          const folded = foldFlags(readFlagEntries());
+          let pend = 0;
+          let acc = 0;
+          let rej = 0;
+          for (const m of folded.values()) for (const e of m.values()) {
+            if (e.status === "pending") pend += 1;
+            else if (e.status === "accepted") acc += 1;
+            else rej += 1;
+          }
+          return "\u65D7\u4ED3: pending=" + pend + " accepted=" + acc + " rejected=" + rej;
+        })()}`,
+        `${(() => {
+          const clusters = /* @__PURE__ */ new Map();
+          for (const ch of s.challenges.values()) {
+            const key = [...ch.container_addr].sort().join("|");
+            if (key === "") continue;
+            const list = clusters.get(key) ?? [];
+            list.push(ch.unique_code);
+            clusters.set(key, list);
+          }
+          const multi = [...clusters.values()].filter((l) => l.length > 1);
+          return multi.length > 0 ? "\u540C\u9776\u573A\u7C07: " + multi.map((l) => l.sort().join("\u2194")).join(" | ") : "\u540C\u9776\u573A\u7C07: \u65E0";
+        })()}`,
         `openContainers(\u5E73\u53F0\u89C6\u89D2, \u5F02\u6B65\u66F4\u65B0\u4F1A\u6EDE\u540E; \u69FD\u771F\u76F8\u4EE5 containerQueue \u884C\u4E3A\u51C6)=${[...openContainers(s)].join(",") || "none"}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
         `\u5F85\u88C1\u51B3(${s.pendingAdj.length}):
@@ -2532,6 +2666,24 @@ ${pendingTxt}`,
             done("xiaochang_wait: \u7F16\u6392\u6001\u53D8\u5316(settle \u7ED3\u7B97/\u56DE\u961F/\u88C1\u51B3/\u65F6\u95F4\u76D2)\u2014\u2014\u8BFB xiaochang_status");
           }
         }, 2e3);
+        const flagSnap = () => {
+          try {
+            const pth = flagsPath();
+            if (!existsSync(pth)) return "";
+            const st = statSync2(pth);
+            return `${st.mtimeMs}:${st.size}`;
+          } catch {
+            return "";
+          }
+        };
+        let flagsBefore = flagSnap();
+        const fgv = setInterval(() => {
+          const nowSnap = flagSnap();
+          if (nowSnap !== flagsBefore) {
+            flagsBefore = nowSnap;
+            done("xiaochang_wait: \u65D7\u4ED3\u65B0\u4E0A\u62A5\u2014\u2014\u8BFB xiaochang_flag_status \u5E76\u7ACB\u5373 xiaochang_submit");
+          }
+        }, 2e3);
         const seqBefore = agent?.session.seq ?? 0;
         const sv = setInterval(() => {
           if (agent !== void 0 && agent.session.seq > seqBefore) done("xiaochang_wait: session message arrived");
@@ -2582,6 +2734,7 @@ ${pendingTxt}`,
           unsub();
           clearInterval(iv);
           clearInterval(oiv);
+          clearInterval(fgv);
           clearInterval(sv);
           clearInterval(fv);
           clearTimeout(to);

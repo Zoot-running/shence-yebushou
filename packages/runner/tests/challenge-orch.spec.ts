@@ -49,9 +49,17 @@ describe('settleAction 升级梯', () => {
     expect(o.zeroProgressStreak).toBe(0)
   })
 
-  it('有进展(战报发现) → rearm', () => {
+  it('战报行数不算进展(v8.3): 只写战报 → 零进展 → rearm-all-in', () => {
     const o = newOrch('a-02', T0)
-    expect(settleAction(o, prog({ findingsDelta: 5 }))).toBe('rearm')
+    expect(settleAction(o, prog({ findingsDelta: 5 }))).toBe('rearm-all-in')
+  })
+
+  it('有进展×2(新fork连击) → rearm-all-in 升级', () => {
+    const o = newOrch('a-02b', T0)
+    o.progressStreak = 1
+    expect(settleAction(o, prog({ forkDelta: 1 }))).toBe('rearm-all-in')
+    applySettle(o, 'rearm-all-in', '有进展但未出旗×2', T0 + 1000)
+    expect(o.progressStreak).toBe(0)
   })
 
   it('有进展(新工件) → rearm', () => {
@@ -291,8 +299,8 @@ describe('zeroProgress 判定', () => {
     expect(zeroProgress(prog())).toBe(true)
     expect(zeroProgress(prog({ findingsDelta: 1 }))).toBe(true)
   })
-  it('有发现/有fork/有工件/有旗 → 非零进展', () => {
-    expect(zeroProgress(prog({ findingsDelta: 2 }))).toBe(false)
+  it('有fork/有工件/有旗 → 非零进展; 战报行数不算', () => {
+    expect(zeroProgress(prog({ findingsDelta: 2 }))).toBe(true)
     expect(zeroProgress(prog({ forkDelta: 1 }))).toBe(false)
     expect(zeroProgress(prog({ artifactsDelta: 1 }))).toBe(false)
     expect(zeroProgress(prog({ flagCandidate: true }))).toBe(false)

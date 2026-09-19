@@ -43,10 +43,14 @@ import {
   adjudicate,
   blockerConcluded,
   compareRisk,
+  flagLine,
+  foldFlags,
   grant,
   makePending,
   newOrch,
+  parseFlagLines,
   parseOrchState,
+  pendingFlagsOf,
   priorityOf,
   rearmByTimebox,
   serializeOrchState,
@@ -54,6 +58,8 @@ import {
   timeboxExpired,
   verifierVerdict,
   type ChallengeOrch,
+  type FlagEntry,
+  type FlagStatus,
   type PendingAdjudication,
   type ProgressSnapshot,
   type SettleProgress,
@@ -558,6 +564,26 @@ export function apply(ctx: Context): void {
     }
   }
 
+  // ── v8.3 旗仓(单文件追加日志; 写者=工具; 执行者侧无战役态也可写) ──
+  const flagsPath = (): string => join(process.env.DSH_HOME ?? '.', 'storages', 'xiaochang-flags.jsonl')
+  function readFlagEntries(): FlagEntry[] {
+    try {
+      const p = flagsPath()
+      return existsSync(p) ? parseFlagLines(readFileSync(p, 'utf8')) : []
+    } catch { return [] }
+  }
+  function appendFlagEntry(e: FlagEntry): void {
+    try {
+      mkdirSync(dirname(flagsPath()), { recursive: true })
+      appendFileSync(flagsPath(), flagLine(e) + '\n')
+    } catch { /* 旗仓写失败不阻断 */ }
+  }
+  /** submit 回执 → 旗仓状态行(accepted/rejected; "改"操作由 submit 内部代劳)。 */
+  function recordFlagVerdict(code: string, flag: string, status: FlagStatus, verdict?: string): void {
+    appendFlagEntry({ code, flag, by: 'submit', status, verdict, at: Date.now() })
+    const s = state
+    if (s !== undefined) { s.orchVersion += 1 }
+  }
   // ── v8 题队列编排内核接线 ──────────────────────────────────────
   const orchFor = (code: string): ChallengeOrch | undefined => state?.orch.get(code)
   function bumpOrch(s: CampaignState): void { s.orchVersion += 1 }
@@ -806,21 +832,10 @@ export function apply(ctx: Context): void {
     if (o.state !== 'granted') return
     const now = Date.now()
     const sn = o.snapshot
-    // 旗候选双通道: 终态文本 FLAG_CANDIDATE + 战报里出现"未提交过的旗值"
-    // (执行者把旗写进战报但终态没提 → 也要走待提交, 容器保留; 提交需容器在线)。
-    const knownFlags = new Set(s.progress.get(code)?.flags ?? [])
-    const boardHasNewFlag = ((): boolean => {
-      try {
-        const p = c().boardPath(code)
-        if (!existsSync(p)) return false
-        const text = readFileSync(p, 'utf8')
-        const found = [...text.matchAll(/FLAG_CANDIDATE:?\s*([^\s<]+)|flag\{[^}\s]{6,}\}|FLAG\{[^}\s]{6,}\}|mock\{[^}\s]{6,}\}/g)]
-          .map(m => m[1] ?? m[0])
-        return found.some(f => !knownFlags.has(f))
-      } catch { return false }
-    })()
+    // v8.3: 旗只看结构化旗仓(执行者 xiaochang_flag_report 写入), 不再从 settle 文本/战报猜。
+    const pendingFlags = pendingFlagsOf(readFlagEntries(), code)
     const p: SettleProgress = {
-      flagCandidate: /FLAG_CANDIDATE\s*:/.test(detail) || boardHasNewFlag,
+      flagCandidate: pendingFlags.length > 0,
       findingsDelta: sn !== undefined ? Math.max(0, findingsLines(code) - sn.findingsLines) : 0,
       forkDelta: sn !== undefined ? Math.max(0, knowledgeOfCode(code).length - sn.forkCount) : 0,
       artifactsDelta: sn !== undefined ? Math.max(0, artifactCount(code) - sn.artifactCount) : 0,
@@ -900,7 +915,7 @@ export function apply(ctx: Context): void {
       `画像(快速读): ${s.profilePath}`,
       `你的任务: ${directive}`,
       '纪律: ①先读知识账本, 从已知边界出发, 不重复死路, 优先用回收工件;',
-      '      ②找到 flag 立即输出 FLAG_CANDIDATE: <flag>(主 agent 负责提交);',
+      '      ②找到 flag 立即调 xiaochang_flag_report(code, flag) 上报入旗仓(主 agent 负责提交);',
       '      ③死路/新分叉调 xiaochang_fork 上报; 终态前把死路原因写清。',
     ].join('\n')
   }
@@ -1351,6 +1366,7 @@ export function apply(ctx: Context): void {
         if (typeof res.cumulative_score === 'number') recordScore(s, args.code, res.cumulative_score)
         if (res.correct) {
           recordWin(args.flag)
+          recordFlagVerdict(args.code, args.flag, 'accepted')
           await v8AfterSubmit(true)
           return JSON.stringify(res)
         }
@@ -1362,17 +1378,76 @@ export function apply(ctx: Context): void {
           if (typeof res2.cumulative_score === 'number') recordScore(s, args.code, res2.cumulative_score)
           if (res2.correct) {
             recordWin(wrapped)
+            recordFlagVerdict(args.code, wrapped, 'accepted')
+            recordFlagVerdict(args.code, args.flag, 'rejected', '裸串口径不对')
             await v8AfterSubmit(true)
             return `裸串被拒, 自动回退包装提交成功: ${JSON.stringify(res2)}`
           }
+          recordFlagVerdict(args.code, args.flag, 'rejected', JSON.stringify(res).slice(0, 80))
+          recordFlagVerdict(args.code, wrapped, 'rejected', JSON.stringify(res2).slice(0, 80))
           await v8AfterSubmit(false)
           return `裸串被拒(${JSON.stringify(res)}); 包装回退也被拒(${JSON.stringify(res2)})——以平台判定为准, 换值或换题面口径`
         }
+        recordFlagVerdict(args.code, args.flag, 'rejected', JSON.stringify(res).slice(0, 80))
         await v8AfterSubmit(false)
         return JSON.stringify(res)
       } catch (error) {
         return `submit error: ${String(error)}`
       }
+    },
+  }))
+
+  // ── v8.3 旗仓工具 ──────────────────────────────────────────────
+  register(defineTool({
+    name: 'xiaochang_flag_report',
+    description:
+      'v8.3 flag depot report (executor): report a captured flag candidate into the per-run flag depot file (single JSONL, tool-only writer, dedup by code+value). A NEW pending value wakes the main agent immediately (its xiaochang_wait polls the depot) — the main agent submits and the verdict (accepted/rejected) is written back by xiaochang_submit automatically. Do NOT put flag values in your settle text; just call this tool.',
+    parameters: {
+      code: { type: 'string', required: true },
+      flag: { type: 'string', required: true, description: 'Flag value verbatim (platform format).' },
+      evidence: { type: 'string', description: 'One line: where/how it was captured (for the main agent).' },
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args: { code: string; flag: string; evidence?: string }) {
+      const entries = readFlagEntries()
+      const folded = foldFlags(entries).get(args.code)
+      const exist = folded?.get(args.flag)
+      if (exist !== undefined) {
+        return `xiaochang_flag_report: 该值已在旗仓(状态=${exist.status}${exist.verdict !== undefined ? '/' + exist.verdict : ''})——不重复写入, 无需再报`
+      }
+      appendFlagEntry({ code: args.code, flag: args.flag, by: 'executor', status: 'pending', at: Date.now() })
+      if (state !== undefined) { state.orchVersion += 1 }
+      audit(state?.auditPath ?? join(process.env.DSH_HOME ?? '.', 'storages', 'xiaochang-run-audit.jsonl'), { type: 'v8-flag-report', code: args.code, evidence: (args.evidence ?? '').slice(0, 120) })
+      return `xiaochang_flag_report: 已入旗仓(pending), 主 agent 将被唤醒提交${args.evidence !== undefined ? `; 证据: ${args.evidence.slice(0, 100)}` : ''}`
+    },
+  }))
+
+  register(defineTool({
+    name: 'xiaochang_flag_status',
+    description:
+      'v8.3 flag depot view: folded per-challenge flag status (pending / accepted / rejected). Main agent reads this before submitting; executors read it to avoid re-reporting/re-submitting known values.',
+    parameters: {
+      code: { type: 'string', description: 'One challenge code; omit for the full depot summary.' },
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => true,
+    async execute(args: { code?: string }) {
+      const folded = foldFlags(readFlagEntries())
+      const lines: string[] = []
+      let pending = 0
+      let accepted = 0
+      let rejected = 0
+      for (const [code, m] of [...folded.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        if (args.code !== undefined && code !== args.code) continue
+        for (const [flag, e] of m) {
+          if (e.status === 'pending') pending += 1
+          else if (e.status === 'accepted') accepted += 1
+          else rejected += 1
+          lines.push(`  ${code} [${e.status}] ${flag.slice(0, 40)}${e.verdict !== undefined ? ' — ' + e.verdict.slice(0, 60) : ''}${e.by !== '' ? ' (by ' + e.by + ')' : ''}`)
+        }
+      }
+      return `旗仓: pending=${pending} accepted=${accepted} rejected=${rejected}\n${lines.join('\n') || '  (空)'}`
     },
   }))
 
@@ -1997,6 +2072,28 @@ ${gaps}
         qLine,
         `budgetRemainingMin=${Math.round(remaining / 60000)}`,
         `runScore(计分表)=${runScoreOf(s)}${s.hintLedger.totalHints() > 0 ? `(hint 已扣约 ${s.hintLedger.totalDeducted()} 分, 已含)` : ''}`,
+        `${(() => {
+          const folded = foldFlags(readFlagEntries())
+          let pend = 0; let acc = 0; let rej = 0
+          for (const m of folded.values()) for (const e of m.values()) {
+            if (e.status === 'pending') pend += 1
+            else if (e.status === 'accepted') acc += 1
+            else rej += 1
+          }
+          return '旗仓: pending=' + pend + ' accepted=' + acc + ' rejected=' + rej
+        })()}`,
+        `${(() => {
+          const clusters = new Map<string, string[]>()
+          for (const ch of s.challenges.values()) {
+            const key = [...ch.container_addr].sort().join('|')
+            if (key === '') continue
+            const list = clusters.get(key) ?? []
+            list.push(ch.unique_code)
+            clusters.set(key, list)
+          }
+          const multi = [...clusters.values()].filter(l => l.length > 1)
+          return multi.length > 0 ? '同靶场簇: ' + multi.map(l => l.sort().join('↔')).join(' | ') : '同靶场簇: 无'
+        })()}`,
         `openContainers(平台视角, 异步更新会滞后; 槽真相以 containerQueue 行为准)=${[...openContainers(s)].join(',') || 'none'}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
         `待裁决(${s.pendingAdj.length}):\n${pendingTxt}`,
@@ -2053,6 +2150,23 @@ ${gaps}
             done('xiaochang_wait: 编排态变化(settle 结算/回队/裁决/时间盒)——读 xiaochang_status')
           }
         }, 2000)
+        // ⑦ v8.3 旗仓: 执行者 flag_report 跨进程写盘 → 唤醒主 agent 提交
+        const flagSnap = (): string => {
+          try {
+            const pth = flagsPath()
+            if (!existsSync(pth)) return ''
+            const st = statSync(pth)
+            return `${st.mtimeMs}:${st.size}`
+          } catch { return '' }
+        }
+        let flagsBefore = flagSnap()
+        const fgv = setInterval(() => {
+          const nowSnap = flagSnap()
+          if (nowSnap !== flagsBefore) {
+            flagsBefore = nowSnap
+            done('xiaochang_wait: 旗仓新上报——读 xiaochang_flag_status 并立即 xiaochang_submit')
+          }
+        }, 2000)
         // ③ 会话新消息（continuable settle 通知等）
         const seqBefore = agent?.session.seq ?? 0
         const sv = setInterval(() => { if (agent !== undefined && agent.session.seq > seqBefore) done('xiaochang_wait: session message arrived') }, 2000)
@@ -2097,7 +2211,7 @@ ${gaps}
         }, 2000)
         // ④ 超时
         const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1000)}s, no event`), timeoutMs)
-        cleanup = () => { unsub(); clearInterval(iv); clearInterval(oiv); clearInterval(sv); clearInterval(fv); clearTimeout(to) }
+        cleanup = () => { unsub(); clearInterval(iv); clearInterval(oiv); clearInterval(fgv); clearInterval(sv); clearInterval(fv); clearTimeout(to) }
         // v7.1 wait 入口评估: 两次 wait 之间写入的 fork 不落盲区——终态题归档(不唤醒), 活跃题立即唤醒。
         if (state !== undefined && evaluateInbox(codeFilter)) {
           inboxBefore = inboxSnap()

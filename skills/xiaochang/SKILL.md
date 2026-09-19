@@ -90,13 +90,14 @@ goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goa
    - **亲挖只剩一个例外（临门一脚）**：执行者已产出 `FLAG_CANDIDATE`、只差最后确认/交卷口径时，允许你动手，且**不超过 3 个工具调用**；解题脚本、攻击链、爆破、验证一律是执行者的活。
    - **v7 极简执行令**：`prompt` 参数只写**一行指令**（指派的那条思路：打哪/为什么/验证点）。**不要抄题面/入口/战报纪律**——机制自动包一层执行令框架（题面+实时入口+战报路径+知识账本路径+画像路径+`FLAG_CANDIDATE` 纪律），漏抄面归零、省 token。
    - **每题知识账本（v7，持久记忆文件）**：`boards/<runId>/<code>/KNOWLEDGE.md` 四节——①题源思路骨架（**你维护**，`xiaochang_knowledge_put` 改写：每条思路写"出处(题面/hint/图谱/分叉)+骨架步骤"）②不可行教训 ③回收工件 ④未走分叉（②③④机制自动累积：`xiaochang_report` 的 deadEnds/gaps/observations/forks 与 `xiaochang_fork` 都自动入文件）。**执行者开工第一件事就是读它**——重试从已知边界出发，零重复识别；你重派时 prompt 只需写"按账本①第 N 条思路继续/换方向"。
-   - **终态结构化报告（F33，执行 prompt 必写这条）**：收工消息（settle）里除了 flag/结论，还要按题输出结构化经验：
+   - **旗仓（v8.3）**：找到 flag **立即调 `xiaochang_flag_report(code, flag, evidence?)`** 上报入旗仓——工具去重、追加 pending、唤醒主 agent 提交；主 agent 用 `xiaochang_flag_status` 查仓、`xiaochang_submit` 提交后工具自动把 accepted/rejected 写回仓。**settle 文本里不要再写 FLAG_CANDIDATE/旗值**（旗的生命周期完全走旗仓，settle 只报进展）。
+- **终态结构化报告（F33，执行 prompt 必写这条）**：收工消息（settle）里按题输出结构化经验：
      `DEAD_ENDS: 已证死的路径(为什么不可行)`、`FORKS: 你未走的分叉(为什么值得走/需要什么)`、
      `OBSERVATIONS: 学到的事实`——你用 `xiaochang_report` 落账时把这三样填进
      deadEnds/forks/observations 字段（结构化入库，全图共享）。
    - 执行者 ≠ 思路提供者：用 `jisi_model_report` 看能力账本，**派最合适的模型**；无数据时按价格序挑便宜的。
    - 多条思路 = 多次 enqueue 同题（未试思路在每次授予时被机制消耗）；多旗题按旗拆思路，一旗一条。
-   - 任一思路拿齐 flag → `xiaochang_submit` 交卷 → `xiaochang_report(code, complete)`（自动关容器+剪枝同题其余兵）。
+   - 任一旗入仓 → `xiaochang_submit` 交卷（回执自动回写旗仓状态）→ 全旗后 `xiaochang_report(code, complete)`（自动关容器+剪枝同题其余兵）。
    - **分叉即时报（F33 ②b + v7.2 语义位 + v7.4 无中断，执行 prompt 必写这条）**：执行者遇到岔口**立即调 `xiaochang_fork`**（code + forks[{path, conclusion, evidence, status}]）——**status 必填语义**：`untaken`(缺省)=未走分叉（两条路都活、另一条值得走）→ 入账④+信箱，**主 agent 经 xiaochang_wait 轮询唤醒（≤2s），不打断你当前 turn**——你按自己的节奏在读图/收果时处理，**当轮就 enqueue 未走分叉**（新种子、prompt 自带该分叉的 whyViable/needs）；`dead-end`=已证死路（403/服务端不可绕/已验证失败）→ **只进②不可行教训，静默归档：不唤醒、不派兵、不进④**。信箱里已有同 path 的分叉会源端去重，不重复上报。
      - **evidence 必写两样（工件交接纪律，让新兵真正"快进"）**：①needs（新兵需要什么才能走这条
        分叉）；②**容器内可复用工件清单**（凡你在靶场容器里已产出的脚本/文件，写明
