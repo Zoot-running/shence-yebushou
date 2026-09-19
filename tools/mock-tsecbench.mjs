@@ -178,9 +178,11 @@ function route(req, res) {
         ch.correct_flag_count += 1
         if (ch.correct_flag_count >= ch.flag_count) ch.is_completed = true
       }
+      // v8.3: 对齐真实平台语义——cumulative_score = 该题已得累计分(部分旗按比例)。
+      const perFlag = Math.round(ch.total_score / ch.flag_count)
       return json(res, 200, {
-        correct, awarded: correct ? ch.total_score / ch.flag_count : 0,
-        cumulative_score: challenges.filter(c => c.is_completed).reduce((s, c) => s + c.total_score, 0),
+        correct, awarded: correct ? perFlag : 0,
+        cumulative_score: ch.correct_flag_count * perFlag,
         correct_flag_count: ch.correct_flag_count, total_flag_count: ch.flag_count,
         matched_flag_index: correct ? ch.flags.indexOf(flag) : null,
       })

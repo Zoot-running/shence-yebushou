@@ -250,8 +250,6 @@ interface CampaignState {
   executorPolicy: ExecutorPolicy
   /** v7: 容器题并发槽位(平台容器上限)。 */
   containerSlots: number
-  /** v7.4: 平台权威累计分(submit 回执的 cumulative_score)——满分判定以此为准, 不自算。 */
-  platformScore?: number
   /** v7.6: 容器资源队列(虎符原语, 校场注入平台判定)。 */
   containerQueue?: Awaited<ReturnType<NonNullable<HufuHolderLike['resourceQueue']>>>
   /** v7.8: 每 code 单调派单计数器(item id 唯一性归机制——同 round 重派不再吞单)。 */
@@ -276,6 +274,8 @@ interface CampaignState {
   timeboxMs: number
   /** v8: 编排心跳计数(仪表面包屑——托管失联时诊断宿主是否还活着)。 */
   tickCount: number
+  /** v8.3 计分表: code → 该题已得累计分(submit 回执 cumulative_score, 平台单题语义; 求和=run 总分)。 */
+  scoreTable: Record<string, number>
 }
 
 let state: CampaignState | undefined
@@ -562,7 +562,16 @@ export function apply(ctx: Context): void {
   const orchFor = (code: string): ChallengeOrch | undefined => state?.orch.get(code)
   function bumpOrch(s: CampaignState): void { s.orchVersion += 1 }
   function persistOrch(s: CampaignState): void {
-    try { writeFileSync(s.orchPath, serializeOrchState(s.orch, s.pendingAdj)) } catch { /* 落盘失败不致命 */ }
+    try { writeFileSync(s.orchPath, serializeOrchState(s.orch, s.pendingAdj, s.scoreTable)) } catch { /* 落盘失败不致命 */ }
+  }
+  /** v8.3 计分表: 平台每题累计分入表(submit 回执驱动; 求和即 run 总分, 不自算)。 */
+  function recordScore(s: CampaignState, code: string, cumulative: number): void {
+    s.scoreTable[code] = cumulative
+    bumpOrch(s)
+    persistOrch(s)
+  }
+  function runScoreOf(s: CampaignState): number {
+    return Object.values(s.scoreTable).reduce((a, b) => a + b, 0)
   }
   function addPending(s: CampaignState, pa: PendingAdjudication): void {
     s.pendingAdj = s.pendingAdj.filter(x => !(x.code === pa.code && x.kind === pa.kind)).concat(pa)
@@ -984,7 +993,6 @@ export function apply(ctx: Context): void {
           locked: args.modelLock ?? false,
         },
         containerSlots: args.containerSlots ?? 3,
-        platformScore: undefined,
         enqCounters: new Map(),
         modelWhitelist: (typeof args.modelWhitelist === 'string'
           ? args.modelWhitelist.split(',').map(m => m.trim())
@@ -998,6 +1006,7 @@ export function apply(ctx: Context): void {
         orchVersion: 0,
         timeboxMs: (args.timeboxMinutes ?? 30) * 60_000,
         tickCount: 0,
+        scoreTable: {},
       }
       try {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
@@ -1065,6 +1074,7 @@ export function apply(ctx: Context): void {
           const back = parseOrchState(readFileSync(s.orchPath, 'utf8'))
           s.orch = back.orch
           s.pendingAdj = back.pending
+          s.scoreTable = back.scoreTable
         }
         for (const ch of fresh) {
           if (!s.orch.has(ch.unique_code)) s.orch.set(ch.unique_code, newOrch(ch.unique_code, s.startedAt))
@@ -1162,9 +1172,7 @@ export function apply(ctx: Context): void {
         return `${ch.unique_code} [${ch.difficulty}·${cls === 'local' ? '附件' : '容器'}] ${ch.total_score}pts flags=${ch.correct_flag_count}/${ch.flag_count} completed=${ch.is_completed} container=${ch.container_status} addrs=${ch.container_addr.join(',') || '-'} progress=${p?.state ?? 'fresh'} | ${ch.description ?? ''}`
       })
       const locals = fresh.filter(ch => resourceClassOf(ch) === 'local').length
-      const scoreLine = s.platformScore !== undefined
-        ? `platformScore=${s.platformScore}/${score.max}(平台权威, 含 hint 扣分) 本地估算=${score.score}/${score.max}`
-        : `score=${score.score}/${score.max}`
+      const scoreLine = `runScore(计分表·平台每题累计分求和)=${runScoreOf(s)}/${score.max}${s.hintLedger.totalHints() > 0 ? `(hint 已扣约 ${s.hintLedger.totalDeducted()} 分, 已含在每题累计分内)` : ''}`
       const hintTxt = s.hintLedger.totalHints() > 0 ? `; hint 已看 ${s.hintLedger.totalHints()} 次、已扣约 ${s.hintLedger.totalDeducted()} 分` : ''
       return `${scoreLine} (${score.completed}/${fresh.length}; 附件题 ${locals} 个全并行, 容器题 ${fresh.length - locals} 个受 ${s.containerSlots} 槽约束${hintTxt})\n\n${rows.join('\n')}`
     },
@@ -1338,8 +1346,9 @@ export function apply(ctx: Context): void {
           }
         }
         const res = await s.adapter.submit(args.code, args.flag)
-        // v7.4: 平台权威累计分入库——满分判定/展示以此为准(不自算 total_score 累加, hint 扣分天然算清)。
-        if (typeof res.cumulative_score === 'number') s.platformScore = res.cumulative_score
+        // v8.3 计分表: 平台 submit 回执 cumulative_score = 该题已得累计分(单题语义, 含 hint 扣减)。
+        // 每笔回执都入表(无论对错), 求和即 run 总分——平台自己的账, 不自算。
+        if (typeof res.cumulative_score === 'number') recordScore(s, args.code, res.cumulative_score)
         if (res.correct) {
           recordWin(args.flag)
           await v8AfterSubmit(true)
@@ -1350,7 +1359,7 @@ export function apply(ctx: Context): void {
         if (!args.flag.startsWith('flag{') && !args.flag.startsWith('HTB{') && !args.flag.startsWith('mock{') && /flag\{/.test(desc)) {
           const wrapped = `flag{${args.flag}}`
           const res2 = await s.adapter.submit(args.code, wrapped)
-          if (typeof res2.cumulative_score === 'number') s.platformScore = res2.cumulative_score
+          if (typeof res2.cumulative_score === 'number') recordScore(s, args.code, res2.cumulative_score)
           if (res2.correct) {
             recordWin(wrapped)
             await v8AfterSubmit(true)
@@ -1397,7 +1406,7 @@ export function apply(ctx: Context): void {
       const hint = raw.hint
       if (hint === null || hint === undefined || hint === '') return 'xiaochang_hint: no hint available'
       const cost = s.hintLedger.record(args.code, ch?.total_score ?? 100, 'main-agent requested')
-      return `hint (${used + 1}/${s.maxHints} used): ${hint}\n⚠️ 本次看提示已扣该题约 ${cost} 分(该题累计已扣 ${s.hintLedger.get(args.code)?.deducted ?? cost}, 全局累计 ${s.hintLedger.totalDeducted()})——满分账里要扣掉; 权威分以 submit 回执的 cumulative_score / xiaochang_list 的 platformScore 为准。`
+      return `hint (${used + 1}/${s.maxHints} used): ${hint}\n⚠️ 本次看提示已扣该题约 ${cost} 分(该题累计已扣 ${s.hintLedger.get(args.code)?.deducted ?? cost}, 全局累计 ${s.hintLedger.totalDeducted()})——满分账里要扣掉; run 总分以 xiaochang_status 的 runScore(计分表)为准。`
     },
   }))
 
@@ -1987,7 +1996,7 @@ ${gaps}
         `v8心跳: tick=${s.tickCount} armed=${s.armed.size} grantedCodes=${s.grantedCodes.size} spawnQueue=${spawnQueue.length} spawning=${spawning}`,
         qLine,
         `budgetRemainingMin=${Math.round(remaining / 60000)}`,
-        `platformScore=${s.platformScore ?? 'n/a'}${s.platformScore !== undefined ? '(权威, 含 hint 扣分)' : ''}`,
+        `runScore(计分表)=${runScoreOf(s)}${s.hintLedger.totalHints() > 0 ? `(hint 已扣约 ${s.hintLedger.totalDeducted()} 分, 已含)` : ''}`,
         `openContainers(平台视角, 异步更新会滞后; 槽真相以 containerQueue 行为准)=${[...openContainers(s)].join(',') || 'none'}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
         `待裁决(${s.pendingAdj.length}):\n${pendingTxt}`,
@@ -2167,7 +2176,8 @@ ${gaps}
           clock = `⚠️ 平台停表调用失败：${String(error)} —— 排名钟仍在走，请重试 xiaochang_finish`
         }
       }
-      return `xiaochang_finish: score=${s.platformScore ?? score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ', ALL TERMINAL' : ''}${s.platformScore !== undefined ? ', 平台权威分' : ', 本地估算分'})\n排名钟：${clock}${guardMarker}`
+      const rs = runScoreOf(s)
+      return `xiaochang_finish: score=${rs > 0 ? rs : score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ', ALL TERMINAL' : ''}${rs > 0 ? ', 计分表(平台每题累计分求和)' : ', 本地估算分'})\n排名钟：${clock}${guardMarker}`
     },
   }))
 }

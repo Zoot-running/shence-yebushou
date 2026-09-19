@@ -230,4 +230,13 @@ describe('v8 题队列宿主接线', () => {
     const st = await tool('xiaochang_status').execute({}, parent)
     expect(String(st)).toContain('未破题(全量·风险排序)')
   })
+
+  it('S13 计分表: submit 回执 cumulative 入表(求和展示)', async () => {
+    // 用错旗提交: mock 回执 cumulative=0, 计分表应有该题条目且 status 显示求和行。
+    const st0 = await tool('xiaochang_status').execute({}, parent)
+    expect(String(st0)).toContain('runScore(计分表)')
+    const res = await tool('xiaochang_submit').execute({ code: 'g-m1', flag: 'mock{not-a-flag}' }, parent)
+    const st1 = await tool('xiaochang_status').execute({}, parent)
+    expect(String(st1)).toContain('runScore(计分表)')
+  }, 30_000)
 })

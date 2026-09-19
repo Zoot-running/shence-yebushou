@@ -706,17 +706,18 @@ function newOrch(code, now) {
 function makePending(code, kind, summary, detailPath, now) {
   return { code, kind, summary, detailPath, createdAt: now };
 }
-function serializeOrchState(orch, pending) {
+function serializeOrchState(orch, pending, scoreTable = {}) {
   return JSON.stringify({
     orch: Object.fromEntries([...orch.entries()].map(([code, o]) => [code, o])),
-    pending
+    pending,
+    scoreTable
   });
 }
 function parseOrchState(json) {
   const d = JSON.parse(json);
   const m = /* @__PURE__ */ new Map();
   for (const [code, o] of Object.entries(d.orch ?? {})) m.set(code, o);
-  return { orch: m, pending: d.pending ?? [] };
+  return { orch: m, pending: d.pending ?? [], scoreTable: d.scoreTable ?? {} };
 }
 
 // src/index.ts
@@ -1036,9 +1037,17 @@ function apply(ctx) {
   }
   function persistOrch(s) {
     try {
-      writeFileSync(s.orchPath, serializeOrchState(s.orch, s.pendingAdj));
+      writeFileSync(s.orchPath, serializeOrchState(s.orch, s.pendingAdj, s.scoreTable));
     } catch {
     }
+  }
+  function recordScore(s, code, cumulative) {
+    s.scoreTable[code] = cumulative;
+    bumpOrch(s);
+    persistOrch(s);
+  }
+  function runScoreOf(s) {
+    return Object.values(s.scoreTable).reduce((a, b) => a + b, 0);
   }
   function addPending(s, pa) {
     s.pendingAdj = s.pendingAdj.filter((x) => !(x.code === pa.code && x.kind === pa.kind)).concat(pa);
@@ -1461,7 +1470,6 @@ function apply(ctx) {
           locked: args.modelLock ?? false
         },
         containerSlots: args.containerSlots ?? 3,
-        platformScore: void 0,
         enqCounters: /* @__PURE__ */ new Map(),
         modelWhitelist: (typeof args.modelWhitelist === "string" ? args.modelWhitelist.split(",").map((m) => m.trim()) : args.modelWhitelist ?? []).filter((m) => m !== ""),
         orch: /* @__PURE__ */ new Map(),
@@ -1472,7 +1480,8 @@ function apply(ctx) {
         settleProcessed: /* @__PURE__ */ new Set(),
         orchVersion: 0,
         timeboxMs: (args.timeboxMinutes ?? 30) * 6e4,
-        tickCount: 0
+        tickCount: 0,
+        scoreTable: {}
       };
       try {
         if (existsSync(s.profilePath)) s.profile = parse(readFileSync(s.profilePath, "utf8"));
@@ -1532,6 +1541,7 @@ function apply(ctx) {
           const back = parseOrchState(readFileSync(s.orchPath, "utf8"));
           s.orch = back.orch;
           s.pendingAdj = back.pending;
+          s.scoreTable = back.scoreTable;
         }
         for (const ch of fresh) {
           if (!s.orch.has(ch.unique_code)) s.orch.set(ch.unique_code, newOrch(ch.unique_code, s.startedAt));
@@ -1633,7 +1643,7 @@ function apply(ctx) {
         return `${ch.unique_code} [${ch.difficulty}\xB7${cls === "local" ? "\u9644\u4EF6" : "\u5BB9\u5668"}] ${ch.total_score}pts flags=${ch.correct_flag_count}/${ch.flag_count} completed=${ch.is_completed} container=${ch.container_status} addrs=${ch.container_addr.join(",") || "-"} progress=${p?.state ?? "fresh"} | ${ch.description ?? ""}`;
       });
       const locals = fresh.filter((ch) => resourceClassOf(ch) === "local").length;
-      const scoreLine = s.platformScore !== void 0 ? `platformScore=${s.platformScore}/${score.max}(\u5E73\u53F0\u6743\u5A01, \u542B hint \u6263\u5206) \u672C\u5730\u4F30\u7B97=${score.score}/${score.max}` : `score=${score.score}/${score.max}`;
+      const scoreLine = `runScore(\u8BA1\u5206\u8868\xB7\u5E73\u53F0\u6BCF\u9898\u7D2F\u8BA1\u5206\u6C42\u548C)=${runScoreOf(s)}/${score.max}${s.hintLedger.totalHints() > 0 ? `(hint \u5DF2\u6263\u7EA6 ${s.hintLedger.totalDeducted()} \u5206, \u5DF2\u542B\u5728\u6BCF\u9898\u7D2F\u8BA1\u5206\u5185)` : ""}`;
       const hintTxt = s.hintLedger.totalHints() > 0 ? `; hint \u5DF2\u770B ${s.hintLedger.totalHints()} \u6B21\u3001\u5DF2\u6263\u7EA6 ${s.hintLedger.totalDeducted()} \u5206` : "";
       return `${scoreLine} (${score.completed}/${fresh.length}; \u9644\u4EF6\u9898 ${locals} \u4E2A\u5168\u5E76\u884C, \u5BB9\u5668\u9898 ${fresh.length - locals} \u4E2A\u53D7 ${s.containerSlots} \u69FD\u7EA6\u675F${hintTxt})
 
@@ -1810,7 +1820,7 @@ ${manifest.join("\n")}`;
           }
         };
         const res = await s.adapter.submit(args.code, args.flag);
-        if (typeof res.cumulative_score === "number") s.platformScore = res.cumulative_score;
+        if (typeof res.cumulative_score === "number") recordScore(s, args.code, res.cumulative_score);
         if (res.correct) {
           recordWin(args.flag);
           await v8AfterSubmit(true);
@@ -1820,7 +1830,7 @@ ${manifest.join("\n")}`;
         if (!args.flag.startsWith("flag{") && !args.flag.startsWith("HTB{") && !args.flag.startsWith("mock{") && /flag\{/.test(desc)) {
           const wrapped = `flag{${args.flag}}`;
           const res2 = await s.adapter.submit(args.code, wrapped);
-          if (typeof res2.cumulative_score === "number") s.platformScore = res2.cumulative_score;
+          if (typeof res2.cumulative_score === "number") recordScore(s, args.code, res2.cumulative_score);
           if (res2.correct) {
             recordWin(wrapped);
             await v8AfterSubmit(true);
@@ -1862,7 +1872,7 @@ ${manifest.join("\n")}`;
       if (hint === null || hint === void 0 || hint === "") return "xiaochang_hint: no hint available";
       const cost = s.hintLedger.record(args.code, ch?.total_score ?? 100, "main-agent requested");
       return `hint (${used + 1}/${s.maxHints} used): ${hint}
-\u26A0\uFE0F \u672C\u6B21\u770B\u63D0\u793A\u5DF2\u6263\u8BE5\u9898\u7EA6 ${cost} \u5206(\u8BE5\u9898\u7D2F\u8BA1\u5DF2\u6263 ${s.hintLedger.get(args.code)?.deducted ?? cost}, \u5168\u5C40\u7D2F\u8BA1 ${s.hintLedger.totalDeducted()})\u2014\u2014\u6EE1\u5206\u8D26\u91CC\u8981\u6263\u6389; \u6743\u5A01\u5206\u4EE5 submit \u56DE\u6267\u7684 cumulative_score / xiaochang_list \u7684 platformScore \u4E3A\u51C6\u3002`;
+\u26A0\uFE0F \u672C\u6B21\u770B\u63D0\u793A\u5DF2\u6263\u8BE5\u9898\u7EA6 ${cost} \u5206(\u8BE5\u9898\u7D2F\u8BA1\u5DF2\u6263 ${s.hintLedger.get(args.code)?.deducted ?? cost}, \u5168\u5C40\u7D2F\u8BA1 ${s.hintLedger.totalDeducted()})\u2014\u2014\u6EE1\u5206\u8D26\u91CC\u8981\u6263\u6389; run \u603B\u5206\u4EE5 xiaochang_status \u7684 runScore(\u8BA1\u5206\u8868)\u4E3A\u51C6\u3002`;
     }
   }));
   register(defineTool({
@@ -2464,7 +2474,7 @@ ${escLines.join("\n")}` : "";
         `v8\u5FC3\u8DF3: tick=${s.tickCount} armed=${s.armed.size} grantedCodes=${s.grantedCodes.size} spawnQueue=${spawnQueue.length} spawning=${spawning}`,
         qLine,
         `budgetRemainingMin=${Math.round(remaining / 6e4)}`,
-        `platformScore=${s.platformScore ?? "n/a"}${s.platformScore !== void 0 ? "(\u6743\u5A01, \u542B hint \u6263\u5206)" : ""}`,
+        `runScore(\u8BA1\u5206\u8868)=${runScoreOf(s)}${s.hintLedger.totalHints() > 0 ? `(hint \u5DF2\u6263\u7EA6 ${s.hintLedger.totalDeducted()} \u5206, \u5DF2\u542B)` : ""}`,
         `openContainers(\u5E73\u53F0\u89C6\u89D2, \u5F02\u6B65\u66F4\u65B0\u4F1A\u6EDE\u540E; \u69FD\u771F\u76F8\u4EE5 containerQueue \u884C\u4E3A\u51C6)=${[...openContainers(s)].join(",") || "none"}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
         `\u5F85\u88C1\u51B3(${s.pendingAdj.length}):
@@ -2653,7 +2663,8 @@ ${pendingTxt}`,
           clock = `\u26A0\uFE0F \u5E73\u53F0\u505C\u8868\u8C03\u7528\u5931\u8D25\uFF1A${String(error)} \u2014\u2014 \u6392\u540D\u949F\u4ECD\u5728\u8D70\uFF0C\u8BF7\u91CD\u8BD5 xiaochang_finish`;
         }
       }
-      return `xiaochang_finish: score=${s.platformScore ?? score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ", ALL TERMINAL" : ""}${s.platformScore !== void 0 ? ", \u5E73\u53F0\u6743\u5A01\u5206" : ", \u672C\u5730\u4F30\u7B97\u5206"})
+      const rs = runScoreOf(s);
+      return `xiaochang_finish: score=${rs > 0 ? rs : score.score}/${score.max} (${score.completed}/${final.length} completed${score.completed === final.length ? ", ALL TERMINAL" : ""}${rs > 0 ? ", \u8BA1\u5206\u8868(\u5E73\u53F0\u6BCF\u9898\u7D2F\u8BA1\u5206\u6C42\u548C)" : ", \u672C\u5730\u4F30\u7B97\u5206"})
 \u6392\u540D\u949F\uFF1A${clock}${guardMarker}`;
     }
   }));

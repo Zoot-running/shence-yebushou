@@ -303,16 +303,20 @@ export function makePending(code: string, kind: PendingKind, summary: string, de
 }
 
 /** 编排态 + 待决事项 序列化（JSON 文件, 崩溃恢复）。 */
-export function serializeOrchState(orch: ReadonlyMap<string, ChallengeOrch>, pending: readonly PendingAdjudication[]): string {
+/** v8.3 计分表: code → 该题已得累计分(平台 submit 回执 cumulative_score, 单题语义)。 */
+export type ScoreTable = Record<string, number>
+
+export function serializeOrchState(orch: ReadonlyMap<string, ChallengeOrch>, pending: readonly PendingAdjudication[], scoreTable: ScoreTable = {}): string {
   return JSON.stringify({
     orch: Object.fromEntries([...orch.entries()].map(([code, o]) => [code, o])),
     pending,
+    scoreTable,
   })
 }
 
-export function parseOrchState(json: string): { orch: Map<string, ChallengeOrch>; pending: PendingAdjudication[] } {
-  const d = JSON.parse(json) as { orch?: Record<string, ChallengeOrch>; pending?: PendingAdjudication[] }
+export function parseOrchState(json: string): { orch: Map<string, ChallengeOrch>; pending: PendingAdjudication[]; scoreTable: ScoreTable } {
+  const d = JSON.parse(json) as { orch?: Record<string, ChallengeOrch>; pending?: PendingAdjudication[]; scoreTable?: ScoreTable }
   const m = new Map<string, ChallengeOrch>()
   for (const [code, o] of Object.entries(d.orch ?? {})) m.set(code, o as ChallengeOrch)
-  return { orch: m, pending: d.pending ?? [] }
+  return { orch: m, pending: d.pending ?? [], scoreTable: d.scoreTable ?? {} }
 }

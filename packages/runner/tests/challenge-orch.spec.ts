@@ -273,7 +273,7 @@ describe('指纹与序列化', () => {
     grant(o, { at: T0, findingsLines: 3, forkCount: 1, artifactCount: 0 }, T0)
     o.directives.push({ text: 'PEEK/HIST 泄漏', tried: false })
     const pending = [makePending('c-03', 'blocker-verified', 'c-03 待裁决', '/opt/work/boards/pending/c-03/FINDINGS.md', T0)]
-    const json = serializeOrchState(new Map([['f1-02', o]]), pending)
+    const json = serializeOrchState(new Map([['f1-02', o]]), pending, { 'f1-02': 600, 'a-01': 100 })
     const back = parseOrchState(json)
     const o2 = back.orch.get('f1-02')!
     expect(o2.state).toBe('granted')
@@ -281,6 +281,8 @@ describe('指纹与序列化', () => {
     expect(o2.grantedUntil).toBe(T0 + TIMEBOX_MS)
     expect(o2.directives[0]!.text).toBe('PEEK/HIST 泄漏')
     expect(back.pending[0]!.kind).toBe('blocker-verified')
+    expect(back.scoreTable['f1-02']).toBe(600)
+    expect(back.scoreTable['a-01']).toBe(100)
   })
 })
 
