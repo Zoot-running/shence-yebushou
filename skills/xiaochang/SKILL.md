@@ -165,7 +165,8 @@ goal 轮驱动会替你把上面的循环一轮一轮跑下去——**不建 goa
 ## 七、v8.4 增补（20390 复盘产物：令文管线 / 判死 / 验证兵 / 节奏约束）
 
 - **思路管线（fanout 答案不再被丢弃）**：fanout 报告到达 → `xiaochang_wait` 推"思路已回"唤醒 → 你裁决采纳（`xiaochang_idea_adopt(code, ideas=[{id,text}])`：落盘账本① + 记**未消费**）→ 派兵时 `xiaochang_enqueue(..., ideaIds=[...])` 引用即标记**已消费**（回显/status 只列未消费；落盘≠消费，派兵才是消费）。已进槽的题思路回来时，是否收工重派/追加 directive/写账本全是你的决策，机制只报"未消费 N 条"。
-- **enqueue 回显与参数（v8.4）**：每次 enqueue 返回三样——已挂家族模板名 / 未消费思路菜单(含 id) / 死路封印簇警告。新参数：`family`（模板族覆盖）、`pacing`（限速/封禁类目标节奏约束, 注入令文硬约束, 如 `["ssh ≤2 次/10min(失败即封禁)"]`）、`ideaIds`（派兵即消费）、`persona`（执行者 persona 内联覆盖）。**方向段上限 4000 字符**；超限全文自动落盘 `storages/xiaochang-directives/{code}.jsonl`，执行者 frame 带路径可读全文——信息零丢失。
+- **enqueue 回显与参数（v8.4）**：每次 enqueue 返回三样——已挂家族模板名 / 未消费思路菜单(含 id) / 死路封印簇警告。新参数：`family`（模板族覆盖）、`pacing`（限速/封禁类目标节奏约束, 注入令文硬约束, 如 `["ssh ≤2 次/10min(失败即封禁)"]`）、`ideaIds`（派兵即消费；**全限定 `<code>-<id>` 与短标签 `<id>` 均可匹配**, 未命中会响亮反馈候选清单）、`persona`（执行者 persona 内联覆盖）。**方向段上限 4000 字符**；超限全文自动落盘 `storages/xiaochang-directives/{code}.jsonl`，执行者 frame 带路径可读全文——信息零丢失。
+- **排题与 priority（v8.4.1）**：enqueue 显式 `priority` **直通排序**（跳出"从未开工公平带"，带内按分值密度 hard 优先——20633 实锤: 老公式让 easy 反超 hard、b-02 排末位）；显式 priority 变更时机制会全量重排已武装的容器队列。**开局想 hard 先来就给 hard 题传 priority=分值**。
 - **家族模板帧（公共知识不再靠你默写）**：执行令自动注入按题面判定的家族战术模板（rev-VM/rev-序列号/rev-授权客户端/web-多跳链/web-单机管理台/ai-推理服务/easy-收割七族, 含成本递增打法+判据+陷阱）——enqueue 的 prompt **优先写个性化判断**（打哪/为什么/验证点），CVE/默认凭据类公共知识可不贴。
 - **账本分级（结论带过程）**：死路条目**必附实测变体清单**（report/fork 的 `testedVariants`）——"任何 X 都无法存活"类封印结论必须列清试过哪些变体；同方向死路 ≥3 条 = 封印簇，**机制自动派验证兵翻案回合**（不用你记得派），status/enqueue 回显都会标注。
 - **集思生命周期（v8.4）**：fanout 单轮 45min 时间盒（到点自动中止）、同题同问重试上限 2 次（不做预算门——**末段赶工纪律要求最后 60min 反而要显式 fanout**，机制不压模型）；fanout worker 可向你要 ≤2 个澄清问题（send_message，一次问全，未答复则最优作答）。fanout persona 可经集思工具按任务注入（渗透/逆向专家），不再全员行营 PM。

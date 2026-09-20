@@ -565,9 +565,11 @@ export function apply(ctx: Context): void {
   function markIdeasConsumed(code: string, ids: string[], directiveFingerprint: string): number {
     const all = readIdeas(code)
     let n = 0
-    const idSet = new Set(ids)
+    // v8.4.1: 短标签匹配——adopt 落盘 id = `<code>-<id>`, enqueue 传短标签(<id>)也算命中
+    // (20633 实锤: 短标签静默 no-op = 最危险的一种失败)。
+    const hit = (eid: string): boolean => ids.some(id => eid === id || eid.endsWith('-' + id))
     const next = all.map(e => {
-      if (e.status === 'unconsumed' && idSet.has(e.id)) {
+      if (e.status === 'unconsumed' && hit(e.id)) {
         n += 1
         return { ...e, status: 'consumed' as const, consumedByDirective: directiveFingerprint, consumedAt: Date.now() }
       }
@@ -1747,6 +1749,7 @@ export function apply(ctx: Context): void {
         return `xiaochang_enqueue: 拒绝——${args.code} 已${o.state === 'solved' ? '解出' : '判死'}, 不再入队`
       }
       o.directives.push({ text: trunc.text, model: args.model, effort: args.effort, persona: args.persona, tried: false })
+      const priorityChanged = args.priority !== undefined && o.priorityOverride !== args.priority
       if (args.priority !== undefined) o.priorityOverride = args.priority
       // v8.4: 家族/pacing 元数据(可覆盖, 可累积)。
       if (args.family !== undefined && args.family !== '') o.family = args.family
@@ -1755,7 +1758,10 @@ export function apply(ctx: Context): void {
       let consumedNote = ''
       if ((args.ideaIds?.length ?? 0) > 0) {
         const n = markIdeasConsumed(args.code, args.ideaIds!, trunc.text.slice(0, 60))
-        consumedNote = n > 0 ? `\n已标记 ${n} 条采纳思路为已消费(本 directive 引用)。` : '\n(ideaIds 中无可标记的未消费思路——id 可能已消费或不存在, 无副作用)'
+        const open = unconsumedIdeas(args.code).map(e => '#' + e.id).join(' ')
+        consumedNote = n > 0
+          ? `\n已标记 ${n} 条采纳思路为已消费(本 directive 引用)。当前未消费: ${open || '无'}`
+          : `\n⚠️ ideaIds 未命中任何未消费思路(传了 ${args.ideaIds!.join(',')}): 已消费/不存在/拼写? 当前未消费: ${open || '无'}`
       }
       // v8.3c 簇调度: 入队/续打对簇内全体成员生效(簇=单调度单元)。
       const memberCodes = [args.code, ...o.cluster]
@@ -1769,6 +1775,15 @@ export function apply(ctx: Context): void {
         if (mo.state !== 'solved' && mo.state !== 'dead') mo.state = 'queued'
       }
       o.state = 'queued'
+      // v8.4.1: 显式 priority 变更 → 已武装容器题全量重排(20633 实锤: 武装时 FIFO 固化,
+      // enqueue 的 priority 只写账本不重排——b-02 高优排到末位)。
+      if (priorityChanged && s.containerQueue !== undefined) {
+        for (const c2 of s.armed) {
+          try { s.containerQueue.evict(c2, 're-prioritize') } catch { /* 未在队(已授予)则跳过 */ }
+        }
+        s.armed.clear()
+        armQueue()
+      }
       bumpOrch(s)
       persistOrch(s)
       persistProgress(s)

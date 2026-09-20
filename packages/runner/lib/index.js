@@ -790,11 +790,10 @@ function clusterMapOf(addrs) {
 function priorityOf(orch, totalScore, now) {
   if (orch.state === "solved" || orch.state === "dead" || orch.state === "pending-adjudication") return Number.NEGATIVE_INFINITY;
   const base = totalScore > 0 ? totalScore : 300;
-  if (orch.neverDispatched) {
-    const p = orch.priorityOverride ?? (2e3 - base) * 10;
-    return 1e6 + p + neverDispatchedBoost(orch, now);
-  }
   if (orch.priorityOverride !== void 0) return orch.priorityOverride;
+  if (orch.neverDispatched) {
+    return 1e6 + base * 10 + neverDispatchedBoost(orch, now);
+  }
   return base * (1 + 0.5 * neverDispatchedBoost(orch, now));
 }
 function compareRisk(a, b, scoreA, scoreB) {
@@ -1167,9 +1166,9 @@ function apply(ctx) {
   function markIdeasConsumed(code, ids, directiveFingerprint) {
     const all = readIdeas(code);
     let n = 0;
-    const idSet = new Set(ids);
+    const hit = (eid) => ids.some((id) => eid === id || eid.endsWith("-" + id));
     const next = all.map((e) => {
-      if (e.status === "unconsumed" && idSet.has(e.id)) {
+      if (e.status === "unconsumed" && hit(e.id)) {
         n += 1;
         return { ...e, status: "consumed", consumedByDirective: directiveFingerprint, consumedAt: Date.now() };
       }
@@ -2330,14 +2329,17 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
         return `xiaochang_enqueue: \u62D2\u7EDD\u2014\u2014${args.code} \u5DF2${o.state === "solved" ? "\u89E3\u51FA" : "\u5224\u6B7B"}, \u4E0D\u518D\u5165\u961F`;
       }
       o.directives.push({ text: trunc.text, model: args.model, effort: args.effort, persona: args.persona, tried: false });
+      const priorityChanged = args.priority !== void 0 && o.priorityOverride !== args.priority;
       if (args.priority !== void 0) o.priorityOverride = args.priority;
       if (args.family !== void 0 && args.family !== "") o.family = args.family;
       if ((args.pacing?.length ?? 0) > 0) o.pacing = [...o.pacing ?? [], ...args.pacing];
       let consumedNote = "";
       if ((args.ideaIds?.length ?? 0) > 0) {
         const n = markIdeasConsumed(args.code, args.ideaIds, trunc.text.slice(0, 60));
+        const open = unconsumedIdeas(args.code).map((e) => "#" + e.id).join(" ");
         consumedNote = n > 0 ? `
-\u5DF2\u6807\u8BB0 ${n} \u6761\u91C7\u7EB3\u601D\u8DEF\u4E3A\u5DF2\u6D88\u8D39(\u672C directive \u5F15\u7528)\u3002` : "\n(ideaIds \u4E2D\u65E0\u53EF\u6807\u8BB0\u7684\u672A\u6D88\u8D39\u601D\u8DEF\u2014\u2014id \u53EF\u80FD\u5DF2\u6D88\u8D39\u6216\u4E0D\u5B58\u5728, \u65E0\u526F\u4F5C\u7528)";
+\u5DF2\u6807\u8BB0 ${n} \u6761\u91C7\u7EB3\u601D\u8DEF\u4E3A\u5DF2\u6D88\u8D39(\u672C directive \u5F15\u7528)\u3002\u5F53\u524D\u672A\u6D88\u8D39: ${open || "\u65E0"}` : `
+\u26A0\uFE0F ideaIds \u672A\u547D\u4E2D\u4EFB\u4F55\u672A\u6D88\u8D39\u601D\u8DEF(\u4F20\u4E86 ${args.ideaIds.join(",")}): \u5DF2\u6D88\u8D39/\u4E0D\u5B58\u5728/\u62FC\u5199? \u5F53\u524D\u672A\u6D88\u8D39: ${open || "\u65E0"}`;
       }
       const memberCodes = [args.code, ...o.cluster];
       for (const c2 of memberCodes) {
@@ -2350,6 +2352,16 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
         if (mo.state !== "solved" && mo.state !== "dead") mo.state = "queued";
       }
       o.state = "queued";
+      if (priorityChanged && s.containerQueue !== void 0) {
+        for (const c2 of s.armed) {
+          try {
+            s.containerQueue.evict(c2, "re-prioritize");
+          } catch {
+          }
+        }
+        s.armed.clear();
+        armQueue();
+      }
       bumpOrch(s);
       persistOrch(s);
       persistProgress(s);

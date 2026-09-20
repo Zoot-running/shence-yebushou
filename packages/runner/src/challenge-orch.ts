@@ -300,11 +300,13 @@ export function clusterMapOf(addrs: ReadonlyMap<string, string[]>): Map<string, 
 export function priorityOf(orch: ChallengeOrch, totalScore: number, now: number): number {
   if (orch.state === 'solved' || orch.state === 'dead' || orch.state === 'pending-adjudication') return Number.NEGATIVE_INFINITY
   const base = totalScore > 0 ? totalScore : 300
-  if (orch.neverDispatched) {
-    const p = orch.priorityOverride ?? (2_000 - base) * 10
-    return 1_000_000 + p + neverDispatchedBoost(orch, now)
-  }
+  // v8.4.1: 主 agent 显式 priority 跳出"从未开工公平段"直通排序(20633 实锤:
+  // (2000-base)*10 让 easy 反超 hard, 且 override 冲不出 1_000_000 段——b-02 排到末位)。
   if (orch.priorityOverride !== undefined) return orch.priorityOverride
+  if (orch.neverDispatched) {
+    // 从未开工段内按分值密度排(hard 先来——20633 教训: 低分优先会让 easy 抢占开局槽)。
+    return 1_000_000 + base * 10 + neverDispatchedBoost(orch, now)
+  }
   return base * (1 + 0.5 * neverDispatchedBoost(orch, now))
 }
 

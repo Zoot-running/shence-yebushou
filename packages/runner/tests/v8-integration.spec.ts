@@ -265,8 +265,9 @@ describe('v8.4 令文管线/判死/验证兵', () => {
       ideas: [{ id: 'r2-1', text: '打 JWT alg=none 伪造管理员(描述里是 SQLi 诱饵)' }],
     }, parent)
     expect(String(adopt)).toContain('未消费')
+    // v8.4.1: 短标签也命中(后缀匹配)——20633 实锤短标签静默 no-op 是坑。
     const enq = await tool('xiaochang_enqueue').execute({
-      code, prompt: '按思路打 JWT alg=none', ideaIds: [`${code}-r2-1`],
+      code, prompt: '按思路打 JWT alg=none', ideaIds: ['r2-1'],
     }, parent)
     expect(String(enq)).toContain('已标记 1 条采纳思路为已消费')
     const inbox = readFileSync(join(HOME, 'storages', 'xiaochang-idea-inbox', `${code}.jsonl`), 'utf8')
@@ -297,9 +298,14 @@ describe('v8.4 令文管线/判死/验证兵', () => {
   }, 30_000)
 
   it('判死修复: 时间盒先回队后, 迟到 settle 依然计真实败绩(hint 闸饿死病灶)', async () => {
-    const code = 'xb-071'
-    // 等该题有 dispatched 执行者
-    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched'), 15_000, 'dispatched item')
+    const code = 'xb-088'
+    // xb-088 是独立容器题(非簇)——v8.4.1 重排后 xb-071 可能被 xb-056 簇吸收(无独立执行者)。
+    // 等该题有 dispatched 执行者(必要时补一条 enqueue 促授予)
+    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched'), 60_000, 'dispatched item')
+    if (!itemsFor(code).some(i => i.state === 'dispatched')) {
+      await tool('xiaochang_enqueue').execute({ code, prompt: '继续打响应头路线' }, parent)
+      await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched'), 30_000, 'dispatched item after enqueue')
+    }
     // 等时间盒回队(v8-timebox) — 状态变 queued, 但执行者 item 还挂着
     await waitFor(() => auditLines().some(l => l.includes('"v8-timebox"') && l.includes(code)), 150_000, 'timebox rearm')
     const item = itemsFor(code).find(i => i.state === 'dispatched')

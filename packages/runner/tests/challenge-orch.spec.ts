@@ -241,10 +241,10 @@ describe('优先级与风险排序', () => {
     expect(neverDispatchedBoost(o, T0 + 120 * 60_000)).toBe(0)
   })
 
-  it('priorityOf 两段式: 首轮公平带(easy 先行) > 分值密度; 终态/待裁决不可入队', () => {
+  it('priorityOf 两段式(v8.4.1): 首轮公平带内 hard 优先 > 分值密度; 显式 override 直通; 终态/待裁决不可入队', () => {
     const o = newOrch('e3-04', T0)
-    // 从未开工: 进首轮公平带(1_000_000 基线), 带内 easy 排前
-    expect(priorityOf(o, 250, T0)).toBe(1_000_000 + (2000 - 250) * 10)
+    // 从未开工: 进首轮公平带(1_000_000 基线), 带内按分值密度排(hard 先来, 20633 教训)
+    expect(priorityOf(o, 250, T0)).toBe(1_000_000 + 250 * 10)
     // 已开工: 分值密度(提权档只属于从未开工的题, 已开工不再提权)
     o.neverDispatched = false
     expect(priorityOf(o, 250, T0)).toBe(250)
@@ -252,10 +252,10 @@ describe('优先级与风险排序', () => {
     o.priorityOverride = 999
     expect(priorityOf(o, 250, T0)).toBe(999)
     o.priorityOverride = undefined
-    // 主 agent 覆盖在首轮带内也生效
+    // v8.4.1: 主 agent 覆盖直通(跳出公平带, 不再被 1_000_000 段吞掉)
     const o2 = newOrch('e3-03', T0)
     o2.priorityOverride = 777
-    expect(priorityOf(o2, 250, T0)).toBe(1_000_000 + 777)
+    expect(priorityOf(o2, 250, T0)).toBe(777)
     o.state = 'pending-adjudication'
     expect(priorityOf(o, 250, T0)).toBe(Number.NEGATIVE_INFINITY)
     o.state = 'dead'
@@ -340,5 +340,25 @@ describe('zeroProgress 判定', () => {
     expect(zeroProgress(prog({ forkDelta: 1 }))).toBe(false)
     expect(zeroProgress(prog({ artifactsDelta: 1 }))).toBe(false)
     expect(zeroProgress(prog({ flagCandidate: true }))).toBe(false)
+  })
+})
+
+describe('v8.4.1 priorityOf: 显式 priority 直通 + 从未开工段 hard 优先', () => {
+  it('显式 priorityOverride 跳出公平段(直通排序)', () => {
+    const easy = newOrch('g-e', 0); easy.priorityOverride = undefined
+    const hard = newOrch('b-h', 0); hard.priorityOverride = 5000
+    // 无 override 的 neverDispatched easy 在 1_000_000 段; override 的 hard 直通 5000
+    expect(priorityOf(hard, 1800, 0)).toBe(5000)
+    expect(priorityOf(easy, 300, 0)).toBeGreaterThan(1_000_000)
+  })
+  it('从未开工段内按分值密度排(hard 先来, 20633 教训)', () => {
+    const easy = newOrch('g-e', 0)
+    const hard = newOrch('b-h', 0)
+    expect(priorityOf(hard, 1800, 0)).toBeGreaterThan(priorityOf(easy, 300, 0))
+  })
+  it('override 与 1_000_000 段比较: override 大者胜出(可按分值给 override)', () => {
+    const a = newOrch('a', 0); a.priorityOverride = 18000
+    const b = newOrch('b', 0); b.priorityOverride = 3000
+    expect(priorityOf(a, 1800, 0)).toBeGreaterThan(priorityOf(b, 300, 0))
   })
 })
