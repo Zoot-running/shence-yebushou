@@ -1121,6 +1121,8 @@ export function apply(ctx: Context): void {
     const kn = ensureKnowledgeFile(code)
     const o = s.orch.get(code)
     // v8.4 家族模板帧: 主 agent 指定 family 优先, 缺省按题面自动判定。
+    // v8.4.3: 模板降级为"背景速查"——与主 agent 任务冲突时以任务为准(20777 c-03 实锤:
+    // 执行者锚定速查表第一条(Dify setup)打了两轮, 主 agent 的 RSC 方向被压过)。
     const family = o?.family ?? familyOf(ch.description ?? '', ch.difficulty)
     const tpl = templateSections().get(family)
     const templateTxt = tpl !== undefined ? `\n${tpl}\n` : ''
@@ -1138,10 +1140,10 @@ export function apply(ctx: Context): void {
       `知识账本(开工必读): ${kn}`,
       `画像(快速读): ${s.profilePath}`,
       `方向段全文(若被截断, 完整版在此): ${directivePathOf(code)}`,
+      `你的任务(最高优先级, 与下方速查冲突时以此为准): ${directive}`,
       ...(ideas.length > 0 ? [`未消费采纳思路 ${ideas.length} 条(账本①可见, 可自行拾取): ${ideas.map(i => i.text.slice(0, 80)).join(' | ').slice(0, 400)}`] : []),
-      templateTxt.trim() !== '' ? `家族: ${family}${templateTxt}` : '',
       pacingTxt.trim() !== '' ? pacingTxt.trim() : '',
-      `你的任务: ${directive}`,
+      templateTxt.trim() !== '' ? `家族: ${family}(背景速查, 与任务冲突以任务为准)${templateTxt}` : '',
       '纪律: ①先读知识账本, 从已知边界出发, 不重复死路, 优先用回收工件;',
       '      ②找到 flag 立即调 xiaochang_flag_report(code, flag) 上报入旗仓(主 agent 负责提交);',
       '      ③死路/新分叉调 xiaochang_fork 上报; 终态前把死路原因写清(附实测变体清单)。',
