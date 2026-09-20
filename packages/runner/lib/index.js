@@ -3160,7 +3160,7 @@ ${pendingTxt}`,
             gateBefore = nowSet;
             if (codeFilter !== void 0 && !state.hintGateOpen.has(codeFilter)) return;
             const opened = codeFilter !== void 0 ? codeFilter : nowSet;
-            if (opened !== "") done(`xiaochang_wait: hint \u95F8\u5DF2\u5F00(${opened})\u2014\u2014\u73B0\u5728\u53EF\u53D6 xiaochang_hint`);
+            if (opened !== "") done(`xiaochang_wait: hint \u95F8\u5DF2\u5F00(${opened})\u2014\u2014\u8BF7\u7ACB\u5373\u8BC4\u4F30\u662F\u5426\u53D6 hint(\u6EE1\u5206>\u7528\u65F6>\u82B1\u8D39): \u5269\u4F59\u5206 > hint \u6263\u5206\u5C31\u5F53\u573A xiaochang_hint; \u51B3\u5B9A\u4E0D\u53D6\u4E5F\u8981\u663E\u5F0F\u8BB0\u7406\u7531\u5E76\u8F6C\u96C6\u601D\u52A0\u6A21\u578B\u591A\u8F6E\u5F81\u96C6(\u51B3\u7B56\u6743\u5728\u4F60, \u673A\u5236\u53EA\u63D0\u9192)`);
           }
         }, 2e3);
         const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1e3)}s, no event`), timeoutMs);

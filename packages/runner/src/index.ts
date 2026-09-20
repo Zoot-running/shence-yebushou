@@ -2567,7 +2567,7 @@ ${gaps}
             gateBefore = nowSet
             if (codeFilter !== undefined && !state.hintGateOpen.has(codeFilter)) return
             const opened = codeFilter !== undefined ? codeFilter : nowSet
-            if (opened !== '') done(`xiaochang_wait: hint 闸已开(${opened})——现在可取 xiaochang_hint`)
+            if (opened !== '') done(`xiaochang_wait: hint 闸已开(${opened})——请立即评估是否取 hint(满分>用时>花费): 剩余分 > hint 扣分就当场 xiaochang_hint; 决定不取也要显式记理由并转集思加模型多轮征集(决策权在你, 机制只提醒)`)
           }
         }, 2000)
         // ④ 超时
