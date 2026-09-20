@@ -31,9 +31,18 @@ interface Item {
 
 function fakeCampaign() {
   const items = new Map<string, Item>()
+  const knowledge = new Map<string, unknown[]>()
   const settleCbs: Array<(ev: { itemId: string; status: string; text: string }) => void> = []
   return {
     items,
+    knowledge,
+    recordKnowledge(itemId: string, entries: unknown[]): void {
+      const cur = knowledge.get(itemId) ?? []
+      knowledge.set(itemId, [...cur, ...entries])
+    },
+    knowledgeOf(itemId: string): unknown[] {
+      return knowledge.get(itemId) ?? []
+    },
     add(item: { id: string; label: string; model?: string }): void {
       items.set(item.id, { ...item, state: 'queued' })
     },
@@ -58,8 +67,13 @@ function fakeCampaign() {
     emitSettle(itemId: string, text: string): void {
       for (const cb of settleCbs) cb({ itemId, status: 'completed', text })
     },
-    recordKnowledge(): void {},
-    knowledgeOf: () => [],
+    recordKnowledge(itemId: string, entries: unknown[]): void {
+      const cur = knowledge.get(itemId) ?? []
+      knowledge.set(itemId, [...cur, ...entries])
+    },
+    knowledgeOf(itemId: string): unknown[] {
+      return knowledge.get(itemId) ?? []
+    },
     cancel(itemId: string, _reason: string): void {
       const v = items.get(itemId)
       if (v !== undefined) v.state = 'superseded'
@@ -94,8 +108,10 @@ const holder = {
     camp.onSettle(cb)
     return () => {}
   },
-  recordKnowledge(): void {},
-  knowledgeOf: () => [],
+  recordKnowledge(_id: string, itemId: string, entries: unknown[]): void {
+    camp.recordKnowledge(itemId, entries)
+  },
+  knowledgeOf: (itemId: string) => camp.knowledgeOf(itemId),
   resourceQueue(config: ConstructorParameters<typeof ResourceQueue>[0]) {
     return new ResourceQueue(config)
   },
@@ -239,4 +255,93 @@ describe('v8 题队列宿主接线', () => {
     const st1 = await tool('xiaochang_status').execute({}, parent)
     expect(String(st1)).toContain('runScore(计分表)')
   }, 30_000)
+})
+
+describe('v8.4 令文管线/判死/验证兵', () => {
+  it('思路采纳→未消费→派兵即消费(idea inbox 状态机)', async () => {
+    const code = 'xb-088'
+    const adopt = await tool('xiaochang_idea_adopt').execute({
+      code,
+      ideas: [{ id: 'r2-1', text: '打 JWT alg=none 伪造管理员(描述里是 SQLi 诱饵)' }],
+    }, parent)
+    expect(String(adopt)).toContain('未消费')
+    const enq = await tool('xiaochang_enqueue').execute({
+      code, prompt: '按思路打 JWT alg=none', ideaIds: [`${code}-r2-1`],
+    }, parent)
+    expect(String(enq)).toContain('已标记 1 条采纳思路为已消费')
+    const inbox = readFileSync(join(HOME, 'storages', 'xiaochang-idea-inbox', `${code}.jsonl`), 'utf8')
+    expect(inbox).toContain('"status":"consumed"')
+    expect(inbox).toContain('"consumedByDirective"')
+  }, 30_000)
+
+  it('截断 v2: 超 4000 字符全文落盘且反馈带路径', async () => {
+    const code = 'xb-088'
+    const long = '长'.repeat(4500)
+    const out = await tool('xiaochang_enqueue').execute({ code, prompt: long }, parent)
+    const text = String(out)
+    expect(text).toContain('方向段已截断')
+    expect(text).toContain('xiaochang-directives')
+    const dp = join(HOME, 'storages', 'xiaochang-directives', `${code}.jsonl`)
+    const saved = readFileSync(dp, 'utf8')
+    expect(saved).toContain('长'.repeat(100))
+  }, 30_000)
+
+  it('家族模板帧注入: 新执行者令文含"家族战术"段', async () => {
+    const code = 'g-m2'
+    await tool('xiaochang_enqueue').execute({ code, prompt: '自由突破(模板帧应自动补家族战术)', family: 'easy-harvest' }, parent)
+    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched' && i.label.includes('家族战术')), 15_000, 'template frame')
+    const item = itemsFor(code).find(i => i.label.includes('家族战术'))
+    expect(item).toBeDefined()
+    expect(item!.label).toContain('家族战术(easy·收割)')
+    expect(item!.label).toContain('判据:')
+  }, 30_000)
+
+  it('判死修复: 时间盒先回队后, 迟到 settle 依然计真实败绩(hint 闸饿死病灶)', async () => {
+    const code = 'xb-071'
+    // 等该题有 dispatched 执行者
+    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched'), 15_000, 'dispatched item')
+    // 等时间盒回队(v8-timebox) — 状态变 queued, 但执行者 item 还挂着
+    await waitFor(() => auditLines().some(l => l.includes('"v8-timebox"') && l.includes(code)), 150_000, 'timebox rearm')
+    const item = itemsFor(code).find(i => i.state === 'dispatched')
+    if (item === undefined) throw new Error('no dispatched item after timebox')
+    camp.emitSettle(item.id, '时间盒已切, 本回合未出旗')
+    await waitFor(() => auditLines().some(l => l.includes('"v8-settle-late"') && l.includes(code)), 15_000, 'late settle')
+  }, 180_000)
+
+  it('hint 闸自动开: 两轮无旗 settle → hint-gate-open 事件 + status 展示', async () => {
+    const code = 'g-m3'
+    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched'), 15_000, 'g-m3 dispatched')
+    const first = itemsFor(code).find(i => i.state === 'dispatched')!
+    camp.emitSettle(first.id, '未破: 无旗无进展')
+    await waitFor(() => auditLines().some(l => l.includes('"v8-settle"') && l.includes(code)), 15_000, 'first settle')
+    // rearm-all-in → 多路重新授予
+    await waitFor(() => itemsFor(code).filter(i => i.state === 'dispatched' && i.id !== first.id).length >= 1, 15_000, 'respawn')
+    const second = itemsFor(code).find(i => i.state === 'dispatched' && i.id !== first.id)!
+    camp.emitSettle(second.id, '仍未破: 无旗无进展')
+    await waitFor(() => auditLines().some(l => l.includes('"v8-hint-gate-open"') && l.includes(code)), 15_000, 'hint gate open')
+    const st = String(await tool('xiaochang_status').execute({}, parent))
+    expect(st).toContain('hint闸已开(可取)')
+    expect(st).toContain(code)
+  }, 60_000)
+
+  it('验证兵自动触发: 同向死路×3 → v8-verifier-auto + 翻案回合派兵', async () => {
+    const code = 'g-m4'
+    await tool('xiaochang_report').execute({
+      code, verdict: 'continue',
+      deadEnds: [
+        { path: 'LSB 隐写: 每字节最低位', conclusion: '不可行' },
+        { path: 'LSB 隐写: 每字节最高位', conclusion: '不可行' },
+        { path: 'LSB 隐写: 跨行采样', conclusion: '不可行' },
+      ],
+    }, parent)
+    // 死路进账探针(recordKnowledgeOnCode → campaign.knowledgeOf → graph 可见)。
+    const graph = String(await tool('xiaochang_graph').execute({ code }, parent))
+    if (!graph.includes('LSB')) throw new Error('dead-ends not in graph: ' + graph.slice(0, 400))
+    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched'), 15_000, 'g-m4 dispatched')
+    const item = itemsFor(code).find(i => i.state === 'dispatched')!
+    camp.emitSettle(item.id, '无旗无进展')
+    await waitFor(() => auditLines().some(l => l.includes('"v8-verifier-auto"') && l.includes(code)), 15_000, 'verifier auto')
+    // 翻案回合: 下一次授予的执行者 = 验证兵
+    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched' && i.label.includes('验证兵')), 15_000, 'verifier spawned')
+  }, 60_000)
 })

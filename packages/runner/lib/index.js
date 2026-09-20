@@ -500,12 +500,6 @@ function replaceKnowledgeSection(fileText, section, entries) {
   const [start, end] = range;
   return [...lines.slice(0, start + 1), ...body, ...lines.slice(end)].join("\n");
 }
-function hintGate(input) {
-  const missing = [];
-  if (input.ideaRound < 2) missing.push(`R2 \u4E8C\u6B21\u5F81\u96C6\u672A\u8D70(\u5F53\u524D\u7B2C ${input.ideaRound} \u8F6E, \u9700 \u22652)\u2014\u2014\u5148 xiaochang_refanout \u52A0\u6A21\u578B\u518D\u6253\u4E00\u8F6E`);
-  if (input.filteredFailed < 1) missing.push("\u8BE5\u9898\u5C1A\u65E0\u8FC7\u6EE4\u540E\u5931\u8D25(\u9700 \u22651 \u6B21\u771F\u5B9E\u8D25\u7EE9)\u2014\u2014\u5148\u6D3E\u6267\u884C\u8005\u6253\u51FA\u771F\u5B9E\u7ED3\u679C");
-  return { allowed: missing.length === 0, missing };
-}
 function dedupeForkPaths(existingPaths, entries) {
   const seen = new Set(existingPaths);
   const out = [];
@@ -544,6 +538,108 @@ function attachmentFetchCandidates(code) {
     `/files/`,
     `/`
   ];
+}
+var TEMPLATE_LIBRARY = [
+  {
+    family: "rev-vm",
+    name: "rev\xB7\u81EA\u7814VM/\u5B57\u8282\u7801\u4FDD\u62A4",
+    tactics: '\u4F18\u5148\u7ED5\u5F00 VM, \u522B\u4E00\u4E0A\u6765\u5168\u89E3: \u2460strings/\u71B5\u503C\u627E\u660E\u6587\u51ED\u636E, \u5B9A\u4F4D bytecode blob(\u9AD8\u71B5\u975E\u4EE3\u7801\u533A); \u2461\u5BBF\u4E3B\u5C42\u7ED5\u8FC7(\u6700\u9AD8\u6760\u6746)\u2014\u2014LD_PRELOAD hook printf/puts/write/send \u76F4\u53D6\u51ED\u636E, \u6216 patch VM \u6821\u9A8C\u8FD4\u56DE\u503C\u6052"\u901A\u8FC7", \u81EA\u89E3\u5BC6\u578B hook mprotect/mmap dump \u8FD0\u884C\u65F6\u5185\u5B58; \u2462\u6BD4\u8F83 opcode handler \u76F4\u8BFB\u4E24\u5BC4\u5B58\u5668(\u4E00\u8FB9\u5E38\u662F\u5E38\u91CF\u53E3\u4EE4); \u2463\u515C\u5E95\u624D\u63D0 opcode \u8BED\u4E49\u8868\u5199 lift \u811A\u672C\u3002',
+    criteria: "hook \u8F93\u51FA\u91CC\u51FA\u73B0 FLAG{/flag{ \u624D\u7B97\u547D\u4E2D; patch \u540E\u4EFB\u610F\u8F93\u5165\u901A\u8FC7\u4E14\u8F93\u51FA\u53D8\u5316\u3002",
+    traps: 'disasm \u91CC putc \u6253\u5B57\u9762\u91CF "."\u3001load \u88AB\u5171\u4EAB\u5C3E\u4E22\u5F03 \u2260 "\u574F\u6784\u5EFA\u8BF1\u9975"\u2014\u2014\u5148\u6309\u9884\u671F\u8BED\u4E49\u91CD\u89E3\u91CA(\u64CD\u4F5C\u6570\u5F52\u5C5E\u3001putc \u8BE5\u6253 acc)\u518D\u5224\u8BF1\u9975;"\u7EAF\u8BF1\u9975\u6784\u5EFA"\u7ED3\u8BBA\u5FC5\u987B\u9644\u5DF2\u8BD5\u8BED\u4E49\u7EC4\u5408\u6E05\u5355\u3002'
+  },
+  {
+    family: "rev-serial",
+    name: "rev\xB7\u5E8F\u5217\u53F7/\u6821\u9A8C\u5668",
+    tactics: "\u2460strings \u62FF invalid/denied/granted \u4E32 \u2192 \u53CD\u63A8\u8F93\u5165-\u6821\u9A8C-\u8F93\u51FA\u94FE; \u2461LD_PRELOAD hook sscanf/atoi/strcmp/memcmp/puts/printf/write \u6253\u5370\u4E24\u4FA7\u53C2\u6570(\u6700\u9AD8\u6760\u6746, \u4E00\u6B21\u8FD0\u884C\u62FF\u671F\u671B SN \u4E0E\u51ED\u636E); \u2462SN \u516C\u5F0F\u53CD\u53D8\u6362(\u524D\u7F00+\u5206\u6BB5+\u6821\u9A8C\u4F4D, \u6C42\u548C\u53D6\u6A21/CRC \u5199 Python); \u2463objdump \u641C movabs/cmp $imm \u5E38\u91CF\u5E8F\u5217\u62FC\u671F\u671B\u503C; \u2464patch \u5931\u8D25\u5206\u652F\u6052\u771F\u3002",
+    criteria: "hook \u6253\u5370\u7684\u671F\u671B\u503C\u4EE3\u5165\u539F\u7A0B\u5E8F\u5FC5\u987B\u8F93\u51FA granted/\u51ED\u636E\u3002",
+    traps: "\u6C99\u7BB1\u65E0 gdb\u2014\u2014\u4E0D\u8981\u5199 gdb \u65AD\u70B9\u65B9\u6848(20390 f2-07 \u4EE4\u6587\u72AF\u8FC7)\u3002"
+  },
+  {
+    family: "rev-license",
+    name: "rev\xB7\u6388\u6743\u5BA2\u6237\u7AEF/\u8DE8\u5E73\u53F0",
+    tactics: "\u2460\u5148\u5224\u6280\u672F\u6808(\u6210\u672C\u5DEE 10 \u500D): file+strings \u5206\u6D41\u2014\u2014.NET(mscoree)\u2192strings \u635E IL \u5E38\u91CF; Java(PK..)\u2192zipfile \u89E3 jar; Electron(app.asar)\u2192\u624B\u89E3 asar \u8BFB JS \u660E\u6587; Go(Go build ID)\u2192pclntab\u3002\u2461\u539F\u751F ELF \u2192 LD_PRELOAD hook strcmp/memcmp/sscanf/atoi \u6253\u5370\u53C2\u6570, \u6216\u6052\u8FD4\u56DE 0 \u653E\u884C\u3002\u2462license\u2192\u5BC6\u94A5\u6D3E\u751F: \u627E KDF \u5E38\u6570(PBKDF2/SHA-256 IV/AES S-box)pycryptodome \u79BB\u7EBF\u91CD\u7B97\u3002\u2463patch \u51ED\u636E\u8F93\u51FA\u51FD\u6570\u4E3A\u65E0\u6761\u4EF6\u6267\u884C\u3002",
+    criteria: "\u91CD\u653E/\u6253\u8865\u4E01\u540E\u8F93\u51FA\u4E0E\u539F\u6837\u9010\u5B57\u8282\u4E00\u81F4\u3002",
+    traps: "\u5148\u82B1 10 \u5206\u949F\u626B\u5DE5\u4EF6\u9884\u7F6E(license/credential \u6587\u4EF6\u3001env\u3001README)\u2014\u2014\u6709\u4E9B\u9898\u9006\u5411\u53EA\u662F\u70DF\u96FE\u3002"
+  },
+  {
+    family: "web-chain",
+    name: "web\xB7\u591A\u8DF3AP\u94FE(\u591A\u65D7\u7B49\u6743)",
+    tactics: '\u5E7F\u5EA6\u4F18\u5148(\u7B49\u6743\u65D7\u5148\u626B\u6D45\u5C42, \u6BCF\u5F97\u4E00\u65D7\u7ACB\u5373\u62A5): \u2460\u5916\u7F51\u6253\u70B9 nmap \u5168\u7AEF\u53E3+\u6307\u7EB9+dirsearch \u5927\u5B57\u5178+robots/www.zip/.git/.bak/.sql/\u524D\u7AEF JS \u6CE8\u91CA, \u8001\u7EC4\u4EF6 nday; \u2461\u65D71 \u4F18\u5148"\u8BFB\u6587\u4EF6"\u7C7B(file/path/id/name \u53C2\u6570\u3001....// \u7ED5\u8FC7\u5355\u6B21 ../ \u66FF\u6362\u3001\u7EDD\u5BF9\u8DEF\u5F84 /challenge/flag*.txt)\u3001\u5907\u4EFD\u6CC4\u9732\u3001\u5F31\u53E3\u4EE4\u3001\u672A\u6388\u6743\u63A5\u53E3\u3001SQLi; \u2462shell \u540E\u56FA\u5B9A\u4FA6\u5BDF: find -iname "*flag*"\u3001grep -rIl "flag{" /var/www /tmp /home /opt\u3001env\u3001/proc/1/environ\u3001/etc/hosts\u3001ip a\u3001ss -lntup; \u2463\u5185\u7F51\u8E29\u70B9\u6587\u4EF6\u4F18\u5148: /etc/hosts\u3001~/.ssh/{known_hosts,config}\u3001~/.bash_history\u3001nginx upstream\u3001docker-compose.yml; \u2464\u5EFA\u4EE3\u7406(\u5FC5\u505A): chisel/ligolo-ng/frp/socat \u6216\u590D\u7528 SSRF/LFI \u901A\u9053; \u2465\u5185\u7F51\u9AD8\u9891\u70B9: Redis 6379 \u672A\u6388\u6743\u5199 authorized_keys/crontab > MySQL \u5F31\u53E3\u4EE4+secure_file_priv \u7A7A\u5199 webshell > Tomcat manager war > SMB/NFS > Jenkins; \u2466\u6838\u5FC3\u673A\u5BC6: /data\u3001/opt/secret\u3001DB dump grep flag\u3001\u8DE8\u673A\u5206\u7247\u62FC\u63A5\u3001\u54CD\u5E94\u5934/cookie/JWT/log \u5168\u67E5\u3002',
+    criteria: "\u6BCF\u65D7\u539F\u6587+\u51FA\u5904\u53CC\u8BB0\u5F55; \u9650\u901F\u7C7B\u76EE\u6807\u8BB0\u5F55\u5C01\u7981\u884C\u4E3A\u5E76\u9075\u5B88\u8282\u594F\u7EA6\u675F\u3002",
+    traps: "\u9650\u901F/\u5C01\u7981\u76EE\u6807\u7684 pacing \u662F\u786C\u7EA6\u675F(\u770B\u4EE4\u6587\u8282\u594F\u7EA6\u675F\u6BB5), \u52FF\u5927\u7206\u7834\u70E7\u901A\u9053; \u9898\u9762\u70B9\u540D\u7684\u4EA7\u54C1\u540D(\u5982\u6CDB\u5FAEOA)\u8981\u8FDB\u8BCD\u8868\u6784\u9020\u3002"
+  },
+  {
+    family: "web-console",
+    name: "web\xB7\u5355\u673A\u7BA1\u7406\u53F0/\u7F51\u5173",
+    tactics: "\u2460\u8BFB\u5BB9\u5668\u5185\u6E90\u7801/\u524D\u7AEF JS bundle(\u5185\u8054 VITE_*/NEXT_PUBLIC_* \u5E38\u76F4\u63A5\u7ED9 token); \u2461\u7F51\u5173/\u8EAB\u4EFD\u5C42\u7ED5\u8FC7\u6E05\u5355(\u8DEF\u5F84\u89C4\u8303\u5316\u53D8\u4F53\u8868\u3001\u8EAB\u4EFD\u5934\u6CE8\u5165\u8868\u3001\u65B0\u65E7\u8DEF\u7531\u5DEE\u96C6); \u2462JWT \u5168\u5BB6(alg=none\u3001RS256\u2192HS256\u3001kid \u7A7F\u8D8A\u3001\u5F31\u5BC6\u94A5\u3001\u65E7 token \u91CD\u653E); \u2463\u53C2\u6570\u540D/\u7F16\u7801\u673A\u5236\u8FB9\u754C(\u542B\u672A\u95ED\u5408\u65B9\u62EC\u53F7\u7C7B\u53D8\u4F53); \u2464\u8FD0\u884C\u65F6\u80FD\u529B\u77E9\u9635(env/\u6C99\u7BB1\u51FD\u6570/proc/\u51FA\u7F51/legacy runtime \u5DEE\u5206)\u3002",
+    criteria: '\u8EAB\u4EFD\u6CE8\u5165\u5FC5\u987B"401\u2192200 \u4E14 body \u968F\u6CE8\u5165\u503C\u53D8\u5316"\u624D\u7B97\u547D\u4E2D(\u9632\u5047\u9633\u6027)\u3002',
+    traps: '\u5B57\u6BB5\u540D/\u7F16\u7801\u7C7B"\u4EFB\u4F55 X \u90FD\u65E0\u6CD5\u5B58\u6D3B"\u7684\u5C01\u5370\u7ED3\u8BBA\u5FC5\u987B\u9644\u5B9E\u6D4B\u53D8\u4F53\u6E05\u5355(20390 a-18 \u5B9E\u9524: php[code.execute \u672A\u95ED\u5408\u65B9\u62EC\u53F7)\u3002'
+  },
+  {
+    family: "ai-service",
+    name: "ai\xB7\u63A8\u7406\u670D\u52A1",
+    tactics: "\u2460\u96F6\u6210\u672C\u6307\u7EB9\u5230\u7248\u672C(11434 Ollama /api/version\u30018000 vLLM /v1/models\u3001Triton /v2/health\u30018265 Ray /api/jobs/\u30018080-8082 TorchServe /ping\u30017860 Gradio\u30015000 MLflow\u30018888 Jupyter; openapi.json+Server \u5934+/metrics \u4EA4\u53C9); \u2461CVE \u5BF9\u53F7: Ray CVE-2023-48022 \u672A\u6388\u6743\u63D0\u4EA4 job\u3001Ollama /api/pull \u8DEF\u5F84\u7A7F\u8D8A\u5199 ld.so.preload(<0.1.47)\u3001TorchServe CVE-2023-43654 url SSRF \u52A0\u8F7D .mar\u3001MLflow \u53CD\u5E8F\u5217\u5316; \u2462\u4F18\u5148\u4EFB\u610F\u6587\u4EF6\u8BFB(Gradio /file=\u3001Ollama /api/create FROM /challenge/flag.txt)\u800C\u975E RCE\u3002",
+    criteria: "\u6587\u4EF6\u8BFB\u5148 /etc/passwd \u6253\u901A\u57FA\u7EBF\u518D\u8BFB\u65D7\u3002",
+    traps: "\u670D\u52A1 down \u4E0D\u4EE3\u8868\u9898\u6B7B\u2014\u2014\u5148\u91CD\u8BD5/\u6362\u5165\u53E3\u5E76\u7559\u8BC1, \u522B\u9677\u5165\u7B49\u5F85\u8F6E\u8BE2\u3002"
+  },
+  {
+    family: "easy-harvest",
+    name: "easy\xB7\u6536\u5272",
+    tactics: "\u4E32\u884C\u6E05\u9898 + \u5355\u9898 15 \u5206\u949F\u65F6\u95F4\u76D2, \u65E0\u8FDB\u5C55\u8BB0\u6B7B\u8DEF\u8DF3\u4E0B\u4E00\u9898\u3002\u9ED8\u8BA4\u51ED\u636E/CVE \u901F\u67E5: Langflow /api/v1/validate/code\u3001Dify /console/api/setup \u52AB\u6301\u3001Open WebUI \u9996\u6CE8\u518C\u5373\u7BA1\u7406\u5458\u3001Neo4j neo4j/neo4j \u6216\u672A\u6388\u6743 tx/commit\u3001Gremlin 8182 Groovy Runtime.exec\u3001HugeGraph CVE-2024-27348\u3001n8n /rest/owner/setup \u63A5\u7BA1\u3001\u82E5\u4F9D admin/admin123\u3001Nacos nacos/nacos\u3001Jenkins/Grafana admin/admin\u3001Shiro rememberMe\u3001Actuator /env+/heapdump\u3001JimuReport \u672A\u6388\u6743 SSTI\u3001SSH \u5F31\u53E3\u4EE4\u5C0F\u5B57\u5178\u3002",
+    criteria: "flag \u539F\u6587+\u51FA\u5904; 15 \u5206\u949F\u8BA1\u65F6\u4ECE\u5BB9\u5668\u5C31\u7EEA\u8D77\u7B97\u3002",
+    traps: "\u4E0D\u8981\u604B\u6218; \u6BCF\u5E94\u7528\u7C7B\u578B\u53EA\u8BD5\u4E00\u6B21\u9ED8\u8BA4\u51ED\u636E\u8868, \u5931\u8D25\u5373\u8BB0\u6B7B\u8DEF\u6362\u4E0B\u4E00\u9898\u3002"
+  }
+];
+function familyOf(description, difficulty) {
+  const d = description ?? "";
+  const dl = difficulty ?? "";
+  if (/(自研.*(VM|执行机制|字节码)|bytecode|虚拟(机|指令)|解释器)/i.test(d)) return "rev-vm";
+  if (/(序列号|serial|校验器|固件.*(校验|授权))/i.test(d)) return "rev-serial";
+  if (/(授权(客户端|逻辑)|license|许可证|跨平台.*(客户端|授权))/i.test(d)) return "rev-license";
+  if (/(OA|官网|内网|横向|APT|多阶段|旗链|渗透测试.*(企业|公司)|核心业务)/i.test(d)) return "web-chain";
+  if (/(管理(控制台|平台|系统)|网关|Serverless|云函数|迁移)/i.test(d)) return "web-console";
+  if (/(AI|推理|模型|Ollama|vLLM|Triton|TorchServe|Ray|Gradio|MLflow|Jupyter|智能)/i.test(d)) return "ai-service";
+  if (dl === "easy" || /(公司内部|内部系统|请对目标)/i.test(d)) return "easy-harvest";
+  return "web-console";
+}
+function hintGateV2(input) {
+  const missing = [];
+  if (input.blockerConfirmed) return { allowed: true, missing: [] };
+  if (input.settleNoFlag >= 2) return { allowed: true, missing: [] };
+  if (input.ideaRound < 2) missing.push(`R2 \u4E8C\u6B21\u5F81\u96C6\u672A\u8D70(\u5F53\u524D\u7B2C ${input.ideaRound} \u8F6E)\u2014\u2014\u5148 xiaochang_refanout \u52A0\u6A21\u578B\u518D\u6253\u4E00\u8F6E`);
+  if (input.settleNoFlag < 1) missing.push("\u8BE5\u9898\u5C1A\u65E0\u771F\u5B9E\u8D25\u7EE9(\u65E0\u65D7 settle \u22651 \u81EA\u52A8\u8BA1)\u2014\u2014\u5148\u6D3E\u6267\u884C\u8005\u6253\u4E00\u8F6E");
+  return { allowed: missing.length === 0, missing };
+}
+function directionOf(path) {
+  const m = /^([^:→]+?)(?:[:：]|→|$)/.exec(path.trim());
+  return (m?.[1] ?? path).trim().slice(0, 40);
+}
+function sealedClustersOf(deadEnds, n = 3) {
+  const byDir = /* @__PURE__ */ new Map();
+  for (const e of deadEnds) {
+    const dir = directionOf(e.path);
+    byDir.set(dir, (byDir.get(dir) ?? 0) + 1);
+  }
+  return [...byDir.entries()].filter(([, count]) => count >= n).map(([direction, count]) => ({ direction, count })).sort((a, b) => b.count - a.count);
+}
+function parseHandoffForks(detail) {
+  const out = [];
+  const re = /^(?:[-*•]|\d+[.)])\s*(?:未竟|未完成|待办|下一步|交接|留待|继续要|还没|尚未)(?:动作|事项|:)?\s*(.{6,200})$/gm;
+  for (const m of detail.matchAll(re)) {
+    const line = m[1].trim();
+    if (line.length === 0 || /^$/.test(line)) continue;
+    out.push({ path: `\u4EA4\u63A5\u672A\u7ADF: ${line.slice(0, 60)}`, conclusion: line });
+  }
+  return out.slice(0, 5);
+}
+function gradedLine(e) {
+  const parts = [e.path];
+  if (e.conclusion !== void 0 && e.conclusion !== "") parts.push(` \u2192 ${e.conclusion}`);
+  if (e.evidence !== void 0 && e.evidence !== "") parts.push(` (\u8BC1\u636E: ${e.evidence.slice(0, 300)})`);
+  if (e.testedVariants !== void 0 && e.testedVariants.length > 0) parts.push(` [\u5DF2\u8BD5: ${e.testedVariants.join("; ").slice(0, 300)}]`);
+  if (e.sealedBy !== void 0 && e.sealedBy.length > 0) parts.push(` [\u540C\u5411\u5C01\u5370\xD7${e.sealedBy.length}]`);
+  parts.push(` [by ${e.by} ${new Date(e.at).toISOString().slice(11, 19)}Z]`);
+  return `- ${parts.join("")}`;
 }
 
 // src/challenge-orch.ts
@@ -1045,6 +1141,70 @@ function apply(ctx) {
       }
     }
   }
+  const ideaInboxDir = () => join2(process.env.DSH_HOME ?? ".", "storages", "xiaochang-idea-inbox");
+  function readIdeas(code) {
+    const p = join2(ideaInboxDir(), `${code}.jsonl`);
+    if (!existsSync(p)) return [];
+    const out = [];
+    for (const line of readFileSync(p, "utf8").split("\n")) {
+      if (line.trim() === "") continue;
+      try {
+        out.push(JSON.parse(line));
+      } catch {
+      }
+    }
+    return out;
+  }
+  function writeIdeas(code, entries) {
+    mkdirSync2(ideaInboxDir(), { recursive: true });
+    const p = join2(ideaInboxDir(), `${code}.jsonl`);
+    appendFileSync(p, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    return p;
+  }
+  function unconsumedIdeas(code) {
+    return readIdeas(code).filter((e) => e.status === "unconsumed");
+  }
+  function markIdeasConsumed(code, ids, directiveFingerprint) {
+    const all = readIdeas(code);
+    let n = 0;
+    const idSet = new Set(ids);
+    const next = all.map((e) => {
+      if (e.status === "unconsumed" && idSet.has(e.id)) {
+        n += 1;
+        return { ...e, status: "consumed", consumedByDirective: directiveFingerprint, consumedAt: Date.now() };
+      }
+      return e;
+    });
+    if (n > 0) {
+      mkdirSync2(ideaInboxDir(), { recursive: true });
+      writeFileSync(join2(ideaInboxDir(), `${code}.jsonl`), next.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    }
+    return n;
+  }
+  const directivesDir = () => join2(process.env.DSH_HOME ?? ".", "storages", "xiaochang-directives");
+  function persistFullDirective(code, full) {
+    mkdirSync2(directivesDir(), { recursive: true });
+    const p = join2(directivesDir(), `${code}.jsonl`);
+    appendFileSync(p, JSON.stringify({ at: Date.now(), text: full }) + "\n");
+    return p;
+  }
+  function directivePathOf(code) {
+    return join2(directivesDir(), `${code}.jsonl`);
+  }
+  const fanoutInboxDir = () => join2(process.env.DSH_HOME ?? ".", "storages", "xiaochang-fanout-inbox");
+  function templateLibraryRuntime() {
+    return TEMPLATE_LIBRARY;
+  }
+  function templateSections() {
+    const out = /* @__PURE__ */ new Map();
+    for (const t of templateLibraryRuntime()) out.set(t.family, templateFrameText(t));
+    return out;
+  }
+  function templateFrameText(t) {
+    return `\u5BB6\u65CF\u6218\u672F(${t.name}): ${t.tactics}
+\u5224\u636E: ${t.criteria}
+\u9677\u9631: ${t.traps}`;
+  }
   const knowledgeFilePath = (code) => join2(dirname(c().boardPath(code)), "KNOWLEDGE.md");
   function ensureKnowledgeFile(code) {
     const p = knowledgeFilePath(code);
@@ -1341,7 +1501,8 @@ function apply(ctx) {
         reasoningEffort: executor.effort,
         board: code,
         resourceClass: cls,
-        priority: { tier: tierOf(ch.difficulty), score: prio }
+        priority: { tier: tierOf(ch.difficulty), score: prio },
+        ...d.persona !== void 0 && d.persona !== "" ? { persona: d.persona } : {}
       });
       if (!vq.triedModels.includes(model)) vq.triedModels.push(model);
       persistV2(s);
@@ -1404,7 +1565,6 @@ function apply(ctx) {
     if (o === void 0) return;
     if (s.settleProcessed.has(itemId)) return;
     s.settleProcessed.add(itemId);
-    if (o.state !== "granted") return;
     const now = Date.now();
     const sn = o.snapshot;
     const pendingFlags = pendingFlagsOf(readFlagEntries(), code);
@@ -1416,6 +1576,38 @@ function apply(ctx) {
       blockerConcluded: blockerConcluded(detail) || knowledgeOfCode(code).some((k) => k.kind === "dead-end" && blockerConcluded(`${k.path} ${k.conclusion ?? ""}`)),
       detail
     };
+    const handoff = parseHandoffForks(detail);
+    if (handoff.length > 0) {
+      const entries = handoff.map((h) => ({ kind: "fork", path: h.path, conclusion: h.conclusion, by: `settle-${itemId}`, at: now }));
+      try {
+        recordKnowledgeOnCode(code, entries);
+        appendKnowledgeFile(code, "forks", handoff.map((h) => `${h.path} \u2192 ${h.conclusion}`));
+      } catch {
+      }
+    }
+    const maybeAutoVerifier = () => {
+      const sealed = sealedClustersOf(knowledgeOfCode(code).filter((k) => k.kind === "dead-end"));
+      if (sealed.length > 0 && o.state !== "dead" && o.state !== "solved" && o.blockerCheck !== "in-flight") {
+        const dispatched = s.verifierDispatched.get(code) ?? 0;
+        if (dispatched < 1) {
+          s.verifierDispatched.set(code, dispatched + 1);
+          o.blockerCheck = "in-flight";
+          o.state = "queued";
+          o.multiSpawn = 1;
+          addPending(s, makePending(code, "needs-verdict", `${code} \u6B7B\u8DEF\u5C01\u5370\u7C07 ${sealed.map((x) => `${x.direction}\xD7${x.count}`).join("|")} \u2192 \u9A8C\u8BC1\u5175\u5DF2\u81EA\u52A8\u89E6\u53D1(\u7FFB\u6848\u56DE\u5408)`, c().boardPath(code), now));
+          audit(s.auditPath, { type: "v8-verifier-auto", code, sealed: sealed.map((x) => x.direction) });
+        }
+      }
+    };
+    if (o.state !== "granted") {
+      if (!p.flagCandidate) o.settleNoFlag += 1;
+      maybeAutoVerifier();
+      refreshHintGate(s, code);
+      bumpOrch(s);
+      persistOrch(s);
+      audit(s.auditPath, { type: "v8-settle-late", itemId, code, state: o.state, settleNoFlag: o.settleNoFlag });
+      return;
+    }
     if (o.blockerCheck === "in-flight") applyVerifierResult(o, verifierVerdict(detail));
     const action = settleAction(o, p);
     applySettle(o, action, detail, now);
@@ -1450,11 +1642,34 @@ function apply(ctx) {
         audit(s.auditPath, { type: "v8-settle-cluster", itemId, code, sibling: sb, action: action2 });
       }
     }
-    audit(s.auditPath, { type: "v8-settle", itemId, code, action, flagCandidate: p.flagCandidate });
+    if (action !== "verify-blocker") maybeAutoVerifier();
+    audit(s.auditPath, { type: "v8-settle", itemId, code, action, flagCandidate: p.flagCandidate, settleNoFlag: o.settleNoFlag });
+    refreshHintGate(s, code);
+    for (const sb of o.cluster) refreshHintGate(s, sb);
     bumpOrch(s);
     persistOrch(s);
     persistProgress(s);
     if (action !== "pending-flag") armQueue();
+  }
+  function refreshHintGate(s, code) {
+    const o = s.orch.get(code);
+    if (o === void 0 || o.state === "solved" || o.state === "dead") return;
+    const used = s.hintLedger.get(code)?.hints ?? 0;
+    if (used >= s.maxHints) return;
+    const vq = s.v2[code];
+    const gate = hintGateV2({
+      ideaRound: vq?.ideaRound ?? 1,
+      settleNoFlag: o.settleNoFlag ?? 0,
+      blockerConfirmed: o.blockerCheck === "confirmed"
+    });
+    if (gate.allowed) {
+      if (!s.hintGateOpen.has(code)) {
+        s.hintGateOpen.add(code);
+        audit(s.auditPath, { type: "v8-hint-gate-open", code, settleNoFlag: o.settleNoFlag, ideaRound: vq?.ideaRound ?? 1 });
+      }
+    } else {
+      s.hintGateOpen.delete(code);
+    }
   }
   async function tickOrch() {
     const s = requireState();
@@ -1487,6 +1702,16 @@ function apply(ctx) {
     const cls = resourceClassOf(ch);
     const addrs = ch.container_addr.length > 0 ? ch.container_addr.join(",") : cls === "local" ? "\u65E0\u9700\u5BB9\u5668(\u672C\u5730\u6C42\u89E3: bash/python \u76F4\u5F00)" : "\u5BB9\u5668\u7531\u8C03\u5EA6\u673A\u5236\u6388\u4E88\u2014\u2014\u4F60\u6301\u69FD\u5F00\u5DE5, \u65E0\u9700\u81EA\u884C\u542F\u52A8/\u7B49\u5F85\u5BB9\u5668(\u6267\u884C\u8005\u6CA1\u6709 start_container \u5DE5\u5177)";
     const kn = ensureKnowledgeFile(code);
+    const o = s.orch.get(code);
+    const family = o?.family ?? familyOf(ch.description ?? "", ch.difficulty);
+    const tpl = templateSections().get(family);
+    const templateTxt = tpl !== void 0 ? `
+${tpl}
+` : "";
+    const pacingTxt = (o?.pacing?.length ?? 0) > 0 ? `
+\u3010\u8282\u594F\u7EA6\u675F(\u786C, \u8FDD\u53CD\u4F1A\u70E7\u901A\u9053)\u3011${o.pacing.map((p) => `- ${p}`).join("\n")}
+` : "";
+    const ideas = unconsumedIdeas(code);
     return [
       `\u3010\u6821\u573A\u6267\u884C\u4EE4 \xB7 ${code}\u3011(${cls === "local" ? "\u9644\u4EF6\u9898\xB7\u5168\u5E76\u884C" : "\u5BB9\u5668\u9898\xB73\u69FD\u8F6E\u6362"}, ${ch.difficulty}, ${ch.total_score}pts, ${ch.flag_count} flags)`,
       `\u9898\u9762: ${(ch.description ?? "").slice(0, 1200)}`,
@@ -1494,11 +1719,15 @@ function apply(ctx) {
       `\u5171\u4EAB\u6218\u62A5: ${c().boardPath(code)}`,
       `\u77E5\u8BC6\u8D26\u672C(\u5F00\u5DE5\u5FC5\u8BFB): ${kn}`,
       `\u753B\u50CF(\u5FEB\u901F\u8BFB): ${s.profilePath}`,
+      `\u65B9\u5411\u6BB5\u5168\u6587(\u82E5\u88AB\u622A\u65AD, \u5B8C\u6574\u7248\u5728\u6B64): ${directivePathOf(code)}`,
+      ...ideas.length > 0 ? [`\u672A\u6D88\u8D39\u91C7\u7EB3\u601D\u8DEF ${ideas.length} \u6761(\u8D26\u672C\u2460\u53EF\u89C1, \u53EF\u81EA\u884C\u62FE\u53D6): ${ideas.map((i) => i.text.slice(0, 80)).join(" | ").slice(0, 400)}`] : [],
+      templateTxt.trim() !== "" ? `\u5BB6\u65CF: ${family}${templateTxt}` : "",
+      pacingTxt.trim() !== "" ? pacingTxt.trim() : "",
       `\u4F60\u7684\u4EFB\u52A1: ${directive}`,
       "\u7EAA\u5F8B: \u2460\u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1, \u4E0D\u91CD\u590D\u6B7B\u8DEF, \u4F18\u5148\u7528\u56DE\u6536\u5DE5\u4EF6;",
       "      \u2461\u627E\u5230 flag \u7ACB\u5373\u8C03 xiaochang_flag_report(code, flag) \u4E0A\u62A5\u5165\u65D7\u4ED3(\u4E3B agent \u8D1F\u8D23\u63D0\u4EA4);",
-      "      \u2462\u6B7B\u8DEF/\u65B0\u5206\u53C9\u8C03 xiaochang_fork \u4E0A\u62A5; \u7EC8\u6001\u524D\u628A\u6B7B\u8DEF\u539F\u56E0\u5199\u6E05\u3002"
-    ].join("\n");
+      "      \u2462\u6B7B\u8DEF/\u65B0\u5206\u53C9\u8C03 xiaochang_fork \u4E0A\u62A5; \u7EC8\u6001\u524D\u628A\u6B7B\u8DEF\u539F\u56E0\u5199\u6E05(\u9644\u5B9E\u6D4B\u53D8\u4F53\u6E05\u5355)\u3002"
+    ].filter((l) => l !== "").join("\n");
   }
   const register = (tool) => ctx.tools.register(tool);
   register(defineTool({
@@ -1596,13 +1825,19 @@ function apply(ctx) {
         orchVersion: 0,
         timeboxMs: (args.timeboxMinutes ?? 30) * 6e4,
         tickCount: 0,
-        scoreTable: {}
+        scoreTable: {},
+        hintGateOpen: /* @__PURE__ */ new Set(),
+        verifierDispatched: /* @__PURE__ */ new Map()
       };
       try {
         if (existsSync(s.profilePath)) s.profile = parse(readFileSync(s.profilePath, "utf8"));
       } catch {
       }
       state = s;
+      try {
+        jisi?.setDeadline?.(s.startedAt + s.budgetMs);
+      } catch {
+      }
       const stableId = `tsecbench-run-${args.runId ?? "pending"}`;
       const swept = sweepLegacyWorkdir(process.cwd(), s.startedAt, `.archive/${stableId}`);
       if (!await s.adapter.gatewayHealthy()) {
@@ -1701,15 +1936,15 @@ function apply(ctx) {
       if (progress.all().length === 0 && jisi?.fanoutNotify !== void 0) {
         try {
           const allowModel = (m) => s.modelWhitelist.length === 0 || s.modelWhitelist.includes(m);
-          const tickets = [];
+          let delegates = 0;
           let hardMulti = 0;
           for (const ch of fresh) {
             const models = (ch.total_score ?? 0) >= 700 ? ["deepseek-flash", "glm-5.3"].filter(allowModel) : ["deepseek-flash"].filter(allowModel);
             if (models.length > 1) hardMulti += 1;
             const ticket = jisi.fanoutNotify(agent, { prompt: buildWarmupPrompt(ch) }, models);
-            tickets.push(ticket.id);
+            delegates += ticket.models.length;
           }
-          warmup = `, \u6696\u8D26 fanout \u5DF2\u53D1 ${tickets.length} \u8DEF(hard \u9898 ${hardMulti} \u9053\u4E3A flash+glm-5.3 \u53CC\u8DEF, \u5176\u4F59 flash \u5355\u8DEF; \u62A5\u544A\u6309\u4FE1\u5C01\u5230\u8FBE\u8BF7\u7167\u5E38\u88C1\u51B3\u2014\u2014**\u6696\u8D26\u5DF2\u8986\u76D6\u5168\u9898, \u65E0\u9700\u518D jisi_fanout_bulk \u5168\u91CF\u53D1; \u53EA\u5BF9 hard/\u5361\u9898\u52A0\u6A21\u578B\u8865\u5F81**)`;
+          warmup = delegates > 0 ? `, \u6696\u8D26 fanout \u5DF2\u53D1 ${delegates} \u8DEF(hard \u9898 ${hardMulti} \u9053\u4E3A flash+glm-5.3 \u53CC\u8DEF, \u5176\u4F59 flash \u5355\u8DEF; \u62A5\u544A\u6309\u4FE1\u5C01\u5230\u8FBE\u8BF7\u7167\u5E38\u88C1\u51B3\u2014\u2014**\u6696\u8D26\u5DF2\u8986\u76D6\u5168\u9898, \u65E0\u9700\u518D jisi_fanout_bulk \u5168\u91CF\u53D1; \u53EA\u5BF9 hard/\u5361\u9898\u52A0\u6A21\u578B\u8865\u5F81**)` : ", \u6696\u8D26 fanout 0 \u8DEF\u5B9E\u9645\u6D3E\u53D1(\u96C6\u601D\u95F8/\u91CD\u8BD5\u4E0A\u9650)\u2014\u2014\u53EF\u624B\u52A8 jisi_fanout_bulk \u8865\u5F81";
         } catch {
           warmup = ", \u6696\u8D26 fanout \u53D1\u9001\u5931\u8D25(\u53EF\u624B\u52A8 jisi_fanout_bulk \u5168\u91CF\u5F81\u96C6)";
         }
@@ -2015,7 +2250,7 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
   }));
   register(defineTool({
     name: "xiaochang_hint",
-    description: "Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v7.4 gate: refused until the challenge has gone through \u22651 R2 re-fanout (ideaRound\u22652) AND has \u22651 filtered failure (provider-outage failures excluded) \u2014 hint is the last resort after escalation, never a shortcut. The deduction is reported loudly and the platform's cumulative_score is the authoritative account.",
+    description: "Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only \u2014 settleNoFlag \u22652 (\u4E24\u8F6E\u771F\u5B9E\u8D25\u7EE9, \u65E0\u65D7 settle \u81EA\u52A8\u8BA1) \u6216 (ideaRound\u22652 \u4E14 settleNoFlag\u22651) \u6216 blocker \u5DF2\u88AB\u9A8C\u8BC1\u5175\u786E\u8BA4\u3002\u95F8\u5F00\u65F6 xiaochang_wait \u4F1A\u4E3B\u52A8\u63A8\u9001 hint-gate-open \u4E8B\u4EF6(\u4E0D\u5FC5\u53CD\u590D\u8BD5). The deduction is reported loudly.",
     parameters: { code: { type: "string", required: true } },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
@@ -2027,12 +2262,17 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
       const used = s.hintLedger.get(args.code)?.hints ?? 0;
       if (used >= s.maxHints) return "xiaochang_hint: hint cap reached";
       const vq = s.v2[args.code];
-      const ff = filteredFailedOf(args.code, campaign);
-      const noFlagSettles = s.orch.get(args.code)?.settleNoFlag ?? 0;
-      const gate = hintGate({ ideaRound: vq?.ideaRound ?? 1, filteredFailed: ff.failed + noFlagSettles });
+      const o = s.orch.get(args.code);
+      const gate = hintGateV2({
+        ideaRound: vq?.ideaRound ?? 1,
+        settleNoFlag: o?.settleNoFlag ?? 0,
+        blockerConfirmed: o?.blockerCheck === "confirmed"
+      });
       if (!gate.allowed) {
-        return `xiaochang_hint: \u62D2\u7EDD(hint \u6263\u8BE5\u9898\u5206\u503C, \u662F R2+\u5931\u8D25\u540E\u7684\u6700\u540E\u624B\u6BB5): ${gate.missing.join("; ")}\u3002\u5F53\u524D\u8BE5\u9898 hint \u5DF2\u7528 ${used}/${s.maxHints}\u3001\u5DF2\u6263 ${s.hintLedger.get(args.code)?.deducted ?? 0} \u5206\u3002`;
+        s.hintGateOpen.delete(args.code);
+        return `xiaochang_hint: \u62D2\u7EDD: ${gate.missing.join("; ")}\u3002\u5F53\u524D\u8BE5\u9898 hint \u5DF2\u7528 ${used}/${s.maxHints}\u3001\u5DF2\u6263 ${s.hintLedger.get(args.code)?.deducted ?? 0} \u5206\u3002\u95F8\u5F00\u540E xiaochang_wait \u4F1A\u4E3B\u52A8\u63A8\u9001, \u4E0D\u5FC5\u53CD\u590D\u8BD5\u3002`;
       }
+      s.hintGateOpen.delete(args.code);
       const ch = s.challenges.get(args.code);
       const raw = await s.adapter.hint(args.code);
       const hint = raw.hint;
@@ -2047,10 +2287,14 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
     description: "v8: put a CHALLENGE into the challenge queue with a directive package (\u601D\u8DEF\u5305). The queue is the single scheduler: when a slot is granted, the mechanism starts the container (if needed) and spawns the executor bound to it \u2014 no manual start/dispatch. Re-call to add more directives (untried ones are consumed at each grant) or to raise priority. Executors never wait for containers; challenges wait, zero tokens.",
     parameters: {
       code: { type: "string", required: true },
-      prompt: { type: "string", required: true, description: "The lean directive: the assigned approach/idea for this challenge (1-3 lines, \u2264700 chars). Do NOT paste the challenge description/addrs/board discipline \u2014 the frame injects those. Do NOT paste CVE/dictionary-style knowledge." },
+      prompt: { type: "string", required: true, description: "The directive: the assigned approach/idea for this challenge. v8.4: \u4F18\u5148\u5199\u4E2A\u6027\u5316\u5224\u65AD(\u65B9\u5411/\u4F18\u5148\u7EA7/\u9A8C\u8BC1\u70B9); \u516C\u5171\u77E5\u8BC6\u53EF\u4E0D\u8D34\u2014\u2014\u5BB6\u65CF\u6A21\u677F\u5E27\u5DF2\u7531\u673A\u5236\u6CE8\u5165. \u4E0A\u9650 4000 \u5B57\u7B26(\u8D85\u9650\u5168\u6587\u843D\u76D8, \u6267\u884C\u8005\u53EF\u8BFB\u5168\u6587, \u4E0D\u4E22\u4FE1\u606F)." },
       priority: { type: "number", description: "v8: explicit queue priority override (default = score density + never-dispatched boost)." },
       model: { type: "string", description: "Preferred executor model for this directive (falls back to default if invalid/unlisted)." },
       effort: { type: "string", description: "Reasoning effort for this directive." },
+      family: { type: "string", description: "v8.4: \u6218\u672F\u5BB6\u65CF\u8986\u76D6(rev-vm|rev-serial|rev-license|web-chain|web-console|ai-service|easy-harvest), \u7F3A\u7701\u6309\u9898\u9762\u81EA\u52A8\u5224\u5B9A; \u51B3\u5B9A\u6CE8\u5165\u6267\u884C\u8005\u5E27\u7684\u5BB6\u65CF\u6A21\u677F\u3002" },
+      pacing: { type: "array", description: 'v8.4: \u76EE\u6807\u4FA7\u8282\u594F\u7EA6\u675F(\u9650\u901F/\u5C01\u7981\u7C7B, \u6CE8\u5165\u4EE4\u6587\u786C\u7EA6\u675F), \u5982 ["ssh \u22642 \u6B21/10min(\u5931\u8D25\u5373\u5C01\u7981)"]\u3002' },
+      ideaIds: { type: "array", description: "v8.4: \u672C directive \u5F15\u7528\u7684\u91C7\u7EB3\u601D\u8DEF id \u5217\u8868(\u4ECE enqueue \u56DE\u663E/status \u7684\u672A\u6D88\u8D39\u601D\u8DEF\u6E05\u5355\u53D6); \u6D3E\u5175\u5373\u6807\u8BB0\u8BE5\u601D\u8DEF\u5DF2\u6D88\u8D39\u3002" },
+      persona: { type: "string", description: "v8.4: \u6267\u884C\u8005 persona \u5185\u8054\u8986\u76D6(\u7F3A\u7701\u7EE7\u627F\u90E8\u7F72\u7EA7; \u53EF\u7ED9\u6E17\u900F/\u9006\u5411\u4E13\u5BB6\u7C7B persona)\u3002" },
       round: { type: "number", description: "v8: ignored (kept for compatibility) \u2014 rounds are managed by the mechanism." },
       dependsOn: { type: "array", description: "v8: ignored (kept for compatibility)." },
       resourceClass: { type: "string", description: "v8: ignored (kept for compatibility) \u2014 class is auto by challenge type." }
@@ -2069,12 +2313,13 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
         syncKnowledgeFileFromLedger(args.code);
       } catch {
       }
-      const DIRECTIVE_MAX = 700;
+      const DIRECTIVE_MAX = 4e3;
       const trunc = truncateDirective(args.prompt, DIRECTIVE_MAX);
       let truncNotice = "";
       if (trunc.truncated) {
+        const fullPath = persistFullDirective(args.code, args.prompt);
         truncNotice = `
-\u26A0\uFE0F \u65B9\u5411\u6BB5\u622A\u65AD\u53CD\u9988: ${args.prompt.length}\u2192${DIRECTIVE_MAX} \u5B57\u7B26, \u622A\u70B9\u539F\u6587 "${trunc.cutTail}\u2026"\u3002\u88AB\u780D\u6389\u7684\u5185\u5BB9\u82E5\u662F\u5173\u952E\u9A8C\u8BC1\u70B9: \u2460\u7528 xiaochang_knowledge_put \u5199\u8FDB\u8BE5\u9898\u8D26\u672C\u2460/\u2462(\u6267\u884C\u8005\u5F00\u5DE5\u5FC5\u8BFB, \u4E0D\u5360 prompt), \u6216 \u2461\u518D enqueue \u4E00\u6761; \u82E5\u53EA\u662F CVE/\u53E3\u4EE4\u8BCD\u5178\u7C7B\u516C\u5171\u77E5\u8BC6, \u4E0D\u7528\u8865\u2014\u2014\u6267\u884C\u8005\u6A21\u578B\u81EA\u5E26\u3002`;
+\u26A0\uFE0F \u65B9\u5411\u6BB5\u5DF2\u622A\u65AD: ${args.prompt.length}\u2192${DIRECTIVE_MAX} \u5B57\u7B26\u3002\u5168\u6587\u5DF2\u843D\u76D8 ${fullPath}(\u6267\u884C\u8005 frame \u81EA\u52A8\u9644\u8DEF\u5F84, \u5F00\u5DE5\u53EF\u8BFB; \u65E0\u9700\u624B\u52A8\u642C\u8FD0)\u3002`;
       }
       const o = s.orch.get(args.code) ?? (() => {
         const n = newOrch(args.code, s.startedAt);
@@ -2084,8 +2329,16 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
       if (o.state === "solved" || o.state === "dead") {
         return `xiaochang_enqueue: \u62D2\u7EDD\u2014\u2014${args.code} \u5DF2${o.state === "solved" ? "\u89E3\u51FA" : "\u5224\u6B7B"}, \u4E0D\u518D\u5165\u961F`;
       }
-      o.directives.push({ text: trunc.text, model: args.model, effort: args.effort, tried: false });
+      o.directives.push({ text: trunc.text, model: args.model, effort: args.effort, persona: args.persona, tried: false });
       if (args.priority !== void 0) o.priorityOverride = args.priority;
+      if (args.family !== void 0 && args.family !== "") o.family = args.family;
+      if ((args.pacing?.length ?? 0) > 0) o.pacing = [...o.pacing ?? [], ...args.pacing];
+      let consumedNote = "";
+      if ((args.ideaIds?.length ?? 0) > 0) {
+        const n = markIdeasConsumed(args.code, args.ideaIds, trunc.text.slice(0, 60));
+        consumedNote = n > 0 ? `
+\u5DF2\u6807\u8BB0 ${n} \u6761\u91C7\u7EB3\u601D\u8DEF\u4E3A\u5DF2\u6D88\u8D39(\u672C directive \u5F15\u7528)\u3002` : "\n(ideaIds \u4E2D\u65E0\u53EF\u6807\u8BB0\u7684\u672A\u6D88\u8D39\u601D\u8DEF\u2014\u2014id \u53EF\u80FD\u5DF2\u6D88\u8D39\u6216\u4E0D\u5B58\u5728, \u65E0\u526F\u4F5C\u7528)";
+      }
       const memberCodes = [args.code, ...o.cluster];
       for (const c2 of memberCodes) {
         const mo = s.orch.get(c2);
@@ -2100,8 +2353,56 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
       bumpOrch(s);
       persistOrch(s);
       persistProgress(s);
-      audit(s.auditPath, { type: "v8-enqueue", code: args.code, directive: trunc.text.slice(0, 80), priority: args.priority });
-      return `enqueued ${args.code} (directives=${o.directives.length}, \u961F\u5217\u4F18\u5148\u7EA7=${priorityOf(o, ch.total_score, Date.now())}, \u72B6\u6001=${o.state}; \u6388\u4E88\u7531\u673A\u5236 tick \u6B66\u88C5, \u65E0\u9700\u624B\u52A8 dispatch)${truncNotice}`;
+      audit(s.auditPath, { type: "v8-enqueue", code: args.code, directive: trunc.text.slice(0, 80), priority: args.priority, family: o.family, pacing: o.pacing });
+      const familyNow = o.family ?? familyOf(ch.description ?? "", ch.difficulty);
+      const tplName = templateSections().has(familyNow) ? familyNow : "(\u65E0\u6A21\u677F)";
+      const ideas = unconsumedIdeas(args.code);
+      const ideaMenu = ideas.length > 0 ? `
+\u672A\u6D88\u8D39\u601D\u8DEF ${ideas.length} \u6761(enqueue \u65F6\u4F20 ideaIds \u5F15\u7528\u5373\u6D88\u8D39):
+${ideas.map((i) => `  #${i.id} ${i.text.slice(0, 90)}`).join("\n")}` : "\n\u672A\u6D88\u8D39\u601D\u8DEF: \u65E0";
+      const deads = knowledgeOfCode(args.code).filter((k) => k.kind === "dead-end");
+      const sealed = sealedClustersOf(deads);
+      const sealedTxt = sealed.length > 0 ? `
+\u26A0\uFE0F \u6B7B\u8DEF\u5C01\u5370\u7C07 ${sealed.length} \u4E2A(\u22653 \u6761\u540C\u5411, \u9A8C\u8BC1\u5175\u5DF2\u81EA\u52A8\u89E6\u53D1): ${sealed.map((x) => `${x.direction}\xD7${x.count}`).join(" | ")}` : "";
+      return `enqueued ${args.code} (directives=${o.directives.length}, \u961F\u5217\u4F18\u5148\u7EA7=${priorityOf(o, ch.total_score, Date.now())}, \u72B6\u6001=${o.state}; \u6388\u4E88\u7531\u673A\u5236 tick \u6B66\u88C5, \u65E0\u9700\u624B\u52A8 dispatch)
+\u5BB6\u65CF\u6A21\u677F\u5DF2\u6302: ${tplName}${ideaMenu}${sealedTxt}${consumedNote}${truncNotice}`;
+    }
+  }));
+  register(defineTool({
+    name: "xiaochang_idea_adopt",
+    description: "v8.4 (main agent): adopt fanout/collect ideas for a challenge. Each adopted idea is written into the challenge ledger \u2460 (executors read it at start) AND tracked in the idea inbox as unconsumed \u2014 it becomes consumed only when a later xiaochang_enqueue references its id via ideaIds (\u6D3E\u5175\u5373\u6D88\u8D39). The enqueue return value lists unconsumed ideas for point-and-dispatch.",
+    parameters: {
+      code: { type: "string", required: true },
+      ideas: { type: "array", required: true, description: "[{id, text}] \u2014 id \u53EF\u7528\u4EFB\u610F\u77ED\u6807\u7B7E(\u5982 r2-1); \u91CD\u590D id \u5E42\u7B49\u8986\u76D6\u3002" }
+    },
+    output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args, exec) {
+      if (parentAgent !== void 0 && exec.agent !== parentAgent) {
+        return "xiaochang_idea_adopt: \u62D2\u7EDD\u2014\u2014\u91C7\u7EB3\u662F\u4E3B agent \u4E13\u5C5E(\u5355\u8C03\u5EA6\u5668)";
+      }
+      const s = requireState();
+      if (s.challenges.get(args.code) === void 0) return `xiaochang_idea_adopt: unknown challenge ${args.code}`;
+      const now = Date.now();
+      const existing = new Map(readIdeas(args.code).map((e) => [e.id, e]));
+      const fresh = [];
+      for (const idea of args.ideas) {
+        const id = `${args.code}-${idea.id}`.slice(0, 64);
+        const prev = existing.get(id);
+        if (prev !== void 0) continue;
+        fresh.push({ id, text: idea.text, status: "unconsumed", adoptedAt: now });
+        existing.set(id, fresh[fresh.length - 1]);
+      }
+      if (fresh.length > 0) {
+        writeIdeas(args.code, fresh);
+        try {
+          appendKnowledgeFile(args.code, "skeleton", fresh.map((e) => `\u601D\u8DEF#${e.id.split("-").pop()}: ${e.text.slice(0, 200)} (\u672A\u6D88\u8D39)`));
+        } catch {
+        }
+      }
+      const unconsumed = unconsumedIdeas(args.code);
+      const menu = unconsumed.map((e) => "  #" + e.id + " " + e.text.slice(0, 90)).join(" / ");
+      return args.code + " \u91C7\u7EB3 " + fresh.length + " \u6761(\u5171 " + unconsumed.length + " \u6761\u672A\u6D88\u8D39)\u3002\u6D3E\u5175\u65F6 enqueue \u4F20 ideaIds=[...] \u5373\u6807\u8BB0\u6D88\u8D39: " + menu;
     }
   }));
   register(defineTool({
@@ -2182,7 +2483,7 @@ ${detail.slice(0, 6e3)}`);
       code: { type: "string", required: true },
       verdict: { type: "string", required: true, description: "complete | failed | skipped | continue | rotate" },
       reason: { type: "string", description: "Short reason (logged)." },
-      deadEnds: { type: "array", description: "[{path, conclusion, evidence}] proven-infeasible paths." },
+      deadEnds: { type: "array", description: "[{path, conclusion, evidence, testedVariants}] proven-infeasible paths. v8.4: \u9644\u5B9E\u6D4B\u53D8\u4F53\u6E05\u5355(\u7ED3\u8BBA\u5E26\u8FC7\u7A0B, \u7FFB\u6848\u5175\u6309\u6E05\u5355\u5916\u53D8\u4F53\u590D\u6838)." },
       forks: { type: "array", description: "[{path, conclusion, evidence}] untaken branches worth dispatching." },
       observations: { type: "array", description: "[{path, conclusion}] facts learned." },
       why: { type: "string", description: "v2 \u5F52\u56E0(failed \u65F6\u5FC5\u586B): model-weak | approach-dead-end | context-insufficient | platform-issue. \u4E24\u7EA7\u5224\u5B9A: \u6267\u884C\u8005\u62A5\u544A\u63D0\u8BAE, \u4F60\u7EC8\u88C1." },
@@ -2215,15 +2516,15 @@ ${detail.slice(0, 6e3)}`);
         jisi.settleAdoptions?.(args.code, win, why);
       }
       const entries = [
-        ...(args.deadEnds ?? []).map((e) => ({ kind: "dead-end", path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: "report", at: Date.now() })),
-        ...(args.forks ?? []).map((e) => ({ kind: "fork", path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: "report", at: Date.now() })),
-        ...(args.observations ?? []).map((e) => ({ kind: "observation", path: e.path, conclusion: e.conclusion, by: "report", at: Date.now() }))
+        ...(args.deadEnds ?? []).map((e) => ({ kind: "dead-end", path: e.path, conclusion: e.conclusion, evidence: e.evidence, testedVariants: e.testedVariants, by: "main-agent", at: Date.now() })),
+        ...(args.forks ?? []).map((e) => ({ kind: "fork", path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: "main-agent", at: Date.now() })),
+        ...(args.observations ?? []).map((e) => ({ kind: "observation", path: e.path, conclusion: e.conclusion, by: "main-agent", at: Date.now() }))
       ];
       try {
         if (entries.length > 0) recordKnowledgeOnCode(args.code, entries);
       } catch {
       }
-      const line = (e) => `${e.path}${e.conclusion !== void 0 ? " \u2192 " + e.conclusion : ""}${e.evidence !== void 0 ? " (\u8BC1\u636E: " + e.evidence + ")" : ""}`;
+      const line = (e) => `${e.path}${e.conclusion !== void 0 ? " \u2192 " + e.conclusion : ""}${e.evidence !== void 0 ? " (\u8BC1\u636E: " + e.evidence + ")" : ""}${(e.testedVariants?.length ?? 0) > 0 ? ` [\u5DF2\u8BD5: ${e.testedVariants.join("; ").slice(0, 300)}]` : ""} [by main-agent]`;
       try {
         if ((args.deadEnds?.length ?? 0) > 0) appendKnowledgeFile(args.code, "dead", args.deadEnds.map(line));
         if ((args.gaps?.length ?? 0) > 0) appendKnowledgeFile(args.code, "dead", args.gaps.map((g) => `\u7F3A\u53E3: ${g}`));
@@ -2390,18 +2691,18 @@ ${prompt}`;
     description: `F33 fork alarm: you (executor) report branches with an explicit status \u2014 "untaken" (default): promising branch not taken, worth dispatching (goes to ledger \u2463 + the fork inbox; the main agent is woken by xiaochang_wait polling the inbox \u2014 NO direct interrupt, forks are collected in the main agent's normal rhythm); "dead-end": a path you PROVED infeasible (403/impossible/verified-fail) \u2014 archived silently to ledger \u2461 only, no inbox, no wake, no dispatch impulse. v7.1: untaken forks of already-terminal challenges are archived silently. v7.4: duplicate paths already in the inbox are skipped at the source.`,
     parameters: {
       code: { type: "string", required: true },
-      forks: { type: "array", required: true, description: '[{path, conclusion, evidence, status}] \u2014 status: "untaken" (default, \u672A\u8D70\u5206\u53C9\u2192\u2463+\u4FE1\u7BB1, \u4E3B agent \u7ECF xiaochang_wait \u5524\u9192) | "dead-end" (\u5DF2\u8BC1\u6B7B\u8DEF\u2192\u53EA\u8FDB\u2461, \u4E0D\u5524\u9192\u4E0D\u6D3E\u5175).' }
+      forks: { type: "array", required: true, description: '[{path, conclusion, evidence, status, testedVariants}] \u2014 status: "untaken" (default, \u672A\u8D70\u5206\u53C9\u2192\u2463+\u4FE1\u7BB1, \u4E3B agent \u7ECF xiaochang_wait \u5524\u9192) | "dead-end" (\u5DF2\u8BC1\u6B7B\u8DEF\u2192\u53EA\u8FDB\u2461, \u4E0D\u5524\u9192\u4E0D\u6D3E\u5175). v8.4: dead-end \u5FC5\u987B\u9644 testedVariants(\u5B9E\u6D4B\u53D8\u4F53\u6E05\u5355)\u2014\u2014\u7ED3\u8BBA\u5E26\u8FC7\u7A0B, \u4F9B\u7FFB\u6848\u5175\u6309\u6E05\u5355\u5916\u53D8\u4F53\u590D\u6838.' }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => true,
     async execute(args) {
       if (args.forks.length === 0) return "xiaochang_fork: no forks given";
-      const fmt = (f) => `${f.path}${f.conclusion !== void 0 ? " \u2192 " + f.conclusion : ""}${f.evidence !== void 0 ? " (\u8BC1\u636E: " + f.evidence + ")" : ""}`;
+      const fmt = (f) => gradedLine({ kind: "dead-end", path: f.path, conclusion: f.conclusion, evidence: f.evidence, testedVariants: f.testedVariants, by: "fork", at: Date.now() });
       const deadEnds = args.forks.filter((f) => f.status === "dead-end");
       const untaken = args.forks.filter((f) => f.status !== "dead-end");
-      const deadLines = deadEnds.map(fmt);
+      const deadLines = deadEnds.map((f) => `${f.path}${f.conclusion !== void 0 ? " \u2192 " + f.conclusion : ""}${f.evidence !== void 0 ? " (\u8BC1\u636E: " + f.evidence + ")" : ""}${(f.testedVariants?.length ?? 0) > 0 ? ` [\u5DF2\u8BD5: ${f.testedVariants.join("; ").slice(0, 300)}]` : ""}`);
       if (deadEnds.length > 0) {
-        const de = deadEnds.map((f) => ({ kind: "dead-end", path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: "fork", at: Date.now() }));
+        const de = deadEnds.map((f) => ({ kind: "dead-end", path: f.path, conclusion: f.conclusion, evidence: f.evidence, testedVariants: f.testedVariants, by: "fork", at: Date.now() }));
         try {
           recordKnowledgeOnCode(args.code, de);
         } catch {
@@ -2681,6 +2982,23 @@ ${escLines.join("\n")}` : "";
         })()}`,
         `openContainers(\u5E73\u53F0\u89C6\u89D2, \u5F02\u6B65\u66F4\u65B0\u4F1A\u6EDE\u540E; \u69FD\u771F\u76F8\u4EE5 containerQueue \u884C\u4E3A\u51C6)=${[...openContainers(s)].join(",") || "none"}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
+        `hint\u95F8\u5DF2\u5F00(\u53EF\u53D6): ${[...s.hintGateOpen].sort().join(",") || "\u65E0"}`,
+        `\u672A\u6D88\u8D39\u601D\u8DEF: ${(() => {
+          const rows = [];
+          for (const code of s.orch.keys()) {
+            const ideas = unconsumedIdeas(code);
+            if (ideas.length > 0) rows.push(`${code}\xD7${ideas.length}`);
+          }
+          return rows.length > 0 ? rows.join(" ") : "\u65E0";
+        })()}`,
+        `\u6B7B\u8DEF\u5C01\u5370\u7C07(\u22653 \u540C\u5411, \u9A8C\u8BC1\u5175\u81EA\u52A8\u89E6\u53D1): ${(() => {
+          const rows = [];
+          for (const code of s.orch.keys()) {
+            const sealed = sealedClustersOf(knowledgeOfCode(code).filter((k) => k.kind === "dead-end"));
+            if (sealed.length > 0) rows.push(`${code}:${sealed.map((x) => `${x.direction}\xD7${x.count}`).join("|")}`);
+          }
+          return rows.length > 0 ? rows.join(" ") : "\u65E0";
+        })()}`,
         `\u5F85\u88C1\u51B3(${s.pendingAdj.length}):
 ${pendingTxt}`,
         `\u672A\u7834\u9898(\u5168\u91CF\xB7\u98CE\u9669\u6392\u5E8F): ${unsolvedTxt}`,
@@ -2800,6 +3118,39 @@ ${pendingTxt}`,
           }
           if (evaluateInbox(codeFilter)) done("xiaochang_wait: fork inbox changed \u2014 read xiaochang_graph and dispatch the untaken branches");
         }, 2e3);
+        const fanInboxSnap = () => {
+          try {
+            const dir = fanoutInboxDir();
+            if (!existsSync(dir)) return "";
+            const files = codeFilter !== void 0 ? readdirSync2(dir).filter((f) => f.endsWith(".jsonl") && f.replace(/\.jsonl$/, "") === codeFilter) : readdirSync2(dir).filter((f) => f.endsWith(".jsonl"));
+            return files.map((f) => {
+              const st = statSync2(join2(dir, f));
+              return `${f}:${st.mtimeMs}:${st.size}`;
+            }).join("|");
+          } catch {
+            return "";
+          }
+        };
+        let fanBefore = fanInboxSnap();
+        const fiv = setInterval(() => {
+          if (state === void 0) return;
+          const nowSnap = fanInboxSnap();
+          if (nowSnap !== fanBefore) {
+            fanBefore = nowSnap;
+            done("xiaochang_wait: \u601D\u8DEF\u5DF2\u56DE(fanout \u62A5\u544A\u5230\u8FBE)\u2014\u2014\u8BFB xiaochang_collect \u88C1\u51B3\u91C7\u7EB3; \u91C7\u7EB3\u5373\u81EA\u52A8\u843D\u76D8\u8D26\u672C\u2460(\u672A\u6D88\u8D39), enqueue \u4F20 ideaIds \u6D3E\u5175\u5373\u6D88\u8D39");
+          }
+        }, 2e3);
+        let gateBefore = [...state?.hintGateOpen ?? []].sort().join(",");
+        const giv = setInterval(() => {
+          if (state === void 0) return;
+          const nowSet = [...state.hintGateOpen].sort().join(",");
+          if (nowSet !== gateBefore) {
+            gateBefore = nowSet;
+            if (codeFilter !== void 0 && !state.hintGateOpen.has(codeFilter)) return;
+            const opened = codeFilter !== void 0 ? codeFilter : nowSet;
+            if (opened !== "") done(`xiaochang_wait: hint \u95F8\u5DF2\u5F00(${opened})\u2014\u2014\u73B0\u5728\u53EF\u53D6 xiaochang_hint`);
+          }
+        }, 2e3);
         const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1e3)}s, no event`), timeoutMs);
         cleanup = () => {
           unsub();
@@ -2808,6 +3159,8 @@ ${pendingTxt}`,
           clearInterval(fgv);
           clearInterval(sv);
           clearInterval(fv);
+          clearInterval(fiv);
+          clearInterval(giv);
           clearTimeout(to);
         };
         if (state !== void 0 && evaluateInbox(codeFilter)) {

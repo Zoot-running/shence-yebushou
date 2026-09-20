@@ -22,6 +22,13 @@ import {
   resolveExecutor,
   resourceClassOf,
   roundOf,
+  familyOf,
+  hintGateV2,
+  sealedClustersOf,
+  parseHandoffForks,
+  gradedLine,
+  TEMPLATE_LIBRARY,
+  templateOf,
 } from '../src/orchestrator.ts'
 
 describe('cleanRoomGate', () => {
@@ -268,5 +275,91 @@ describe('v7.8 开局饱和 helpers', () => {
     const c = attachmentFetchCandidates('g-25')
     expect(c.some(p => p.includes('g-25') || p.includes('g25'))).toBe(true)
     expect(c).toContain('/download')
+  })
+})
+
+// ── v8.4 纯函数 ─────────────────────────────────────────────────────
+describe('v8.4 familyOf 家族判定', () => {
+  it('rev·VM/字节码', () => {
+    expect(familyOf('某嵌入式设备厂商自研了一套内部执行机制来承载访问码校验')).toBe('rev-vm')
+    expect(familyOf('bytecode vm')).toBe('rev-vm')
+  })
+  it('rev·序列号 / 授权客户端', () => {
+    expect(familyOf('固件序列号校验器')).toBe('rev-serial')
+    expect(familyOf('跨平台授权客户端')).toBe('rev-license')
+  })
+  it('web·多跳链 / 单机管理台 / ai·推理 / easy 收割', () => {
+    expect(familyOf('某大型企业遭遇APT攻击, 官网入口, 内网横向, 泛微OA')).toBe('web-chain')
+    expect(familyOf('企业级 Serverless 云函数管理控制台, 认证网关迁移')).toBe('web-console')
+    expect(familyOf('请对目标AI推理服务')).toBe('ai-service')
+    expect(familyOf('公司内部系统', 'easy')).toBe('easy-harvest')
+  })
+})
+
+describe('v8.4 hintGateV2 客观判死闸', () => {
+  it('settleNoFlag≥2 → 直接放行(不等 R2)', () => {
+    expect(hintGateV2({ ideaRound: 1, settleNoFlag: 2, blockerConfirmed: false }).allowed).toBe(true)
+  })
+  it('ideaRound≥2 且 settleNoFlag≥1 → 放行', () => {
+    expect(hintGateV2({ ideaRound: 2, settleNoFlag: 1, blockerConfirmed: false }).allowed).toBe(true)
+  })
+  it('blocker 被验证兵确认 → 放行', () => {
+    expect(hintGateV2({ ideaRound: 1, settleNoFlag: 0, blockerConfirmed: true }).allowed).toBe(true)
+  })
+  it('零败绩 → 拒绝并给出缺项', () => {
+    const g = hintGateV2({ ideaRound: 1, settleNoFlag: 0, blockerConfirmed: false })
+    expect(g.allowed).toBe(false)
+    expect(g.missing.length).toBe(2)
+  })
+})
+
+describe('v8.4 sealedClustersOf 死路封印簇', () => {
+  it('同方向 ≥3 条 → 成簇', () => {
+    const clusters = sealedClustersOf([
+      { path: '网关身份头: X-Auth-User' },
+      { path: '网关身份头: X-Remote-User' },
+      { path: '网关身份头: X-Forwarded-User' },
+      { path: 'JWT alg=none' },
+    ])
+    expect(clusters).toEqual([{ direction: '网关身份头', count: 3 }])
+  })
+  it('不足 3 条不成簇', () => {
+    expect(sealedClustersOf([{ path: 'A: 1' }, { path: 'A: 2' }, { path: 'B: 1' }])).toEqual([])
+  })
+})
+
+describe('v8.4 parseHandoffForks 交接未竟动作', () => {
+  it('抽取未竟/下一步行', () => {
+    const text = '结论: 未破。\n- 未竟动作: 读 /root/credentials.zip\n- 下一步: 慢节奏试 fileserver SSH\n常规行不抽'
+    const forks = parseHandoffForks(text)
+    expect(forks.length).toBe(2)
+    expect(forks[0]!.conclusion).toContain('credentials.zip')
+    expect(forks[1]!.conclusion).toContain('fileserver SSH')
+  })
+})
+
+describe('v8.4 gradedLine 分级账本行', () => {
+  it('结论带过程(已试清单+来源)', () => {
+    const line = gradedLine({
+      kind: 'dead-end', path: '字段名保留点号', conclusion: '任何 Content-Type 都无法存活',
+      testedVariants: ['urlencoded 点号', 'multipart 点号'], by: 'exec#s1-w1', at: 0,
+    })
+    expect(line).toContain('[已试: urlencoded 点号; multipart 点号]')
+    expect(line).toContain('[by exec#s1-w1')
+  })
+})
+
+describe('v8.4 模板库', () => {
+  it('七族齐全且内容非空', () => {
+    const fams = TEMPLATE_LIBRARY.map(t => t.family)
+    expect(fams).toEqual(['rev-vm', 'rev-serial', 'rev-license', 'web-chain', 'web-console', 'ai-service', 'easy-harvest'])
+    for (const t of TEMPLATE_LIBRARY) {
+      expect(t.tactics.length).toBeGreaterThan(100)
+      expect(t.traps.length).toBeGreaterThan(20)
+    }
+  })
+  it('templateOf 查表', () => {
+    expect(templateOf('rev-vm')?.name).toContain('VM')
+    expect(templateOf('nope')).toBeUndefined()
   })
 })

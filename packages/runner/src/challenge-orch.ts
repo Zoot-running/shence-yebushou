@@ -29,6 +29,8 @@ export interface Directive {
   text: string
   model?: string
   effort?: string
+  /** v8.4: 执行者 persona 内联覆盖(缺省继承部署级)。 */
+  persona?: string
   tried: boolean
 }
 
@@ -66,6 +68,10 @@ export interface ChallengeOrch {
   blockerCheck: 'none' | 'in-flight' | 'confirmed' | 'refuted'
   /** v8.3c 同靶场簇: 与本码共享容器实例的兄弟题码(不含自身); 簇内同态结算。 */
   cluster: string[]
+  /** v8.4 战术家族(模板帧注入用): 主 agent enqueue 可显式指定, 缺省由题面自动判定。 */
+  family?: string
+  /** v8.4 目标侧节奏约束(限速/封禁类, 注入令文): 如 "ssh ≤2 次/10min"。 */
+  pacing?: string[]
   /** 上次 settle 结论指纹（同结论检测）。 */
   lastSettleFingerprint?: string
   snapshot?: ProgressSnapshot

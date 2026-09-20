@@ -394,3 +394,162 @@ export function attachmentFetchCandidates(code: string): string[] {
     `/download/${code}`, `/download`, `/files/`, `/`,
   ]
 }
+
+// ── v8.4: 战术模板库 + 家族判定(模板帧注入) ──────────────────────────
+
+export interface FamilyTemplate {
+  family: string
+  name: string
+  /** 成本递增打法(注入 executor frame, 与主 agent directive 并列)。 */
+  tactics: string
+  /** 判据: 每步"命中才算数"。 */
+  criteria: string
+  /** 本家族已知过早闭合陷阱(20390 实锤案例)。 */
+  traps: string
+}
+
+/** 七族模板(v8.4 初稿; 来源 18728 令文打法 + 20390 教训, 见 DESIGN/XIAOCHANG-V8-战术模板库.md)。 */
+export const TEMPLATE_LIBRARY: readonly FamilyTemplate[] = [
+  {
+    family: 'rev-vm',
+    name: 'rev·自研VM/字节码保护',
+    tactics: '优先绕开 VM, 别一上来全解: ①strings/熵值找明文凭据, 定位 bytecode blob(高熵非代码区); ②宿主层绕过(最高杠杆)——LD_PRELOAD hook printf/puts/write/send 直取凭据, 或 patch VM 校验返回值恒"通过", 自解密型 hook mprotect/mmap dump 运行时内存; ③比较 opcode handler 直读两寄存器(一边常是常量口令); ④兜底才提 opcode 语义表写 lift 脚本。',
+    criteria: 'hook 输出里出现 FLAG{/flag{ 才算命中; patch 后任意输入通过且输出变化。',
+    traps: 'disasm 里 putc 打字面量 "."、load 被共享尾丢弃 ≠ "坏构建诱饵"——先按预期语义重解释(操作数归属、putc 该打 acc)再判诱饵;"纯诱饵构建"结论必须附已试语义组合清单。',
+  },
+  {
+    family: 'rev-serial',
+    name: 'rev·序列号/校验器',
+    tactics: '①strings 拿 invalid/denied/granted 串 → 反推输入-校验-输出链; ②LD_PRELOAD hook sscanf/atoi/strcmp/memcmp/puts/printf/write 打印两侧参数(最高杠杆, 一次运行拿期望 SN 与凭据); ③SN 公式反变换(前缀+分段+校验位, 求和取模/CRC 写 Python); ④objdump 搜 movabs/cmp $imm 常量序列拼期望值; ⑤patch 失败分支恒真。',
+    criteria: 'hook 打印的期望值代入原程序必须输出 granted/凭据。',
+    traps: '沙箱无 gdb——不要写 gdb 断点方案(20390 f2-07 令文犯过)。',
+  },
+  {
+    family: 'rev-license',
+    name: 'rev·授权客户端/跨平台',
+    tactics: '①先判技术栈(成本差 10 倍): file+strings 分流——.NET(mscoree)→strings 捞 IL 常量; Java(PK..)→zipfile 解 jar; Electron(app.asar)→手解 asar 读 JS 明文; Go(Go build ID)→pclntab。②原生 ELF → LD_PRELOAD hook strcmp/memcmp/sscanf/atoi 打印参数, 或恒返回 0 放行。③license→密钥派生: 找 KDF 常数(PBKDF2/SHA-256 IV/AES S-box)pycryptodome 离线重算。④patch 凭据输出函数为无条件执行。',
+    criteria: '重放/打补丁后输出与原样逐字节一致。',
+    traps: '先花 10 分钟扫工件预置(license/credential 文件、env、README)——有些题逆向只是烟雾。',
+  },
+  {
+    family: 'web-chain',
+    name: 'web·多跳AP链(多旗等权)',
+    tactics: '广度优先(等权旗先扫浅层, 每得一旗立即报): ①外网打点 nmap 全端口+指纹+dirsearch 大字典+robots/www.zip/.git/.bak/.sql/前端 JS 注释, 老组件 nday; ②旗1 优先"读文件"类(file/path/id/name 参数、....// 绕过单次 ../ 替换、绝对路径 /challenge/flag*.txt)、备份泄露、弱口令、未授权接口、SQLi; ③shell 后固定侦察: find -iname "*flag*"、grep -rIl "flag{" /var/www /tmp /home /opt、env、/proc/1/environ、/etc/hosts、ip a、ss -lntup; ④内网踩点文件优先: /etc/hosts、~/.ssh/{known_hosts,config}、~/.bash_history、nginx upstream、docker-compose.yml; ⑤建代理(必做): chisel/ligolo-ng/frp/socat 或复用 SSRF/LFI 通道; ⑥内网高频点: Redis 6379 未授权写 authorized_keys/crontab > MySQL 弱口令+secure_file_priv 空写 webshell > Tomcat manager war > SMB/NFS > Jenkins; ⑦核心机密: /data、/opt/secret、DB dump grep flag、跨机分片拼接、响应头/cookie/JWT/log 全查。',
+    criteria: '每旗原文+出处双记录; 限速类目标记录封禁行为并遵守节奏约束。',
+    traps: '限速/封禁目标的 pacing 是硬约束(看令文节奏约束段), 勿大爆破烧通道; 题面点名的产品名(如泛微OA)要进词表构造。',
+  },
+  {
+    family: 'web-console',
+    name: 'web·单机管理台/网关',
+    tactics: '①读容器内源码/前端 JS bundle(内联 VITE_*/NEXT_PUBLIC_* 常直接给 token); ②网关/身份层绕过清单(路径规范化变体表、身份头注入表、新旧路由差集); ③JWT 全家(alg=none、RS256→HS256、kid 穿越、弱密钥、旧 token 重放); ④参数名/编码机制边界(含未闭合方括号类变体); ⑤运行时能力矩阵(env/沙箱函数/proc/出网/legacy runtime 差分)。',
+    criteria: '身份注入必须"401→200 且 body 随注入值变化"才算命中(防假阳性)。',
+    traps: '字段名/编码类"任何 X 都无法存活"的封印结论必须附实测变体清单(20390 a-18 实锤: php[code.execute 未闭合方括号)。',
+  },
+  {
+    family: 'ai-service',
+    name: 'ai·推理服务',
+    tactics: '①零成本指纹到版本(11434 Ollama /api/version、8000 vLLM /v1/models、Triton /v2/health、8265 Ray /api/jobs/、8080-8082 TorchServe /ping、7860 Gradio、5000 MLflow、8888 Jupyter; openapi.json+Server 头+/metrics 交叉); ②CVE 对号: Ray CVE-2023-48022 未授权提交 job、Ollama /api/pull 路径穿越写 ld.so.preload(<0.1.47)、TorchServe CVE-2023-43654 url SSRF 加载 .mar、MLflow 反序列化; ③优先任意文件读(Gradio /file=、Ollama /api/create FROM /challenge/flag.txt)而非 RCE。',
+    criteria: '文件读先 /etc/passwd 打通基线再读旗。',
+    traps: '服务 down 不代表题死——先重试/换入口并留证, 别陷入等待轮询。',
+  },
+  {
+    family: 'easy-harvest',
+    name: 'easy·收割',
+    tactics: '串行清题 + 单题 15 分钟时间盒, 无进展记死路跳下一题。默认凭据/CVE 速查: Langflow /api/v1/validate/code、Dify /console/api/setup 劫持、Open WebUI 首注册即管理员、Neo4j neo4j/neo4j 或未授权 tx/commit、Gremlin 8182 Groovy Runtime.exec、HugeGraph CVE-2024-27348、n8n /rest/owner/setup 接管、若依 admin/admin123、Nacos nacos/nacos、Jenkins/Grafana admin/admin、Shiro rememberMe、Actuator /env+/heapdump、JimuReport 未授权 SSTI、SSH 弱口令小字典。',
+    criteria: 'flag 原文+出处; 15 分钟计时从容器就绪起算。',
+    traps: '不要恋战; 每应用类型只试一次默认凭据表, 失败即记死路换下一题。',
+  },
+]
+
+/** 家族自动判定(题面关键词, 主 agent enqueue 可用 family 覆盖)。 */
+export function familyOf(description: string, difficulty?: string): string {
+  const d = description ?? ''
+  const dl = difficulty ?? ''
+  if (/(自研.*(VM|执行机制|字节码)|bytecode|虚拟(机|指令)|解释器)/i.test(d)) return 'rev-vm'
+  if (/(序列号|serial|校验器|固件.*(校验|授权))/i.test(d)) return 'rev-serial'
+  if (/(授权(客户端|逻辑)|license|许可证|跨平台.*(客户端|授权))/i.test(d)) return 'rev-license'
+  if (/(OA|官网|内网|横向|APT|多阶段|旗链|渗透测试.*(企业|公司)|核心业务)/i.test(d)) return 'web-chain'
+  if (/(管理(控制台|平台|系统)|网关|Serverless|云函数|迁移)/i.test(d)) return 'web-console'
+  if (/(AI|推理|模型|Ollama|vLLM|Triton|TorchServe|Ray|Gradio|MLflow|Jupyter|智能)/i.test(d)) return 'ai-service'
+  if (dl === 'easy' || /(公司内部|内部系统|请对目标)/i.test(d)) return 'easy-harvest'
+  return 'web-console'
+}
+
+export function templateOf(family?: string): FamilyTemplate | undefined {
+  if (family === undefined) return undefined
+  return TEMPLATE_LIBRARY.find(t => t.family === family)
+}
+
+// ── v8.4: hint 闸 v2(客观判死 + 主动开闸) ────────────────────────────
+
+/**
+ * v8.4 hint 放行条件(客观信号, 不读执行者自述措辞):
+ *  - 真实败绩 = settleNoFlag ≥ 1(无旗 settle 一律计, blocker 措辞不豁免)且 ideaRound ≥ 2;
+ *  - 或者 blocker 已被验证兵确认(题侧问题坐实, 直接放行);
+ *  - 或者 settleNoFlag ≥ 2(两轮真实败绩, 不再等 R2——防 R2 管道自身卡死)。
+ */
+export function hintGateV2(input: { ideaRound: number; settleNoFlag: number; blockerConfirmed: boolean }): { allowed: boolean; missing: string[] } {
+  const missing: string[] = []
+  if (input.blockerConfirmed) return { allowed: true, missing: [] }
+  if (input.settleNoFlag >= 2) return { allowed: true, missing: [] }
+  if (input.ideaRound < 2) missing.push(`R2 二次征集未走(当前第 ${input.ideaRound} 轮)——先 xiaochang_refanout 加模型再打一轮`)
+  if (input.settleNoFlag < 1) missing.push('该题尚无真实败绩(无旗 settle ≥1 自动计)——先派执行者打一轮')
+  return { allowed: missing.length === 0, missing }
+}
+
+// ── v8.4: 死路封印簇检测(翻案兵触发) ─────────────────────────────────
+
+/** 死路方向 = path 首段(冒号/箭头前), 归一化。 */
+export function directionOf(path: string): string {
+  const m = /^([^:→]+?)(?:[:：]|→|$)/.exec(path.trim())
+  return (m?.[1] ?? path).trim().slice(0, 40)
+}
+
+/** 同方向 ≥N 条 dead-end 的封印簇。 */
+export function sealedClustersOf(deadEnds: Array<{ path: string }>, n = 3): Array<{ direction: string; count: number }> {
+  const byDir = new Map<string, number>()
+  for (const e of deadEnds) {
+    const dir = directionOf(e.path)
+    byDir.set(dir, (byDir.get(dir) ?? 0) + 1)
+  }
+  return [...byDir.entries()].filter(([, count]) => count >= n).map(([direction, count]) => ({ direction, count })).sort((a, b) => b.count - a.count)
+}
+
+// ── v8.4: settle 交接"未竟动作"解析(转未走分叉) ───────────────────────
+
+/** 从 settle 终态文本抽取"交接/未竟/下一步"类行, 转成 fork 条目(避免换人/换实例丢临门一脚)。 */
+export function parseHandoffForks(detail: string): Array<{ path: string; conclusion: string }> {
+  const out: Array<{ path: string; conclusion: string }> = []
+  const re = /^(?:[-*•]|\d+[.)])\s*(?:未竟|未完成|待办|下一步|交接|留待|继续要|还没|尚未)(?:动作|事项|:)?\s*(.{6,200})$/gm
+  for (const m of detail.matchAll(re)) {
+    const line = m[1]!.trim()
+    if (line.length === 0 || /^$/.test(line)) continue
+    out.push({ path: `交接未竟: ${line.slice(0, 60)}`, conclusion: line })
+  }
+  return out.slice(0, 5)
+}
+
+// ── v8.4: 账本分级条目行(provenance + testedVariants 内联) ────────────
+
+export interface GradedKnowledge {
+  kind: 'observation' | 'conclusion' | 'dead-end' | 'fork' | 'flag-path'
+  path: string
+  conclusion?: string
+  evidence?: string
+  testedVariants?: string[]
+  by: string
+  at: number
+  /** 同向封印者(死路簇成员, 供翻案兵复核)。 */
+  sealedBy?: string[]
+}
+
+/** 分级条目 → 账本行(测试清单与来源内联, 保证"结论带过程")。 */
+export function gradedLine(e: GradedKnowledge): string {
+  const parts = [e.path]
+  if (e.conclusion !== undefined && e.conclusion !== '') parts.push(` → ${e.conclusion}`)
+  if (e.evidence !== undefined && e.evidence !== '') parts.push(` (证据: ${e.evidence.slice(0, 300)})`)
+  if (e.testedVariants !== undefined && e.testedVariants.length > 0) parts.push(` [已试: ${e.testedVariants.join('; ').slice(0, 300)}]`)
+  if (e.sealedBy !== undefined && e.sealedBy.length > 0) parts.push(` [同向封印×${e.sealedBy.length}]`)
+  parts.push(` [by ${e.by} ${new Date(e.at).toISOString().slice(11, 19)}Z]`)
+  return `- ${parts.join('')}`
+}

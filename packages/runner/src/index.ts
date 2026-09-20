@@ -25,16 +25,24 @@ import {
   cleanRoomGate,
   codeOf,
   dedupeForkPaths,
-  hintGate,
+  familyOf,
+  gradedLine,
+  hintGateV2,
   knowledgeSkeleton,
+  parseHandoffForks,
   parseObservations,
   replaceKnowledgeSection,
   resolveExecutor,
   resourceClassOf,
   roundOf,
+  sealedClustersOf,
   sweepLegacyWorkdir,
+  templateOf,
+  TEMPLATE_LIBRARY,
   truncateDirective,
   type ExecutorPolicy,
+  type FamilyTemplate,
+  type GradedKnowledge,
   type KnowledgeSection,
 } from './orchestrator.ts'
 import {
@@ -158,7 +166,8 @@ interface JisiLike {
   adoptionStats?(code: string): { adopted: number; dead: number }
   /** v6: 停止规则裁决(序贯弃权)。 */
   judge?(input: { troops: number; filteredFailed: number; noProgressMin: number; difficulty: number; coverageRatio: number; remainingPoints: number; modelExhaustion: number; r2Count: number }): { action: 'continue' | 'escalate' | 'judge-dead'; reasons: string[] }
-
+  /** v8.4: 设预算截止墙钟(ms)——集思末段禁新 fanout 的门。 */
+  setDeadline?(deadlineTs: number): void
 }
 
 interface SetupArgs {
@@ -283,6 +292,10 @@ interface CampaignState {
   tickCount: number
   /** v8.3 计分表: code → 该题已得累计分(submit 回执 cumulative_score, 平台单题语义; 求和=run 总分)。 */
   scoreTable: Record<string, number>
+  /** v8.4: hint 闸已开待取的题码(wait 主动推送; 主 agent 取 hint 后移除)。 */
+  hintGateOpen: Set<string>
+  /** v8.4: 验证兵自动触发去重(题码 → 已触发次数)。 */
+  verifierDispatched: Map<string, number>
 }
 
 let state: CampaignState | undefined
@@ -448,7 +461,7 @@ export function apply(ctx: Context): void {
   }
 
   // ── F33 知识账本 helpers（apply 闭包内——campaign/campaignId/holder 都在这层作用域）──
-  type KnowledgeIn = { kind: string; path: string; conclusion?: string; evidence?: string; by?: string; at?: number }
+  type KnowledgeIn = { kind: string; path: string; conclusion?: string; evidence?: string; by?: string; at?: number; testedVariants?: string[] }
   // ── F33 ②b 分叉信箱: 执行者跨会话上报的可靠通道(盘文件, 主 agent 的
   //    xiaochang_wait 轮询该目录变化唤醒; 主 agent 读图时吸收进账本并归档)。
   //    设计缘由(run 17891 实锤): 执行者会话与主会话不在同一插件实例——
@@ -518,6 +531,78 @@ export function apply(ctx: Context): void {
       if (codeOf(v.item.id) !== code) continue
       try { holder.recordKnowledge?.(campaignId, v.item.id, entries) } catch { /* 知识落账失败不阻断调度 */ }
     }
+  }
+  // ── v8.4 思路信箱: fanout 采纳思路的消费状态跟踪(落盘=unconsumed, 派兵=consumed) ──
+  interface IdeaEntry {
+    id: string
+    text: string
+    status: 'unconsumed' | 'consumed'
+    adoptedAt: number
+    consumedByDirective?: string
+    consumedAt?: number
+  }
+  const ideaInboxDir = (): string => join(process.env.DSH_HOME ?? '.', 'storages', 'xiaochang-idea-inbox')
+  function readIdeas(code: string): IdeaEntry[] {
+    const p = join(ideaInboxDir(), `${code}.jsonl`)
+    if (!existsSync(p)) return []
+    const out: IdeaEntry[] = []
+    for (const line of readFileSync(p, 'utf8').split('\n')) {
+      if (line.trim() === '') continue
+      try { out.push(JSON.parse(line) as IdeaEntry) } catch { /* 坏行跳过 */ }
+    }
+    return out
+  }
+  function writeIdeas(code: string, entries: IdeaEntry[]): string {
+    mkdirSync(ideaInboxDir(), { recursive: true })
+    const p = join(ideaInboxDir(), `${code}.jsonl`)
+    appendFileSync(p, entries.map(e => JSON.stringify(e)).join('\n') + '\n')
+    return p
+  }
+  function unconsumedIdeas(code: string): IdeaEntry[] {
+    return readIdeas(code).filter(e => e.status === 'unconsumed')
+  }
+  /** 派兵即消费: enqueue 引用 ideaIds → 状态写 consumed(附 directive 指纹)。 */
+  function markIdeasConsumed(code: string, ids: string[], directiveFingerprint: string): number {
+    const all = readIdeas(code)
+    let n = 0
+    const idSet = new Set(ids)
+    const next = all.map(e => {
+      if (e.status === 'unconsumed' && idSet.has(e.id)) {
+        n += 1
+        return { ...e, status: 'consumed' as const, consumedByDirective: directiveFingerprint, consumedAt: Date.now() }
+      }
+      return e
+    })
+    if (n > 0) {
+      mkdirSync(ideaInboxDir(), { recursive: true })
+      writeFileSync(join(ideaInboxDir(), `${code}.jsonl`), next.map(e => JSON.stringify(e)).join('\n') + '\n')
+    }
+    return n
+  }
+  // ── v8.4 截断 v2: 全文落盘(方向段文件), 反馈带路径, frame 附路径 ──
+  const directivesDir = (): string => join(process.env.DSH_HOME ?? '.', 'storages', 'xiaochang-directives')
+  function persistFullDirective(code: string, full: string): string {
+    mkdirSync(directivesDir(), { recursive: true })
+    const p = join(directivesDir(), `${code}.jsonl`)
+    appendFileSync(p, JSON.stringify({ at: Date.now(), text: full }) + '\n')
+    return p
+  }
+  function directivePathOf(code: string): string {
+    return join(directivesDir(), `${code}.jsonl`)
+  }
+  // ── v8.4 fanout 报告信箱(jisi 侧写, runner wait 轮询唤醒主 agent) ──
+  const fanoutInboxDir = (): string => join(process.env.DSH_HOME ?? '.', 'storages', 'xiaochang-fanout-inbox')
+  // ── v8.4 模板库: 内置七族为源(v8.4 起; 运行时可编辑文件留待后续版本) ──
+  function templateLibraryRuntime(): readonly FamilyTemplate[] {
+    return TEMPLATE_LIBRARY
+  }
+  function templateSections(): Map<string, string> {
+    const out = new Map<string, string>()
+    for (const t of templateLibraryRuntime()) out.set(t.family, templateFrameText(t))
+    return out
+  }
+  function templateFrameText(t: FamilyTemplate): string {
+    return `家族战术(${t.name}): ${t.tactics}\n判据: ${t.criteria}\n陷阱: ${t.traps}`
   }
   // ── v7 每题知识账本文件(四节: ①主 agent 写, ②③④机制自动累积) ──────
   // 与 FINDINGS.md 同目录; 执行者 bash 直读, 无需工具; 重试零重复识别。
@@ -756,7 +841,7 @@ export function apply(ctx: Context): void {
     o.multiSpawn = 0
     if (o.r2Due) { o.r2Due = false; void issueR2(code) }
     const vq = ensureVq(code)
-    const picks: Array<{ text: string; model?: string; effort?: string }> = []
+    const picks: Array<{ text: string; model?: string; effort?: string; persona?: string }> = []
     if (o.blockerCheck === 'in-flight') {
       picks.push({ text: VERIFIER_DIRECTIVE })
     } else {
@@ -801,6 +886,7 @@ export function apply(ctx: Context): void {
         board: code,
         resourceClass: cls,
         priority: { tier: tierOf(ch.difficulty), score: prio },
+        ...(d.persona !== undefined && d.persona !== '' ? { persona: d.persona } : {}),
       })
       if (!vq.triedModels.includes(model)) vq.triedModels.push(model)
       persistV2(s)
@@ -864,10 +950,8 @@ export function apply(ctx: Context): void {
     if (o === undefined) return
     if (s.settleProcessed.has(itemId)) return
     s.settleProcessed.add(itemId)
-    if (o.state !== 'granted') return
     const now = Date.now()
     const sn = o.snapshot
-    // v8.3: 旗只看结构化旗仓(执行者 xiaochang_flag_report 写入), 不再从 settle 文本/战报猜。
     const pendingFlags = pendingFlagsOf(readFlagEntries(), code)
     const p: SettleProgress = {
       flagCandidate: pendingFlags.length > 0,
@@ -877,6 +961,42 @@ export function apply(ctx: Context): void {
       blockerConcluded: blockerConcluded(detail)
         || knowledgeOfCode(code).some(k => k.kind === 'dead-end' && blockerConcluded(`${k.path} ${k.conclusion ?? ''}`)),
       detail,
+    }
+    // v8.4 交接未竟动作: settle 文本里的"未竟/下一步"行转未走分叉(换人/换实例不丢临门一脚)。
+    const handoff = parseHandoffForks(detail)
+    if (handoff.length > 0) {
+      const entries: KnowledgeIn[] = handoff.map(h => ({ kind: 'fork', path: h.path, conclusion: h.conclusion, by: `settle-${itemId}`, at: now }))
+      try {
+        recordKnowledgeOnCode(code, entries)
+        appendKnowledgeFile(code, 'forks', handoff.map(h => `${h.path} → ${h.conclusion}`))
+      } catch { /* 交接转分叉失败不阻断 */ }
+    }
+    // v8.4 验证兵自动触发(不靠主 agent 记得派): 死路封印簇 ≥3 同向 → 机制强制翻案回合。
+    // 与判死计数同规: 不因 settle 时机(granted/late)而跳过——封印检测是客观信号。
+    const maybeAutoVerifier = (): void => {
+      const sealed = sealedClustersOf(knowledgeOfCode(code).filter(k => k.kind === 'dead-end'))
+      if (sealed.length > 0 && o.state !== 'dead' && o.state !== 'solved' && o.blockerCheck !== 'in-flight') {
+        const dispatched = s.verifierDispatched.get(code) ?? 0
+        if (dispatched < 1) {
+          s.verifierDispatched.set(code, dispatched + 1)
+          o.blockerCheck = 'in-flight'
+          o.state = 'queued'
+          o.multiSpawn = 1
+          addPending(s, makePending(code, 'needs-verdict', `${code} 死路封印簇 ${sealed.map(x => `${x.direction}×${x.count}`).join('|')} → 验证兵已自动触发(翻案回合)`, c().boardPath(code), now))
+          audit(s.auditPath, { type: 'v8-verifier-auto', code, sealed: sealed.map(x => x.direction) })
+        }
+      }
+    }
+    // v8.4 判死修复: 时间盒已把题回队(状态≠granted)时, 迟到的 settle 依然计真实败绩——
+    // 20390 hint 闸饿死 2.5h 的直接病灶(执行者跑满时间盒 → 时间盒先回队 → settle 被跳过)。
+    if (o.state !== 'granted') {
+      if (!p.flagCandidate) o.settleNoFlag += 1
+      maybeAutoVerifier()
+      refreshHintGate(s, code)
+      bumpOrch(s)
+      persistOrch(s)
+      audit(s.auditPath, { type: 'v8-settle-late', itemId, code, state: o.state, settleNoFlag: o.settleNoFlag })
+      return
     }
     if (o.blockerCheck === 'in-flight') applyVerifierResult(o, verifierVerdict(detail))
     const action = settleAction(o, p)
@@ -914,11 +1034,35 @@ export function apply(ctx: Context): void {
         audit(s.auditPath, { type: 'v8-settle-cluster', itemId, code, sibling: sb, action: action2 })
       }
     }
-    audit(s.auditPath, { type: 'v8-settle', itemId, code, action, flagCandidate: p.flagCandidate })
+    if (action !== 'verify-blocker') maybeAutoVerifier()
+    audit(s.auditPath, { type: 'v8-settle', itemId, code, action, flagCandidate: p.flagCandidate, settleNoFlag: o.settleNoFlag })
+    refreshHintGate(s, code)
+    for (const sb of o.cluster) refreshHintGate(s, sb)
     bumpOrch(s)
     persistOrch(s)
     persistProgress(s)
     if (action !== 'pending-flag') armQueue()
+  }
+  /** v8.4: 判死条件满足 → hint 闸开 + wait 主动推送(治 20390 习得性无助)。 */
+  function refreshHintGate(s: CampaignState, code: string): void {
+    const o = s.orch.get(code)
+    if (o === undefined || o.state === 'solved' || o.state === 'dead') return
+    const used = s.hintLedger.get(code)?.hints ?? 0
+    if (used >= s.maxHints) return
+    const vq = s.v2[code]
+    const gate = hintGateV2({
+      ideaRound: vq?.ideaRound ?? 1,
+      settleNoFlag: o.settleNoFlag ?? 0,
+      blockerConfirmed: o.blockerCheck === 'confirmed',
+    })
+    if (gate.allowed) {
+      if (!s.hintGateOpen.has(code)) {
+        s.hintGateOpen.add(code)
+        audit(s.auditPath, { type: 'v8-hint-gate-open', code, settleNoFlag: o.settleNoFlag, ideaRound: vq?.ideaRound ?? 1 })
+      }
+    } else {
+      s.hintGateOpen.delete(code)
+    }
   }
   /** v8 编排心跳: 时间盒到期 → 关容器+回队(账本保留, 升级梯不动)。 */
   async function tickOrch(): Promise<void> {
@@ -943,7 +1087,7 @@ export function apply(ctx: Context): void {
     }
   }
 
-  // ── v7 极简执行令框架: 主 agent 只写指令, 机制注入题面/入口/账本/画像/纪律 ──
+  // ── v8.4 执行令框架: 主 agent 写指令, 机制注入题面/入口/账本/画像/纪律/家族模板/节奏约束 ──
   function buildExecFrame(code: string, directive: string): string {
     const s = requireState()
     const ch = s.challenges.get(code)
@@ -955,6 +1099,17 @@ export function apply(ctx: Context): void {
         ? '无需容器(本地求解: bash/python 直开)'
         : '容器由调度机制授予——你持槽开工, 无需自行启动/等待容器(执行者没有 start_container 工具)'
     const kn = ensureKnowledgeFile(code)
+    const o = s.orch.get(code)
+    // v8.4 家族模板帧: 主 agent 指定 family 优先, 缺省按题面自动判定。
+    const family = o?.family ?? familyOf(ch.description ?? '', ch.difficulty)
+    const tpl = templateSections().get(family)
+    const templateTxt = tpl !== undefined ? `\n${tpl}\n` : ''
+    // v8.4 节奏约束(限速/封禁类目标): 主 agent enqueue 显式给的 pacing。
+    const pacingTxt = (o?.pacing?.length ?? 0) > 0
+      ? `\n【节奏约束(硬, 违反会烧通道)】${o!.pacing!.map(p => `- ${p}`).join('\n')}\n`
+      : ''
+    // v8.4 截断 v2: 方向段全文落盘路径(截断时自动持久化; 执行者可读全文)。
+    const ideas = unconsumedIdeas(code)
     return [
       `【校场执行令 · ${code}】(${cls === 'local' ? '附件题·全并行' : '容器题·3槽轮换'}, ${ch.difficulty}, ${ch.total_score}pts, ${ch.flag_count} flags)`,
       `题面: ${(ch.description ?? '').slice(0, 1200)}`,
@@ -962,11 +1117,15 @@ export function apply(ctx: Context): void {
       `共享战报: ${c().boardPath(code)}`,
       `知识账本(开工必读): ${kn}`,
       `画像(快速读): ${s.profilePath}`,
+      `方向段全文(若被截断, 完整版在此): ${directivePathOf(code)}`,
+      ...(ideas.length > 0 ? [`未消费采纳思路 ${ideas.length} 条(账本①可见, 可自行拾取): ${ideas.map(i => i.text.slice(0, 80)).join(' | ').slice(0, 400)}`] : []),
+      templateTxt.trim() !== '' ? `家族: ${family}${templateTxt}` : '',
+      pacingTxt.trim() !== '' ? pacingTxt.trim() : '',
       `你的任务: ${directive}`,
       '纪律: ①先读知识账本, 从已知边界出发, 不重复死路, 优先用回收工件;',
       '      ②找到 flag 立即调 xiaochang_flag_report(code, flag) 上报入旗仓(主 agent 负责提交);',
-      '      ③死路/新分叉调 xiaochang_fork 上报; 终态前把死路原因写清。',
-    ].join('\n')
+      '      ③死路/新分叉调 xiaochang_fork 上报; 终态前把死路原因写清(附实测变体清单)。',
+    ].filter(l => l !== '').join('\n')
   }
 
   const register = (tool: object): void => ctx.tools.register(tool as never)
@@ -1071,11 +1230,15 @@ export function apply(ctx: Context): void {
         timeboxMs: (args.timeboxMinutes ?? 30) * 60_000,
         tickCount: 0,
         scoreTable: {},
+        hintGateOpen: new Set(),
+        verifierDispatched: new Map(),
       }
       try {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
       } catch { /* 画像损坏：空画像 */ }
       state = s
+      // v8.4: 把本 run 预算截止同步给集思(fanout 末段预算门)。
+      try { jisi?.setDeadline?.(s.startedAt + s.budgetMs) } catch { /* 集思预算门失败不阻断 */ }
       // 稳定 campaignId：跨进程崩溃/重启幂等恢复（虎符快照），prompt 本体不丢（F18）。
       const stableId = `tsecbench-run-${args.runId ?? 'pending'}`
       // F5/F6 机制化：pre-run sweep——把早于本 run 开始时间的题号工件与旧 run 战报
@@ -1178,7 +1341,7 @@ export function apply(ctx: Context): void {
       if (progress.all().length === 0 && jisi?.fanoutNotify !== undefined) {
         try {
           const allowModel = (m: string): boolean => s.modelWhitelist.length === 0 || s.modelWhitelist.includes(m)
-          const tickets: string[] = []
+          let delegates = 0
           let hardMulti = 0
           for (const ch of fresh) {
             // v7.9 暖账分层: hard(≥700 分) 自动加 glm-5.3 一路(公开 CyberGym 先验 84.5), easy/medium 一路 flash。
@@ -1187,9 +1350,11 @@ export function apply(ctx: Context): void {
               : ['deepseek-flash'].filter(allowModel)
             if (models.length > 1) hardMulti += 1
             const ticket = jisi.fanoutNotify(agent, { prompt: buildWarmupPrompt(ch) }, models)
-            tickets.push(ticket.id)
+            delegates += ticket.models.length
           }
-          warmup = `, 暖账 fanout 已发 ${tickets.length} 路(hard 题 ${hardMulti} 道为 flash+glm-5.3 双路, 其余 flash 单路; 报告按信封到达请照常裁决——**暖账已覆盖全题, 无需再 jisi_fanout_bulk 全量发; 只对 hard/卡题加模型补征**)`
+          warmup = delegates > 0
+            ? `, 暖账 fanout 已发 ${delegates} 路(hard 题 ${hardMulti} 道为 flash+glm-5.3 双路, 其余 flash 单路; 报告按信封到达请照常裁决——**暖账已覆盖全题, 无需再 jisi_fanout_bulk 全量发; 只对 hard/卡题加模型补征**)`
+            : ', 暖账 fanout 0 路实际派发(集思闸/重试上限)——可手动 jisi_fanout_bulk 补征'
         } catch { warmup = ', 暖账 fanout 发送失败(可手动 jisi_fanout_bulk 全量征集)' }
       }
       return `xiaochang_setup ok: ${fresh.length} challenges, concurrency=${s.concurrency} (no threshold), containerSlots=${args.containerSlots ?? 3}, budget ${Math.round(s.budgetMs / 60000)}min, resume=${progress.all().length > 0}, campaign=${campaignId ?? stableId}, swept=${swept}${warmup}`
@@ -1503,7 +1668,7 @@ export function apply(ctx: Context): void {
   register(defineTool({
     name: 'xiaochang_hint',
     description:
-      'Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v7.4 gate: refused until the challenge has gone through ≥1 R2 re-fanout (ideaRound≥2) AND has ≥1 filtered failure (provider-outage failures excluded) — hint is the last resort after escalation, never a shortcut. The deduction is reported loudly and the platform\'s cumulative_score is the authoritative account.',
+      'Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only — settleNoFlag ≥2 (两轮真实败绩, 无旗 settle 自动计) 或 (ideaRound≥2 且 settleNoFlag≥1) 或 blocker 已被验证兵确认。闸开时 xiaochang_wait 会主动推送 hint-gate-open 事件(不必反复试). The deduction is reported loudly.',
     parameters: { code: { type: 'string', required: true } },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
@@ -1515,16 +1680,19 @@ export function apply(ctx: Context): void {
       const s = requireState()
       const used = s.hintLedger.get(args.code)?.hints ?? 0
       if (used >= s.maxHints) return 'xiaochang_hint: hint cap reached'
-      // v7.4 时机门禁: hint 是扣分的最后手段——必须先走过 R2 二次征集且已有过滤后失败
-      // (V1 实锤: 两条 hint 吃掉 180 分, agent 还浑然不知)。
-      // v8: "打过但未破"(orch.settleNoFlag)计入真实败绩——资源阻塞收工不再堵死救援通道。
+      // v8.4 客观闸: 无旗 settle 一律计真实败绩(blocker 措辞不豁免), 不读执行者自述。
       const vq = s.v2[args.code]
-      const ff = filteredFailedOf(args.code, campaign)
-      const noFlagSettles = s.orch.get(args.code)?.settleNoFlag ?? 0
-      const gate = hintGate({ ideaRound: vq?.ideaRound ?? 1, filteredFailed: ff.failed + noFlagSettles })
+      const o = s.orch.get(args.code)
+      const gate = hintGateV2({
+        ideaRound: vq?.ideaRound ?? 1,
+        settleNoFlag: o?.settleNoFlag ?? 0,
+        blockerConfirmed: o?.blockerCheck === 'confirmed',
+      })
       if (!gate.allowed) {
-        return `xiaochang_hint: 拒绝(hint 扣该题分值, 是 R2+失败后的最后手段): ${gate.missing.join('; ')}。当前该题 hint 已用 ${used}/${s.maxHints}、已扣 ${s.hintLedger.get(args.code)?.deducted ?? 0} 分。`
+        s.hintGateOpen.delete(args.code)
+        return `xiaochang_hint: 拒绝: ${gate.missing.join('; ')}。当前该题 hint 已用 ${used}/${s.maxHints}、已扣 ${s.hintLedger.get(args.code)?.deducted ?? 0} 分。闸开后 xiaochang_wait 会主动推送, 不必反复试。`
       }
+      s.hintGateOpen.delete(args.code)
       const ch = s.challenges.get(args.code)
       const raw = await s.adapter.hint(args.code) as { hint?: string | null }
       const hint = raw.hint
@@ -1541,17 +1709,21 @@ export function apply(ctx: Context): void {
       'v8: put a CHALLENGE into the challenge queue with a directive package (思路包). The queue is the single scheduler: when a slot is granted, the mechanism starts the container (if needed) and spawns the executor bound to it — no manual start/dispatch. Re-call to add more directives (untried ones are consumed at each grant) or to raise priority. Executors never wait for containers; challenges wait, zero tokens.',
     parameters: {
       code: { type: 'string', required: true },
-      prompt: { type: 'string', required: true, description: 'The lean directive: the assigned approach/idea for this challenge (1-3 lines, ≤700 chars). Do NOT paste the challenge description/addrs/board discipline — the frame injects those. Do NOT paste CVE/dictionary-style knowledge.' },
+      prompt: { type: 'string', required: true, description: 'The directive: the assigned approach/idea for this challenge. v8.4: 优先写个性化判断(方向/优先级/验证点); 公共知识可不贴——家族模板帧已由机制注入. 上限 4000 字符(超限全文落盘, 执行者可读全文, 不丢信息).' },
       priority: { type: 'number', description: 'v8: explicit queue priority override (default = score density + never-dispatched boost).' },
       model: { type: 'string', description: 'Preferred executor model for this directive (falls back to default if invalid/unlisted).' },
       effort: { type: 'string', description: 'Reasoning effort for this directive.' },
+      family: { type: 'string', description: 'v8.4: 战术家族覆盖(rev-vm|rev-serial|rev-license|web-chain|web-console|ai-service|easy-harvest), 缺省按题面自动判定; 决定注入执行者帧的家族模板。' },
+      pacing: { type: 'array', description: 'v8.4: 目标侧节奏约束(限速/封禁类, 注入令文硬约束), 如 ["ssh ≤2 次/10min(失败即封禁)"]。' },
+      ideaIds: { type: 'array', description: 'v8.4: 本 directive 引用的采纳思路 id 列表(从 enqueue 回显/status 的未消费思路清单取); 派兵即标记该思路已消费。' },
+      persona: { type: 'string', description: 'v8.4: 执行者 persona 内联覆盖(缺省继承部署级; 可给渗透/逆向专家类 persona)。' },
       round: { type: 'number', description: 'v8: ignored (kept for compatibility) — rounds are managed by the mechanism.' },
       dependsOn: { type: 'array', description: 'v8: ignored (kept for compatibility).' },
       resourceClass: { type: 'string', description: 'v8: ignored (kept for compatibility) — class is auto by challenge type.' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args: { code: string; prompt: string; priority?: number; model?: string; effort?: string; round?: number; dependsOn?: string[]; resourceClass?: string }, exec) {
+    async execute(args: { code: string; prompt: string; priority?: number; model?: string; effort?: string; family?: string; pacing?: string[]; ideaIds?: string[]; persona?: string; round?: number; dependsOn?: string[]; resourceClass?: string }, exec) {
       // v7.6: 调度权单点——只有主 agent 可入题队列(单调度器架构; 执行者无权改写战役)。
       if (parentAgent !== undefined && exec.agent !== parentAgent) {
         return 'xiaochang_enqueue: 拒绝——入题队列是主 agent 专属(单调度器); 执行者只解自己的题, 有发现用 xiaochang_fork 上报'
@@ -1561,20 +1733,30 @@ export function apply(ctx: Context): void {
       if (ch === undefined) return `xiaochang_enqueue: unknown challenge ${args.code}`
       // v7: 账本文件就绪 + restore/迁移兜底镜像(账本知识全量进文件, 行去重幂等)。
       try { ensureKnowledgeFile(args.code); syncKnowledgeFileFromLedger(args.code) } catch { /* 账本失败不阻断 */ }
-      // v7.6: 方向段截断(700 字符, 阈值按 run18728 真局派单分布 p50≈623 定)。
-      const DIRECTIVE_MAX = 700
+      // v8.4: 方向段 4000 字符(防呆上限; 超限全文落盘, 执行者 frame 带路径读全文)。
+      const DIRECTIVE_MAX = 4000
       const trunc = truncateDirective(args.prompt, DIRECTIVE_MAX)
       let truncNotice = ''
       if (trunc.truncated) {
-        truncNotice = `\n⚠️ 方向段截断反馈: ${args.prompt.length}→${DIRECTIVE_MAX} 字符, 截点原文 "${trunc.cutTail}…"。被砍掉的内容若是关键验证点: ①用 xiaochang_knowledge_put 写进该题账本①/③(执行者开工必读, 不占 prompt), 或 ②再 enqueue 一条; 若只是 CVE/口令词典类公共知识, 不用补——执行者模型自带。`
+        const fullPath = persistFullDirective(args.code, args.prompt)
+        truncNotice = `\n⚠️ 方向段已截断: ${args.prompt.length}→${DIRECTIVE_MAX} 字符。全文已落盘 ${fullPath}(执行者 frame 自动附路径, 开工可读; 无需手动搬运)。`
       }
       const o = s.orch.get(args.code) ?? ((): ChallengeOrch => { const n = newOrch(args.code, s.startedAt); s.orch.set(args.code, n); return n })()
       // v8: 终态题拒绝入队(出队仅 solved/dead 两条路)。
       if (o.state === 'solved' || o.state === 'dead') {
         return `xiaochang_enqueue: 拒绝——${args.code} 已${o.state === 'solved' ? '解出' : '判死'}, 不再入队`
       }
-      o.directives.push({ text: trunc.text, model: args.model, effort: args.effort, tried: false })
+      o.directives.push({ text: trunc.text, model: args.model, effort: args.effort, persona: args.persona, tried: false })
       if (args.priority !== undefined) o.priorityOverride = args.priority
+      // v8.4: 家族/pacing 元数据(可覆盖, 可累积)。
+      if (args.family !== undefined && args.family !== '') o.family = args.family
+      if ((args.pacing?.length ?? 0) > 0) o.pacing = [...(o.pacing ?? []), ...args.pacing!]
+      // v8.4: 派兵即消费——本 directive 引用的采纳思路标记 consumed。
+      let consumedNote = ''
+      if ((args.ideaIds?.length ?? 0) > 0) {
+        const n = markIdeasConsumed(args.code, args.ideaIds!, trunc.text.slice(0, 60))
+        consumedNote = n > 0 ? `\n已标记 ${n} 条采纳思路为已消费(本 directive 引用)。` : '\n(ideaIds 中无可标记的未消费思路——id 可能已消费或不存在, 无副作用)'
+      }
       // v8.3c 簇调度: 入队/续打对簇内全体成员生效(簇=单调度单元)。
       const memberCodes = [args.code, ...o.cluster]
       for (const c2 of memberCodes) {
@@ -1590,8 +1772,59 @@ export function apply(ctx: Context): void {
       bumpOrch(s)
       persistOrch(s)
       persistProgress(s)
-      audit(s.auditPath, { type: 'v8-enqueue', code: args.code, directive: trunc.text.slice(0, 80), priority: args.priority })
-      return `enqueued ${args.code} (directives=${o.directives.length}, 队列优先级=${priorityOf(o, ch.total_score, Date.now())}, 状态=${o.state}; 授予由机制 tick 武装, 无需手动 dispatch)${truncNotice}`
+      audit(s.auditPath, { type: 'v8-enqueue', code: args.code, directive: trunc.text.slice(0, 80), priority: args.priority, family: o.family, pacing: o.pacing })
+      // v8.4 回显: 已挂模板 / 账本摘要 / 未消费思路菜单 / 封印簇。
+      const familyNow = o.family ?? familyOf(ch.description ?? '', ch.difficulty)
+      const tplName = templateSections().has(familyNow) ? familyNow : '(无模板)'
+      const ideas = unconsumedIdeas(args.code)
+      const ideaMenu = ideas.length > 0
+        ? `\n未消费思路 ${ideas.length} 条(enqueue 时传 ideaIds 引用即消费):\n${ideas.map(i => `  #${i.id} ${i.text.slice(0, 90)}`).join('\n')}`
+        : '\n未消费思路: 无'
+      const deads = knowledgeOfCode(args.code).filter(k => k.kind === 'dead-end')
+      const sealed = sealedClustersOf(deads)
+      const sealedTxt = sealed.length > 0
+        ? `\n⚠️ 死路封印簇 ${sealed.length} 个(≥3 条同向, 验证兵已自动触发): ${sealed.map(x => `${x.direction}×${x.count}`).join(' | ')}`
+        : ''
+      return `enqueued ${args.code} (directives=${o.directives.length}, 队列优先级=${priorityOf(o, ch.total_score, Date.now())}, 状态=${o.state}; 授予由机制 tick 武装, 无需手动 dispatch)\n家族模板已挂: ${tplName}${ideaMenu}${sealedTxt}${consumedNote}${truncNotice}`
+    },
+  }))
+
+  // v8.4 采纳工具: fanout 思路裁决采纳 → 落盘账本① + 记未消费(派兵才消费)。
+  register(defineTool({
+    name: 'xiaochang_idea_adopt',
+    description:
+      'v8.4 (main agent): adopt fanout/collect ideas for a challenge. Each adopted idea is written into the challenge ledger ① (executors read it at start) AND tracked in the idea inbox as unconsumed — it becomes consumed only when a later xiaochang_enqueue references its id via ideaIds (派兵即消费). The enqueue return value lists unconsumed ideas for point-and-dispatch.',
+    parameters: {
+      code: { type: 'string', required: true },
+      ideas: { type: 'array', required: true, description: '[{id, text}] — id 可用任意短标签(如 r2-1); 重复 id 幂等覆盖。' },
+    },
+    output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
+    isConcurrencySafe: () => false,
+    async execute(args: { code: string; ideas: Array<{ id: string; text: string }> }, exec) {
+      if (parentAgent !== undefined && exec.agent !== parentAgent) {
+        return 'xiaochang_idea_adopt: 拒绝——采纳是主 agent 专属(单调度器)'
+      }
+      const s = requireState()
+      if (s.challenges.get(args.code) === undefined) return `xiaochang_idea_adopt: unknown challenge ${args.code}`
+      const now = Date.now()
+      const existing = new Map(readIdeas(args.code).map(e => [e.id, e]))
+      const fresh: IdeaEntry[] = []
+      for (const idea of args.ideas) {
+        const id = `${args.code}-${idea.id}`.slice(0, 64)
+        const prev = existing.get(id)
+        if (prev !== undefined) continue // 幂等: 已采纳不重复
+        fresh.push({ id, text: idea.text, status: 'unconsumed', adoptedAt: now })
+        existing.set(id, fresh[fresh.length - 1]!)
+      }
+      if (fresh.length > 0) {
+        writeIdeas(args.code, fresh)
+        try {
+          appendKnowledgeFile(args.code, 'skeleton', fresh.map(e => `思路#${e.id.split('-').pop()}: ${e.text.slice(0, 200)} (未消费)`))
+        } catch { /* 账本文件失败不阻断 */ }
+      }
+      const unconsumed = unconsumedIdeas(args.code)
+      const menu = unconsumed.map(e => '  #' + e.id + ' ' + e.text.slice(0, 90)).join(' / ')
+      return args.code + ' 采纳 ' + fresh.length + ' 条(共 ' + unconsumed.length + ' 条未消费)。派兵时 enqueue 传 ideaIds=[...] 即标记消费: ' + menu
     },
   }))
 
@@ -1683,7 +1916,7 @@ export function apply(ctx: Context): void {
       code: { type: 'string', required: true },
       verdict: { type: 'string', required: true, description: 'complete | failed | skipped | continue | rotate' },
       reason: { type: 'string', description: 'Short reason (logged).' },
-      deadEnds: { type: 'array', description: '[{path, conclusion, evidence}] proven-infeasible paths.' },
+      deadEnds: { type: 'array', description: '[{path, conclusion, evidence, testedVariants}] proven-infeasible paths. v8.4: 附实测变体清单(结论带过程, 翻案兵按清单外变体复核).' },
       forks: { type: 'array', description: '[{path, conclusion, evidence}] untaken branches worth dispatching.' },
       observations: { type: 'array', description: '[{path, conclusion}] facts learned.' },
       why: { type: 'string', description: 'v2 归因(failed 时必填): model-weak | approach-dead-end | context-insufficient | platform-issue. 两级判定: 执行者报告提议, 你终裁.' },
@@ -1691,7 +1924,7 @@ export function apply(ctx: Context): void {
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args: { code: string; verdict: string; reason?: string; deadEnds?: Array<{ path: string; conclusion?: string; evidence?: string }>; forks?: Array<{ path: string; conclusion?: string; evidence?: string }>; observations?: Array<{ path: string; conclusion?: string }>; why?: string; gaps?: string[] }, exec) {
+    async execute(args: { code: string; verdict: string; reason?: string; deadEnds?: Array<{ path: string; conclusion?: string; evidence?: string; testedVariants?: string[] }>; forks?: Array<{ path: string; conclusion?: string; evidence?: string }>; observations?: Array<{ path: string; conclusion?: string }>; why?: string; gaps?: string[] }, exec) {
       // v7.6: 调度权单点——裁决/剪枝只有主 agent 可做。
       if (parentAgent !== undefined && exec.agent !== parentAgent) {
         return 'xiaochang_report: 拒绝——裁决是主 agent 专属(单调度器); 执行者只报告结果, 交主 agent 判断'
@@ -1720,13 +1953,13 @@ export function apply(ctx: Context): void {
       }
       // F33: 结构化经验落账(全局解题图)——记账失败绝不阻断 verdict 主线(关容器/剪枝/落盘)。
       const entries: KnowledgeIn[] = [
-        ...(args.deadEnds ?? []).map(e => ({ kind: 'dead-end', path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: 'report', at: Date.now() })),
-        ...(args.forks ?? []).map(e => ({ kind: 'fork', path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: 'report', at: Date.now() })),
-        ...(args.observations ?? []).map(e => ({ kind: 'observation', path: e.path, conclusion: e.conclusion, by: 'report', at: Date.now() })),
+        ...(args.deadEnds ?? []).map(e => ({ kind: 'dead-end', path: e.path, conclusion: e.conclusion, evidence: e.evidence, testedVariants: e.testedVariants, by: 'main-agent', at: Date.now() })),
+        ...(args.forks ?? []).map(e => ({ kind: 'fork', path: e.path, conclusion: e.conclusion, evidence: e.evidence, by: 'main-agent', at: Date.now() })),
+        ...(args.observations ?? []).map(e => ({ kind: 'observation', path: e.path, conclusion: e.conclusion, by: 'main-agent', at: Date.now() })),
       ]
       try { if (entries.length > 0) recordKnowledgeOnCode(args.code, entries) } catch { /* 落账失败不阻断 */ }
       // v7: 知识账本文件自动累积——②死路/缺口, ③工件(observations), ④分叉; 失败不阻断。
-      const line = (e: { path: string; conclusion?: string; evidence?: string }): string => `${e.path}${e.conclusion !== undefined ? ' → ' + e.conclusion : ''}${e.evidence !== undefined ? ' (证据: ' + e.evidence + ')' : ''}`
+      const line = (e: { path: string; conclusion?: string; evidence?: string; testedVariants?: string[] }): string => `${e.path}${e.conclusion !== undefined ? ' → ' + e.conclusion : ''}${e.evidence !== undefined ? ' (证据: ' + e.evidence + ')' : ''}${(e.testedVariants?.length ?? 0) > 0 ? ` [已试: ${e.testedVariants!.join('; ').slice(0, 300)}]` : ''} [by main-agent]`
       try {
         if ((args.deadEnds?.length ?? 0) > 0) appendKnowledgeFile(args.code, 'dead', args.deadEnds!.map(line))
         if ((args.gaps?.length ?? 0) > 0) appendKnowledgeFile(args.code, 'dead', args.gaps!.map(g => `缺口: ${g}`))
@@ -1892,19 +2125,19 @@ ${gaps}
       'F33 fork alarm: you (executor) report branches with an explicit status — "untaken" (default): promising branch not taken, worth dispatching (goes to ledger ④ + the fork inbox; the main agent is woken by xiaochang_wait polling the inbox — NO direct interrupt, forks are collected in the main agent\'s normal rhythm); "dead-end": a path you PROVED infeasible (403/impossible/verified-fail) — archived silently to ledger ② only, no inbox, no wake, no dispatch impulse. v7.1: untaken forks of already-terminal challenges are archived silently. v7.4: duplicate paths already in the inbox are skipped at the source.',
     parameters: {
       code: { type: 'string', required: true },
-      forks: { type: 'array', required: true, description: '[{path, conclusion, evidence, status}] — status: "untaken" (default, 未走分叉→④+信箱, 主 agent 经 xiaochang_wait 唤醒) | "dead-end" (已证死路→只进②, 不唤醒不派兵).' },
+      forks: { type: 'array', required: true, description: '[{path, conclusion, evidence, status, testedVariants}] — status: "untaken" (default, 未走分叉→④+信箱, 主 agent 经 xiaochang_wait 唤醒) | "dead-end" (已证死路→只进②, 不唤醒不派兵). v8.4: dead-end 必须附 testedVariants(实测变体清单)——结论带过程, 供翻案兵按清单外变体复核.' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => true,
-    async execute(args: { code: string; forks: Array<{ path: string; conclusion?: string; evidence?: string; status?: 'untaken' | 'dead-end' }> }) {
+    async execute(args: { code: string; forks: Array<{ path: string; conclusion?: string; evidence?: string; status?: 'untaken' | 'dead-end'; testedVariants?: string[] }> }) {
       if (args.forks.length === 0) return 'xiaochang_fork: no forks given'
-      const fmt = (f: { path: string; conclusion?: string; evidence?: string }): string => `${f.path}${f.conclusion !== undefined ? ' → ' + f.conclusion : ''}${f.evidence !== undefined ? ' (证据: ' + f.evidence + ')' : ''}`
+      const fmt = (f: { path: string; conclusion?: string; evidence?: string; testedVariants?: string[] }): string => gradedLine({ kind: 'dead-end', path: f.path, conclusion: f.conclusion, evidence: f.evidence, testedVariants: f.testedVariants, by: 'fork', at: Date.now() })
       const deadEnds = args.forks.filter(f => f.status === 'dead-end')
       const untaken = args.forks.filter(f => f.status !== 'dead-end')
-      const deadLines = deadEnds.map(fmt)
+      const deadLines = deadEnds.map(f => `${f.path}${f.conclusion !== undefined ? ' → ' + f.conclusion : ''}${f.evidence !== undefined ? ' (证据: ' + f.evidence + ')' : ''}${(f.testedVariants?.length ?? 0) > 0 ? ` [已试: ${f.testedVariants!.join('; ').slice(0, 300)}]` : ''}`)
       // v7.2 dead-end 语义位: 死路只进②不可行教训(静默)——不信箱/不唤醒/不进④, 账本不再双写。
       if (deadEnds.length > 0) {
-        const de: KnowledgeIn[] = deadEnds.map(f => ({ kind: 'dead-end', path: f.path, conclusion: f.conclusion, evidence: f.evidence, by: 'fork', at: Date.now() }))
+        const de: KnowledgeIn[] = deadEnds.map(f => ({ kind: 'dead-end', path: f.path, conclusion: f.conclusion, evidence: f.evidence, testedVariants: f.testedVariants, by: 'fork', at: Date.now() }))
         try { recordKnowledgeOnCode(args.code, de) } catch { /* 入账失败不阻断 */ }
         try { appendKnowledgeFile(args.code, 'dead', deadLines) } catch { /* 账本文件失败不阻断 */ }
       }
@@ -2159,6 +2392,23 @@ ${gaps}
         })()}`,
         `openContainers(平台视角, 异步更新会滞后; 槽真相以 containerQueue 行为准)=${[...openContainers(s)].join(',') || 'none'}`,
         `hints=${s.hintLedger.totalHints()} (deducted ${s.hintLedger.totalDeducted()})`,
+        `hint闸已开(可取): ${[...s.hintGateOpen].sort().join(',') || '无'}`,
+        `未消费思路: ${(() => {
+          const rows: string[] = []
+          for (const code of s.orch.keys()) {
+            const ideas = unconsumedIdeas(code)
+            if (ideas.length > 0) rows.push(`${code}×${ideas.length}`)
+          }
+          return rows.length > 0 ? rows.join(' ') : '无'
+        })()}`,
+        `死路封印簇(≥3 同向, 验证兵自动触发): ${(() => {
+          const rows: string[] = []
+          for (const code of s.orch.keys()) {
+            const sealed = sealedClustersOf(knowledgeOfCode(code).filter(k => k.kind === 'dead-end'))
+            if (sealed.length > 0) rows.push(`${code}:${sealed.map(x => `${x.direction}×${x.count}`).join('|')}`)
+          }
+          return rows.length > 0 ? rows.join(' ') : '无'
+        })()}`,
         `待裁决(${s.pendingAdj.length}):\n${pendingTxt}`,
         `未破题(全量·风险排序): ${unsolvedTxt}`,
         `progress: ${progress}`, escTxt,
@@ -2273,9 +2523,41 @@ ${gaps}
           // 主 agent: 终态题 fork 静默归档(不唤醒, 防迟到回放增兵冲动); 活跃题 fork 照常唤醒。
           if (evaluateInbox(codeFilter)) done('xiaochang_wait: fork inbox changed — read xiaochang_graph and dispatch the untaken branches')
         }, 2000)
+        // ⑧ v8.4 思路回流推送: jisi fanout 报告落盘 → 唤醒主 agent 裁决(该题在槽或已有未消费思路时)。
+        const fanInboxSnap = (): string => {
+          try {
+            const dir = fanoutInboxDir()
+            if (!existsSync(dir)) return ''
+            const files = codeFilter !== undefined
+              ? readdirSync(dir).filter(f => f.endsWith('.jsonl') && f.replace(/\.jsonl$/, '') === codeFilter)
+              : readdirSync(dir).filter(f => f.endsWith('.jsonl'))
+            return files.map(f => { const st = statSync(join(dir, f)); return `${f}:${st.mtimeMs}:${st.size}` }).join('|')
+          } catch { return '' }
+        }
+        let fanBefore = fanInboxSnap()
+        const fiv = setInterval(() => {
+          if (state === undefined) return // 执行者会话不监听思路信箱(主 agent 专属裁决通道)
+          const nowSnap = fanInboxSnap()
+          if (nowSnap !== fanBefore) {
+            fanBefore = nowSnap
+            done('xiaochang_wait: 思路已回(fanout 报告到达)——读 xiaochang_collect 裁决采纳; 采纳即自动落盘账本①(未消费), enqueue 传 ideaIds 派兵即消费')
+          }
+        }, 2000)
+        // ⑨ v8.4 hint 闸自动开: 判死条件满足 → 主动推送(治习得性无助, 主 agent 不必反复试)。
+        let gateBefore = [...(state?.hintGateOpen ?? [])].sort().join(',')
+        const giv = setInterval(() => {
+          if (state === undefined) return
+          const nowSet = [...state.hintGateOpen].sort().join(',')
+          if (nowSet !== gateBefore) {
+            gateBefore = nowSet
+            if (codeFilter !== undefined && !state.hintGateOpen.has(codeFilter)) return
+            const opened = codeFilter !== undefined ? codeFilter : nowSet
+            if (opened !== '') done(`xiaochang_wait: hint 闸已开(${opened})——现在可取 xiaochang_hint`)
+          }
+        }, 2000)
         // ④ 超时
         const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1000)}s, no event`), timeoutMs)
-        cleanup = () => { unsub(); clearInterval(iv); clearInterval(oiv); clearInterval(fgv); clearInterval(sv); clearInterval(fv); clearTimeout(to) }
+        cleanup = () => { unsub(); clearInterval(iv); clearInterval(oiv); clearInterval(fgv); clearInterval(sv); clearInterval(fv); clearInterval(fiv); clearInterval(giv); clearTimeout(to) }
         // v7.1 wait 入口评估: 两次 wait 之间写入的 fork 不落盲区——终态题归档(不唤醒), 活跃题立即唤醒。
         if (state !== undefined && evaluateInbox(codeFilter)) {
           inboxBefore = inboxSnap()
