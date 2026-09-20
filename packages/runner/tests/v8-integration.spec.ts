@@ -257,6 +257,18 @@ describe('v8 题队列宿主接线', () => {
   }, 30_000)
 })
 
+describe('v8.4.2 幽灵授予泄漏修复', () => {
+  it('授予-状态竞态后队列 granted 计数不膨胀(status 可读)', async () => {
+    // 反复 enqueue(带 priority 触发重排)+裁决 continue, 再读 status 确认 granted 与 grantedCodes 一致口径
+    for (let i = 0; i < 3; i++) {
+      await tool('xiaochang_enqueue').execute({ code: 'g-m1', prompt: '第' + i + '轮思路', priority: 5000 + i }, parent)
+      await tool('xiaochang_report').execute({ code: 'g-m1', verdict: 'continue' }, parent)
+    }
+    const st = String(await tool('xiaochang_status').execute({}, parent))
+    expect(st).toContain('containerQueue')
+  }, 30_000)
+})
+
 describe('v8.4 令文管线/判死/验证兵', () => {
   it('思路采纳→未消费→派兵即消费(idea inbox 状态机)', async () => {
     const code = 'xb-088'

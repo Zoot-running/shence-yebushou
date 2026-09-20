@@ -1417,7 +1417,14 @@ function apply(ctx) {
     const s = requireState();
     s.armed.delete(code);
     const o = orchFor(code);
-    if (o === void 0 || o.state !== "queued") return;
+    if (o === void 0 || o.state !== "queued") {
+      try {
+        await releaseGrant(code);
+        audit(s.auditPath, { type: "v8-grant-miss", code, state: o?.state ?? "no-orch" });
+      } catch {
+      }
+      return;
+    }
     try {
       const fresh = await s.adapter.listChallenges();
       for (const x of fresh) s.challenges.set(x.unique_code, x);
@@ -1548,8 +1555,16 @@ function apply(ctx) {
       s.armed.add(code);
       void q.acquire(code).then((res) => {
         if (res.status === "granted") {
-          s.grantedCodes.add(code);
-          requestSpawn(code);
+          const o2 = s.orch.get(code);
+          if (o2 === void 0 || o2.state !== "queued") {
+            void q.release().catch(() => {
+            });
+            s.armed.delete(code);
+            audit(s.auditPath, { type: "v8-arm-grant-race", code, state: o2?.state ?? "no-orch" });
+          } else {
+            s.grantedCodes.add(code);
+            requestSpawn(code);
+          }
         } else {
           s.armed.delete(code);
           audit(s.auditPath, { type: "v8-arm-drop", code, status: res.status, reason: res.reason });

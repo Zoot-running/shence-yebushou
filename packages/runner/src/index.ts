@@ -807,7 +807,15 @@ export function apply(ctx: Context): void {
     const s = requireState()
     s.armed.delete(code)
     const o = orchFor(code)
-    if (o === undefined || o.state !== 'queued') return
+    // v8.4.2: 授予落地时题已不在 queued(裁决/降级/换实例竞态) → 必须释放队列授予,
+    // 否则队列 granted 永久 +1 幽灵槽(20733 实锤: granted=3/3 只 1 槽在转, 2 槽死锁)。
+    if (o === undefined || o.state !== 'queued') {
+      try {
+        await releaseGrant(code)
+        audit(s.auditPath, { type: 'v8-grant-miss', code, state: o?.state ?? 'no-orch' })
+      } catch { /* 释放失败不阻断 */ }
+      return
+    }
     try {
       const fresh = await s.adapter.listChallenges()
       for (const x of fresh) s.challenges.set(x.unique_code, x)
@@ -936,8 +944,18 @@ export function apply(ctx: Context): void {
       }
       s.armed.add(code)
       void q.acquire(code).then(res => {
-        if (res.status === 'granted') { s.grantedCodes.add(code); requestSpawn(code) }
-        else {
+        if (res.status === 'granted') {
+          const o2 = s.orch.get(code)
+          if (o2 === undefined || o2.state !== 'queued') {
+            // v8.4.2: 授予与状态竞态 → 归还槽位(防幽灵授予)。
+            void q.release().catch(() => {})
+            s.armed.delete(code)
+            audit(s.auditPath, { type: 'v8-arm-grant-race', code, state: o2?.state ?? 'no-orch' })
+          } else {
+            s.grantedCodes.add(code)
+            requestSpawn(code)
+          }
+        } else {
           s.armed.delete(code)
           audit(s.auditPath, { type: 'v8-arm-drop', code, status: res.status, reason: res.reason })
         }
