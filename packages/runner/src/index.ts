@@ -208,7 +208,6 @@ interface V2Question {
   adopted: number
   lastVerdict?: string
   /** v6: 末段自动 R2 已发(防重复)。 */
-  autoR2?: boolean
 }
 type V2State = Record<string, V2Question>
 
@@ -2372,34 +2371,17 @@ ${gaps}
         if (ruling.action === 'escalate') escLines.push(`⚠️ ${code}: ${ruling.reasons[0] ?? ''}${exclTxt}${searchHint}`)
         if (ruling.action === 'judge-dead') escLines.push(`⛔ ${code}: ${ruling.reasons[0] ?? ''}${exclTxt}${searchHint}`)
       }
-      // v6 末段自动 R2: 预算 ≤60min 且 hard 未破且该题本窗口未发过 → 插件直接发兵(机制默认动作)。
+      // v8.5.2: 末段自动 R2 已删(v8.5.1 只删了授予时 issueR2, 此块漏删——20911 实锤 fanout-73/74/75
+      // 机制自动发起, 与"机制不代劳调度"冲突)。改为纯提示行: 末段赶工由主 agent 按开战令纪律执行。
       if (remaining <= 60 * 60_000) {
         const hardOpen: string[] = []
         for (const [code, q] of Object.entries(s.v2)) {
-          // 进度已终态的题绝不重复征集(2026-09-15 干跑实锤: 只查 lastVerdict 会漏掉归因门控没写 lastVerdict 的已解题)。
           const p = s.progress.get(code)
           if (p !== undefined && (p.state === 'complete' || p.state === 'failed' || p.state === 'skipped')) continue
           if (q.difficulty >= 55 && q.lastVerdict !== 'complete') hardOpen.push(code)
         }
-        for (const code of hardOpen.slice(0, 3)) {
-          const q = s.v2[code]!
-          if (q.autoR2 !== true) {
-            q.autoR2 = true
-            s.v2[code] = q
-            persistV2(s)
-            if (jisi?.fanoutNotify !== undefined) {
-              const prompt = buildRefanoutPrompt(code)
-              const models = await pickRefanoutModels(q)
-              const ticket = jisi.fanoutNotify(parentAgent ?? (exec?.agent as unknown), { prompt }, models)
-              q.ideaRound += 1
-              q.triedModels.push(...models.filter(m => !q.triedModels.includes(m)))
-              s.v2[code] = q
-              persistV2(s)
-              escLines.push(`⏰ 末段自动 R2: ${code} 已自动发起二次征集(${models.join(', ')}, ticket ${ticket.id})——可 jisi_fanout_drop 改判`)
-            } else {
-              escLines.push(`⏰ 末段赶工: ${code} 未破且 jisi 通道不可用 → 手动 xiaochang_refanout`)
-            }
-          }
+        if (hardOpen.length > 0) {
+          escLines.push(`⏰ 末段赶工提示(机制不代劳): 未破 hard ${hardOpen.slice(0, 3).join(' ')}——按开战令纪律显式 fanout 加模型并派最清晰一路`)
         }
       }
       const escTxt = escLines.length > 0 ? `\n升级建议:\n${escLines.join('\n')}` : ''

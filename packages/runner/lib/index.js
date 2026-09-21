@@ -2920,25 +2920,8 @@ ${[...deadLines.map((l) => `- \u274C${l}`), ...entries.map((f) => `- \u{1F500}${
           if (p !== void 0 && (p.state === "complete" || p.state === "failed" || p.state === "skipped")) continue;
           if (q2.difficulty >= 55 && q2.lastVerdict !== "complete") hardOpen.push(code);
         }
-        for (const code of hardOpen.slice(0, 3)) {
-          const q2 = s.v2[code];
-          if (q2.autoR2 !== true) {
-            q2.autoR2 = true;
-            s.v2[code] = q2;
-            persistV2(s);
-            if (jisi?.fanoutNotify !== void 0) {
-              const prompt = buildRefanoutPrompt(code);
-              const models = await pickRefanoutModels(q2);
-              const ticket = jisi.fanoutNotify(parentAgent ?? exec?.agent, { prompt }, models);
-              q2.ideaRound += 1;
-              q2.triedModels.push(...models.filter((m) => !q2.triedModels.includes(m)));
-              s.v2[code] = q2;
-              persistV2(s);
-              escLines.push(`\u23F0 \u672B\u6BB5\u81EA\u52A8 R2: ${code} \u5DF2\u81EA\u52A8\u53D1\u8D77\u4E8C\u6B21\u5F81\u96C6(${models.join(", ")}, ticket ${ticket.id})\u2014\u2014\u53EF jisi_fanout_drop \u6539\u5224`);
-            } else {
-              escLines.push(`\u23F0 \u672B\u6BB5\u8D76\u5DE5: ${code} \u672A\u7834\u4E14 jisi \u901A\u9053\u4E0D\u53EF\u7528 \u2192 \u624B\u52A8 xiaochang_refanout`);
-            }
-          }
+        if (hardOpen.length > 0) {
+          escLines.push(`\u23F0 \u672B\u6BB5\u8D76\u5DE5\u63D0\u793A(\u673A\u5236\u4E0D\u4EE3\u52B3): \u672A\u7834 hard ${hardOpen.slice(0, 3).join(" ")}\u2014\u2014\u6309\u5F00\u6218\u4EE4\u7EAA\u5F8B\u663E\u5F0F fanout \u52A0\u6A21\u578B\u5E76\u6D3E\u6700\u6E05\u6670\u4E00\u8DEF`);
         }
       }
       const escTxt = escLines.length > 0 ? `
