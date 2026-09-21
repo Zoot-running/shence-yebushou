@@ -817,7 +817,7 @@ export function apply(ctx: Context): void {
       const itemTxt = items.length === 0
         ? '在途0(槽空转——可 enqueue 该题加 dispatchNow 当场补兵)'
         : items.map(v => {
-          const w = v.item.id.split('#')[2] ?? v.item.id
+          const w = v.item.id.split('#')[1] ?? v.item.id
           const at = v.dispatchedAt ?? now
           const mins = Math.round((now - at) / 60000)
           const stale = now - at > 45 * 60_000 ? '⚠️>45m' : ''

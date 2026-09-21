@@ -1423,7 +1423,7 @@ function apply(ctx) {
       const items = c().ledger.views().filter((v) => codeOf(v.item.id) === code && (v.state === "dispatched" || v.state === "help" || v.state === "stalled"));
       const boxLeft = o.grantedUntil !== void 0 ? Math.max(0, Math.round((o.grantedUntil - now) / 6e4)) : "?";
       const itemTxt = items.length === 0 ? "\u5728\u90140(\u69FD\u7A7A\u8F6C\u2014\u2014\u53EF enqueue \u8BE5\u9898\u52A0 dispatchNow \u5F53\u573A\u8865\u5175)" : items.map((v) => {
-        const w = v.item.id.split("#")[2] ?? v.item.id;
+        const w = v.item.id.split("#")[1] ?? v.item.id;
         const at = v.dispatchedAt ?? now;
         const mins = Math.round((now - at) / 6e4);
         const stale = now - at > 45 * 6e4 ? "\u26A0\uFE0F>45m" : "";
