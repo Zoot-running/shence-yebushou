@@ -664,8 +664,8 @@ export function apply(ctx: Context): void {
     } catch { /* 旗仓写失败不阻断 */ }
   }
   /** submit 回执 → 旗仓状态行(accepted/rejected; "改"操作由 submit 内部代劳)。 */
-  function recordFlagVerdict(code: string, flag: string, status: FlagStatus, verdict?: string): void {
-    appendFlagEntry({ code, flag, by: 'submit', status, verdict, at: Date.now() })
+  function recordFlagVerdict(code: string, flag: string, status: FlagStatus, verdict?: string, flagIndex?: number): void {
+    appendFlagEntry({ code, flag, by: 'submit', status, verdict, ...(flagIndex !== undefined ? { flagIndex } : {}), at: Date.now() })
     const s = state
     if (s !== undefined) { s.orchVersion += 1 }
   }
@@ -999,6 +999,17 @@ export function apply(ctx: Context): void {
     // (否则主 agent 不敢提前收兵, 又退回"跑满盒"——用户裁定)。
     if (s.manualInterrupted.has(itemId)) {
       audit(s.auditPath, { type: 'v8-settle-manual', itemId, code })
+      // v8.5.2d 孤儿容器修复(21013 a-02 实锤): 收兵收回最后一兵时, 补上正常 settle 的
+      // "关容器+释放槽"——否则平台容器开着占 3 名额、题已回队, tick 空转不授予新题。
+      const memberCodes = [code, ...(o.cluster ?? [])]
+      const hasOthers = c().ledger.views().some(x => x.item.id !== itemId && memberCodes.includes(codeOf(x.item.id))
+        && (x.state === 'dispatched' || x.state === 'help' || x.state === 'stalled'))
+      if (!hasOthers) {
+        try { await s.adapter.close(code) } catch { /* 平台侧已关 */ }
+        await releaseGrant(code)
+        s.progress.update(code, { containerClosed: true })
+        audit(s.auditPath, { type: 'v8-settle-manual-close', itemId, code })
+      }
       return
     }
     const sn = o.snapshot
@@ -1119,6 +1130,23 @@ export function apply(ctx: Context): void {
       audit(s.auditPath, { type: 'v8-timebox', code })
       changed = true
     }
+    // v8.5.2d 孤儿容器兜底: 已回队(queued)但平台容器还开着的题(人工收兵/迟到 settle
+    // 漏关) → 补关, 把 3 容器名额还回去。
+    const orphanCandidates = [...s.orch.entries()].filter(([, o]) =>
+      o.state === 'queued' && o.lastGrantAt !== undefined && now - o.lastGrantAt > s.timeboxMs)
+    if (orphanCandidates.length > 0) {
+      try {
+        const fresh = await s.adapter.listChallenges()
+        for (const [code] of orphanCandidates) {
+          const ch = fresh.find(x => x.unique_code === code)
+          if (ch !== undefined && ch.container_status !== undefined && !['stopped', 'closed'].includes(ch.container_status)) {
+            try { await s.adapter.close(code) } catch { /* 已关 */ }
+            audit(s.auditPath, { type: 'v8-orphan-close', code })
+            changed = true
+          }
+        }
+      } catch { /* 刷新失败不阻断 */ }
+    }
     if (changed) {
       bumpOrch(s)
       persistOrch(s)
@@ -1162,6 +1190,10 @@ export function apply(ctx: Context): void {
       `方向段全文(若被截断, 完整版在此): ${directivePathOf(code)}`,
       `你的任务(最高优先级, 与下方速查冲突时以此为准): ${directive}`,
       ...(ideas.length > 0 ? [`未消费采纳思路 ${ideas.length} 条(账本①可见, 可自行拾取): ${ideas.map(i => i.text.slice(0, 80)).join(' | ').slice(0, 400)}`] : []),
+      ...(() => {
+        const doneIdx = [...new Set(readFlagEntries().filter(e => e.code === code && e.status === 'accepted' && e.flagIndex !== undefined).map(e => e.flagIndex as number))].sort((a, b) => a - b)
+        return doneIdx.length > 0 ? [`已交旗位: ${doneIdx.join(',')}——勿再上报同旗位轮换值(平台 409 duplicate, 不计新分)`] : []
+      })(),
       pacingTxt.trim() !== '' ? pacingTxt.trim() : '',
       templateTxt.trim() !== '' ? `家族: ${family}(背景速查, 与任务冲突以任务为准)${templateTxt}` : '',
       '纪律: ①先读知识账本, 从已知边界出发, 不重复死路, 优先用回收工件;',
@@ -1633,9 +1665,15 @@ export function apply(ctx: Context): void {
         // v8.3 计分表: 平台 submit 回执 cumulative_score = 该题已得累计分(单题语义, 含 hint 扣减)。
         // 每笔回执都入表(无论对错), 求和即 run 总分——平台自己的账, 不自算。
         if (typeof res.cumulative_score === 'number') recordScore(s, args.code, res.cumulative_score)
+        // v8.5.2d: 409 duplicate = 该旗位早已交过(值是换实例后的轮换值)——真话记 accepted+duplicate 备注,
+        // 让旗仓条目终结(不再唤醒/不再重交), 不动编排状态(不是败绩, 不触发回队)。
+        if (res.duplicate === true) {
+          recordFlagVerdict(args.code, args.flag, 'accepted', `duplicate: 该值对应旗位已交(索引${res.matched_flag_index ?? '?'}), 轮换值不计新分`, res.matched_flag_index ?? undefined)
+          return `409 duplicate: ${args.flag} 对应旗位已提交过(索引 ${res.matched_flag_index ?? '?'})——旗仓已标记 accepted(duplicate), 不再唤醒; 该轮换值不计新分, 换旗位再打`
+        }
         if (res.correct) {
           recordWin(args.flag)
-          recordFlagVerdict(args.code, args.flag, 'accepted')
+          recordFlagVerdict(args.code, args.flag, 'accepted', undefined, res.matched_flag_index ?? undefined)
           await v8AfterSubmit(true)
           return JSON.stringify(res)
         }
@@ -1647,7 +1685,7 @@ export function apply(ctx: Context): void {
           if (typeof res2.cumulative_score === 'number') recordScore(s, args.code, res2.cumulative_score)
           if (res2.correct) {
             recordWin(wrapped)
-            recordFlagVerdict(args.code, wrapped, 'accepted')
+            recordFlagVerdict(args.code, wrapped, 'accepted', undefined, res2.matched_flag_index ?? undefined)
             recordFlagVerdict(args.code, args.flag, 'rejected', '裸串口径不对')
             await v8AfterSubmit(true)
             return `裸串被拒, 自动回退包装提交成功: ${JSON.stringify(res2)}`
@@ -1718,7 +1756,7 @@ export function apply(ctx: Context): void {
           const flagTxt = flag.length > 200
             ? `${flag.slice(0, 200)}…(共${flag.length}字符, 显示已截断——原文读 storages/xiaochang-flags.jsonl)`
             : flag
-          lines.push(`  ${code} [${e.status}] ${flagTxt}${e.verdict !== undefined ? ' — ' + e.verdict.slice(0, 60) : ''}${e.by !== '' ? ' (by ' + e.by + ')' : ''}`)
+          lines.push(`  ${code} [${e.status}${e.flagIndex !== undefined ? `·旗位${e.flagIndex}` : ''}] ${flagTxt}${e.verdict !== undefined ? ' — ' + e.verdict.slice(0, 60) : ''}${e.by !== '' ? ' (by ' + e.by + ')' : ''}`)
         }
       }
       return `旗仓: pending=${pending} accepted=${accepted} rejected=${rejected}\n${lines.join('\n') || '  (空)'}`
@@ -2711,8 +2749,8 @@ ${gaps}
       let clock: string
       if (s.runBearerToken === undefined || s.runId === undefined) {
         clock = '⚠️ 平台停表未执行（排名钟仍在走）：缺 runBearerToken/runId。请补调 xiaochang_setup 传入 runId+runBearerToken（或 env RUN_BEARER_TOKEN）后重试 xiaochang_finish'
-      } else if (!allTerminal) {
-        clock = 'ℹ️ 存在非终态题，未调平台停表'
+      } else if (!allTerminal && args.force !== true) {
+        clock = 'ℹ️ 存在非终态题，未调平台停表(需强停传 force=true——本地模式没有 guard 兜底, 钟会一直走)'
       } else {
         try {
           const res = await fetch(`${s.baseURL}/api/v1/runs/${s.runId}/finish`, {

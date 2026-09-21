@@ -173,6 +173,8 @@ beforeAll(async () => {
     budgetMinutes: 30,
     containerSlots: 3,
     timeboxMinutes: 2,
+    runId: 9911,
+    runBearerToken: 'mock-benchmark-token',
   }, parent)
   // 等原子授予跑起来
   await waitFor(() => auditLines().some(l => l.includes('"v8-grant"')), 15_000, 'v8-grant')
@@ -225,7 +227,7 @@ describe('v8 题队列宿主接线', () => {
     camp.emitSettle(t2.id, '未破: 依旧无果')
     await waitFor(() => auditLines().some(l => l.includes('"v8-settle"') && l.includes('adjudicate')), 20_000, 'adjudicate settle')
     // 待决清单
-    const orchPath = join(HOME, 'storages', 'xiaochang-orch-pending.json')
+    const orchPath = join(HOME, 'storages', 'xiaochang-orch-9911.json')
     await waitFor(() => existsSync(orchPath) && readFileSync(orchPath, 'utf8').includes('needs-verdict'), 20_000, 'pending needs-verdict')
     // status 仪表显示待裁决
     const st = await tool('xiaochang_status').execute({}, parent)
@@ -233,7 +235,7 @@ describe('v8 题队列宿主接线', () => {
   }, 90_000)
 
   it('S10 裁决 continue: 回队且待决清空', async () => {
-    const orchPath = join(HOME, 'storages', 'xiaochang-orch-pending.json')
+    const orchPath = join(HOME, 'storages', 'xiaochang-orch-9911.json')
     const d = JSON.parse(readFileSync(orchPath, 'utf8')) as { pending: Array<{ code: string }> }
     const code = d.pending[0]!.code
     const res = await tool('xiaochang_report').execute({ code, verdict: 'continue', reason: '再给一次机会' }, parent)
@@ -360,7 +362,7 @@ describe('v8.4 令文管线/判死/验证兵', () => {
     camp.emitSettle(item.id, '无旗无进展')
     // 机制只写建议(审计 + 待裁决条目), 不自动派兵。
     await waitFor(() => auditLines().some(l => l.includes('"v8-verifier-suggest"') && l.includes(code)), 15_000, 'verifier suggest')
-    const orchPath = join(HOME, 'storages', 'xiaochang-orch-pending.json')
+    const orchPath = join(HOME, 'storages', 'xiaochang-orch-9911.json')
     await waitFor(() => existsSync(orchPath) && readFileSync(orchPath, 'utf8').includes('验证建议'), 15_000, 'pending suggest')
     expect(itemsFor(code).some(i => i.label.includes('验证兵'))).toBe(false)
     // 主 agent 读待裁决后手动派验证兵。
@@ -371,7 +373,7 @@ describe('v8.4 令文管线/判死/验证兵', () => {
 
 describe('v8.5 调度权回归主 agent', () => {
   const orchOf = (code: string): { state: string; settleNoFlag: number } => {
-    const p = join(HOME, 'storages', 'xiaochang-orch-pending.json')
+    const p = join(HOME, 'storages', 'xiaochang-orch-9911.json')
     const d = JSON.parse(readFileSync(p, 'utf8')) as { orch: Record<string, { state: string; settleNoFlag: number }> }
     return d.orch[code] ?? { state: 'missing', settleNoFlag: 0 }
   }
@@ -462,5 +464,51 @@ describe('v8.5 调度权回归主 agent', () => {
     const st = String(await tool('xiaochang_flag_status').execute({}, parent))
     expect(st).toContain(longFlag) // ≤200 字符全文显示
     expect(st).not.toContain('显示已截断')
+  }, 30_000)
+
+  it('v8.5.2d 409 duplicate: 重复提交标 accepted(duplicate)+旗位, 不再假 pending(21013 b-02 死循环)', async () => {
+    const code = 'b-02'
+    const flag = 'mock{b02_flag1_website_leak}'
+    const r1 = await tool('xiaochang_submit').execute({ code, flag }, parent)
+    expect(JSON.parse(String(r1)).correct).toBe(true) // 首次: 平台收下, 索引 0
+    // 重复提交(换实例轮换值场景): 平台 409 → 旗仓 accepted(duplicate), 不再唤醒/重交
+    const r2 = await tool('xiaochang_submit').execute({ code, flag }, parent)
+    expect(String(r2)).toContain('409 duplicate')
+    expect(String(r2)).toContain('索引 0')
+    await waitFor(async () => String(await tool('xiaochang_flag_status').execute({ code }, parent)).includes('duplicate: 该值对应旗位已交'), 10_000, 'depot duplicate note')
+    // 状态保持 granted 不被打回(同 提交不撤销授予 修复)
+    expect(orchOf(code).state).toBe('granted')
+  }, 60_000)
+
+  it('v8.5.2d 已交旗位注入执行令: 后续执行者不再重抓已交旗位', async () => {
+    const code = 'b-02'
+    await tool('xiaochang_enqueue').execute({ code, prompt: 't6: 续打下一旗位' }, parent)
+    await waitFor(() => orchOf(code).state === 'granted', 90_000, 'b-02 granted')
+    const r = await tool('xiaochang_enqueue').execute({ code, prompt: 't6b: 已交旗位检查', dispatchNow: true }, parent)
+    expect(String(r)).toContain('已 dispatchNow 立即派发')
+    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched' && i.label.includes('已交旗位: 0')), 20_000, 'frame 已交旗位')
+  }, 150_000)
+
+  it('v8.5.2d 收兵关容器: 收回最后一兵时补关容器(21013 a-02 孤儿容器)', async () => {
+    const code = 'g-m1'
+    // 收掉全部在途(动态加兵测试留下的 3 路) → 最后一兵 settle 时应触发关容器
+    const inFlight = itemsFor(code).filter(i => i.state === 'dispatched').map(i => i.id)
+    if (inFlight.length === 0) {
+      await tool('xiaochang_enqueue').execute({ code, prompt: 't7: 收兵测试' }, parent)
+      await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched'), 60_000, 'fresh item for recall')
+    }
+    const ids = itemsFor(code).filter(i => i.state === 'dispatched').map(i => i.id)
+    const last = ids[ids.length - 1]!
+    const closesBefore = (await (await fetch(`http://127.0.0.1:${MOCK_PORT}/debug/closes`, { headers: { authorization: 'Bearer mock-benchmark-token' } })).json() as { count: number }).count
+    await tool('xiaochang_report').execute({ code, verdict: 'continue', interruptItemIds: ids, reason: '收兵测试' }, parent)
+    camp.emitSettle(last, '被主 agent 收回')
+    await waitFor(() => auditLines().some(l => l.includes('"v8-settle-manual-close"') && l.includes(code)), 15_000, 'manual close audit')
+    const closesAfter = (await (await fetch(`http://127.0.0.1:${MOCK_PORT}/debug/closes`, { headers: { authorization: 'Bearer mock-benchmark-token' } })).json() as { count: number }).count
+    expect(closesAfter).toBeGreaterThan(closesBefore)
+  }, 120_000)
+
+  it('v8.5.2d finish 门: force=true 放行平台停表(21013 两次收尾钟未停)', async () => {
+    const res = await tool('xiaochang_finish').execute({ force: true }, parent)
+    expect(String(res)).toContain('平台停表已确认')
   }, 30_000)
 })

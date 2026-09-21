@@ -24,6 +24,8 @@ export interface ChallengeInfo {
 
 export interface SubmitResult {
   correct: boolean
+  /** v8.5.2d: 平台 409 duplicate(该旗位已交, 值通常为换实例后的轮换值)。 */
+  duplicate?: boolean
   awarded: number
   cumulative_score: number
   correct_flag_count: number
@@ -79,7 +81,23 @@ export class TsecbenchAdapter {
       headers: this.headers(),
       body: JSON.stringify({ unique_code: uniqueCode, flag }),
     })
-    if (!res.ok) throw new Error(`tsecbench: submit ${uniqueCode} failed (${res.status}): ${JSON.stringify(await res.json())}`)
+    if (!res.ok) {
+      // v8.5.2d: 409 duplicate = 该旗位早已交过(幂等, 平台语义)——类型化返回而非抛异常,
+      // 让 runner 把旗仓条目终结为 accepted(duplicate), 不再反复唤醒/重交。
+      if (res.status === 409) {
+        const body = await res.json().catch(() => ({})) as Partial<SubmitResult>
+        return {
+          correct: false,
+          duplicate: true,
+          awarded: body.awarded ?? 0,
+          cumulative_score: body.cumulative_score ?? 0,
+          correct_flag_count: body.correct_flag_count ?? 0,
+          total_flag_count: body.total_flag_count ?? 0,
+          matched_flag_index: body.matched_flag_index ?? null,
+        }
+      }
+      throw new Error(`tsecbench: submit ${uniqueCode} failed (${res.status}): ${JSON.stringify(await res.json())}`)
+    }
     return await res.json() as SubmitResult
   }
 

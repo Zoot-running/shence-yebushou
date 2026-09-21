@@ -1215,8 +1215,8 @@ function apply(ctx) {
     } catch {
     }
   }
-  function recordFlagVerdict(code, flag, status, verdict) {
-    appendFlagEntry({ code, flag, by: "submit", status, verdict, at: Date.now() });
+  function recordFlagVerdict(code, flag, status, verdict, flagIndex) {
+    appendFlagEntry({ code, flag, by: "submit", status, verdict, ...flagIndex !== void 0 ? { flagIndex } : {}, at: Date.now() });
     const s = state;
     if (s !== void 0) {
       s.orchVersion += 1;
@@ -1556,6 +1556,17 @@ function apply(ctx) {
     const now = Date.now();
     if (s.manualInterrupted.has(itemId)) {
       audit(s.auditPath, { type: "v8-settle-manual", itemId, code });
+      const memberCodes = [code, ...o.cluster ?? []];
+      const hasOthers2 = c().ledger.views().some((x) => x.item.id !== itemId && memberCodes.includes(codeOf(x.item.id)) && (x.state === "dispatched" || x.state === "help" || x.state === "stalled"));
+      if (!hasOthers2) {
+        try {
+          await s.adapter.close(code);
+        } catch {
+        }
+        await releaseGrant(code);
+        s.progress.update(code, { containerClosed: true });
+        audit(s.auditPath, { type: "v8-settle-manual-close", itemId, code });
+      }
       return;
     }
     const sn = o.snapshot;
@@ -1671,6 +1682,24 @@ function apply(ctx) {
       audit(s.auditPath, { type: "v8-timebox", code });
       changed = true;
     }
+    const orphanCandidates = [...s.orch.entries()].filter(([, o]) => o.state === "queued" && o.lastGrantAt !== void 0 && now - o.lastGrantAt > s.timeboxMs);
+    if (orphanCandidates.length > 0) {
+      try {
+        const fresh = await s.adapter.listChallenges();
+        for (const [code] of orphanCandidates) {
+          const ch = fresh.find((x) => x.unique_code === code);
+          if (ch !== void 0 && ch.container_status !== void 0 && !["stopped", "closed"].includes(ch.container_status)) {
+            try {
+              await s.adapter.close(code);
+            } catch {
+            }
+            audit(s.auditPath, { type: "v8-orphan-close", code });
+            changed = true;
+          }
+        }
+      } catch {
+      }
+    }
     if (changed) {
       bumpOrch(s);
       persistOrch(s);
@@ -1705,6 +1734,10 @@ ${tpl}
       `\u65B9\u5411\u6BB5\u5168\u6587(\u82E5\u88AB\u622A\u65AD, \u5B8C\u6574\u7248\u5728\u6B64): ${directivePathOf(code)}`,
       `\u4F60\u7684\u4EFB\u52A1(\u6700\u9AD8\u4F18\u5148\u7EA7, \u4E0E\u4E0B\u65B9\u901F\u67E5\u51B2\u7A81\u65F6\u4EE5\u6B64\u4E3A\u51C6): ${directive}`,
       ...ideas.length > 0 ? [`\u672A\u6D88\u8D39\u91C7\u7EB3\u601D\u8DEF ${ideas.length} \u6761(\u8D26\u672C\u2460\u53EF\u89C1, \u53EF\u81EA\u884C\u62FE\u53D6): ${ideas.map((i) => i.text.slice(0, 80)).join(" | ").slice(0, 400)}`] : [],
+      ...(() => {
+        const doneIdx = [...new Set(readFlagEntries().filter((e) => e.code === code && e.status === "accepted" && e.flagIndex !== void 0).map((e) => e.flagIndex))].sort((a, b) => a - b);
+        return doneIdx.length > 0 ? [`\u5DF2\u4EA4\u65D7\u4F4D: ${doneIdx.join(",")}\u2014\u2014\u52FF\u518D\u4E0A\u62A5\u540C\u65D7\u4F4D\u8F6E\u6362\u503C(\u5E73\u53F0 409 duplicate, \u4E0D\u8BA1\u65B0\u5206)`] : [];
+      })(),
       pacingTxt.trim() !== "" ? pacingTxt.trim() : "",
       templateTxt.trim() !== "" ? `\u5BB6\u65CF: ${family}(\u80CC\u666F\u901F\u67E5, \u4E0E\u4EFB\u52A1\u51B2\u7A81\u4EE5\u4EFB\u52A1\u4E3A\u51C6)${templateTxt}` : "",
       "\u7EAA\u5F8B: \u2460\u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1, \u4E0D\u91CD\u590D\u6B7B\u8DEF, \u4F18\u5148\u7528\u56DE\u6536\u5DE5\u4EF6;",
@@ -2154,9 +2187,13 @@ ${manifest.join("\n")}`;
         };
         const res = await s.adapter.submit(args.code, args.flag);
         if (typeof res.cumulative_score === "number") recordScore(s, args.code, res.cumulative_score);
+        if (res.duplicate === true) {
+          recordFlagVerdict(args.code, args.flag, "accepted", `duplicate: \u8BE5\u503C\u5BF9\u5E94\u65D7\u4F4D\u5DF2\u4EA4(\u7D22\u5F15${res.matched_flag_index ?? "?"}), \u8F6E\u6362\u503C\u4E0D\u8BA1\u65B0\u5206`, res.matched_flag_index ?? void 0);
+          return `409 duplicate: ${args.flag} \u5BF9\u5E94\u65D7\u4F4D\u5DF2\u63D0\u4EA4\u8FC7(\u7D22\u5F15 ${res.matched_flag_index ?? "?"})\u2014\u2014\u65D7\u4ED3\u5DF2\u6807\u8BB0 accepted(duplicate), \u4E0D\u518D\u5524\u9192; \u8BE5\u8F6E\u6362\u503C\u4E0D\u8BA1\u65B0\u5206, \u6362\u65D7\u4F4D\u518D\u6253`;
+        }
         if (res.correct) {
           recordWin(args.flag);
-          recordFlagVerdict(args.code, args.flag, "accepted");
+          recordFlagVerdict(args.code, args.flag, "accepted", void 0, res.matched_flag_index ?? void 0);
           await v8AfterSubmit(true);
           return JSON.stringify(res);
         }
@@ -2167,7 +2204,7 @@ ${manifest.join("\n")}`;
           if (typeof res2.cumulative_score === "number") recordScore(s, args.code, res2.cumulative_score);
           if (res2.correct) {
             recordWin(wrapped);
-            recordFlagVerdict(args.code, wrapped, "accepted");
+            recordFlagVerdict(args.code, wrapped, "accepted", void 0, res2.matched_flag_index ?? void 0);
             recordFlagVerdict(args.code, args.flag, "rejected", "\u88F8\u4E32\u53E3\u5F84\u4E0D\u5BF9");
             await v8AfterSubmit(true);
             return `\u88F8\u4E32\u88AB\u62D2, \u81EA\u52A8\u56DE\u9000\u5305\u88C5\u63D0\u4EA4\u6210\u529F: ${JSON.stringify(res2)}`;
@@ -2231,7 +2268,7 @@ ${manifest.join("\n")}`;
           else if (e.status === "accepted") accepted += 1;
           else rejected += 1;
           const flagTxt = flag.length > 200 ? `${flag.slice(0, 200)}\u2026(\u5171${flag.length}\u5B57\u7B26, \u663E\u793A\u5DF2\u622A\u65AD\u2014\u2014\u539F\u6587\u8BFB storages/xiaochang-flags.jsonl)` : flag;
-          lines.push(`  ${code} [${e.status}] ${flagTxt}${e.verdict !== void 0 ? " \u2014 " + e.verdict.slice(0, 60) : ""}${e.by !== "" ? " (by " + e.by + ")" : ""}`);
+          lines.push(`  ${code} [${e.status}${e.flagIndex !== void 0 ? `\xB7\u65D7\u4F4D${e.flagIndex}` : ""}] ${flagTxt}${e.verdict !== void 0 ? " \u2014 " + e.verdict.slice(0, 60) : ""}${e.by !== "" ? " (by " + e.by + ")" : ""}`);
         }
       }
       return `\u65D7\u4ED3: pending=${pending} accepted=${accepted} rejected=${rejected}
@@ -3251,8 +3288,8 @@ ${inflightSummary()}`);
       let clock;
       if (s.runBearerToken === void 0 || s.runId === void 0) {
         clock = "\u26A0\uFE0F \u5E73\u53F0\u505C\u8868\u672A\u6267\u884C\uFF08\u6392\u540D\u949F\u4ECD\u5728\u8D70\uFF09\uFF1A\u7F3A runBearerToken/runId\u3002\u8BF7\u8865\u8C03 xiaochang_setup \u4F20\u5165 runId+runBearerToken\uFF08\u6216 env RUN_BEARER_TOKEN\uFF09\u540E\u91CD\u8BD5 xiaochang_finish";
-      } else if (!allTerminal) {
-        clock = "\u2139\uFE0F \u5B58\u5728\u975E\u7EC8\u6001\u9898\uFF0C\u672A\u8C03\u5E73\u53F0\u505C\u8868";
+      } else if (!allTerminal && args.force !== true) {
+        clock = "\u2139\uFE0F \u5B58\u5728\u975E\u7EC8\u6001\u9898\uFF0C\u672A\u8C03\u5E73\u53F0\u505C\u8868(\u9700\u5F3A\u505C\u4F20 force=true\u2014\u2014\u672C\u5730\u6A21\u5F0F\u6CA1\u6709 guard \u515C\u5E95, \u949F\u4F1A\u4E00\u76F4\u8D70)";
       } else {
         try {
           const res = await fetch(`${s.baseURL}/api/v1/runs/${s.runId}/finish`, {

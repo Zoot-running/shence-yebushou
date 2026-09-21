@@ -291,6 +291,8 @@ export interface FlagEntry {
   status: FlagStatus
   /** rejected 时的平台判定原文(可选)。 */
   verdict?: string
+  /** v8.5.2d: 提交回执的旗位索引(accepted 时记; 执行令帧列"已交旗位"防轮换值重报)。 */
+  flagIndex?: number
   at: number
 }
 

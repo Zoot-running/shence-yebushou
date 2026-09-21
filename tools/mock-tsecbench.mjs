@@ -27,12 +27,14 @@ const FLAG_071 = ['mock{xb071_header_flag}']
 const FLAG_056 = ['mock{xb056_lsb_stego}']
 
 const challenges = []
+const debugState = { closes: 0 }
 function add(code, difficulty, score, flags, description, handler) {
   challenges.push({
     unique_code: code, difficulty, total_score: score, flag_count: flags.length,
     flags, correct_flag_count: 0, is_completed: false,
     container_status: 'stopped', container_addr: [],
     description, handler,
+    submitted: [],
   })
 }
 for (let i = 0; i < 4; i += 1) {
@@ -157,6 +159,8 @@ function route(req, res) {
   const p = url.pathname
   const q = url.searchParams
   if (p === '/health') return json(res, 200, { status: 'ok', ok: true, mock: 'dryrun' })
+  if (p === '/debug/closes' && req.method === 'GET') return json(res, 200, { count: debugState.closes })
+  if (p.startsWith('/api/v1/runs/') && p.endsWith('/finish') && req.method === 'POST') return json(res, 200, { run_id: p.split('/')[4], status: 'finished' })
   if (p === '/openapi/v1/challenges' && req.method === 'GET') {
     return json(res, 200, { challenges: challenges.map(c => ({ ...c, handler: undefined })) })
   }
@@ -184,8 +188,20 @@ function route(req, res) {
       const { unique_code, flag } = parseBody(body)
       const ch = challenges.find(c => c.unique_code === unique_code)
       if (!ch) return json(res, 404, { detail: 'unknown challenge' })
-      const correct = ch.flags.includes(flag) && !ch.flags.slice(0, ch.correct_flag_count).includes(flag)
+      // v8.5.2d: 对齐真实平台——已交过的值(含轮换值)重复提交 → 409 duplicate(幂等)。
+      if (ch.submitted.includes(flag)) {
+        const perFlag = Math.round(ch.total_score / ch.flag_count)
+        return json(res, 409, {
+          detail: 'duplicate',
+          correct: false, awarded: 0,
+          cumulative_score: ch.correct_flag_count * perFlag,
+          correct_flag_count: ch.correct_flag_count, total_flag_count: ch.flag_count,
+          matched_flag_index: ch.flags.indexOf(flag),
+        })
+      }
+      const correct = ch.flags.includes(flag)
       if (correct) {
+        ch.submitted.push(flag)
         ch.correct_flag_count += 1
         if (ch.correct_flag_count >= ch.flag_count) ch.is_completed = true
       }
@@ -202,7 +218,7 @@ function route(req, res) {
   if (p === '/openapi/v1/challenges/close' && req.method === 'POST') {
     const code = q.get('unique_code')
     const ch = challenges.find(c => c.unique_code === code)
-    if (ch) { ch.container_status = 'stopped'; ch.container_addr = [] }
+    if (ch) { ch.container_status = 'stopped'; ch.container_addr = []; debugState.closes += 1 }
     return json(res, 200, { closed: true })
   }
   if (p === '/openapi/v1/challenges/hint' && req.method === 'GET') {
