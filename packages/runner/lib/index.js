@@ -605,7 +605,6 @@ function familyOf(description, difficulty) {
 }
 function hintGateV2(input) {
   const missing = [];
-  if (input.blockerConfirmed) return { allowed: true, missing: [] };
   if (input.settleNoFlag >= 2) return { allowed: true, missing: [] };
   if (input.ideaRound < 2) missing.push(`R2 \u4E8C\u6B21\u5F81\u96C6\u672A\u8D70(\u5F53\u524D\u7B2C ${input.ideaRound} \u8F6E)\u2014\u2014\u5148 xiaochang_refanout \u52A0\u6A21\u578B\u518D\u6253\u4E00\u8F6E`);
   if (input.settleNoFlag < 1) missing.push("\u8BE5\u9898\u5C1A\u65E0\u771F\u5B9E\u8D25\u7EE9(\u65E0\u65D7 settle \u22651 \u81EA\u52A8\u8BA1)\u2014\u2014\u5148\u6D3E\u6267\u884C\u8005\u6253\u4E00\u8F6E");
@@ -648,19 +647,6 @@ var TIMEBOX_MS = 30 * 6e4;
 var SUBMIT_GRACE_MS = 15 * 6e4;
 var NEVER_DISPATCHED_BOOST_STEP_MS = 30 * 6e4;
 var NEVER_DISPATCHED_BOOST_MAX = 3;
-var BLOCKER_RE = /(攻击面\s*缺失|无攻击面|攻击面.*(?:不存在|缺失)|环境缺失|未随容器|平台.*未(?:发布|暴露)|未暴露|not exposed|no attack surface|unreachable|不可达|服务未启动|仅.*静态)/i;
-function blockerConcluded(text) {
-  return BLOCKER_RE.test(text);
-}
-function verifierVerdict(text) {
-  const confirm = /(blocker\s*成立|确认|confirmed|攻击面\s*确实|确无|verify\s*ok)/i;
-  const refute = /(推翻|不成立|refut|攻击面\s*存在|有攻击面|误判)/i;
-  const c = confirm.test(text);
-  const r = refute.test(text);
-  if (c && !r) return "confirm";
-  if (r && !c) return "refute";
-  return "unclear";
-}
 function realProgress(p) {
   return p.forkDelta > 0 || p.artifactsDelta > 0;
 }
@@ -669,25 +655,8 @@ function fingerprintOf(detail) {
 }
 function settleAction(orch, p) {
   if (p.flagCandidate) return "pending-flag";
-  if (p.blockerConcluded) {
-    if (orch.blockerCheck === "confirmed") return "adjudicate";
-    if (orch.blockerCheck === "in-flight" || orch.blockerCheck === "refuted") {
-    } else {
-      return "verify-blocker";
-    }
-  }
-  if (realProgress(p)) {
-    if (orch.progressStreak + 1 >= 2) return "rearm-all-in";
-    return "rearm";
-  }
-  const streak = orch.zeroProgressStreak + 1;
-  if (streak === 1) return "rearm-all-in";
-  return "adjudicate";
-}
-function applyVerifierResult(orch, verdict) {
-  if (verdict === "confirm") orch.blockerCheck = "confirmed";
-  else if (verdict === "refute") orch.blockerCheck = "refuted";
-  else orch.blockerCheck = "none";
+  if (realProgress(p)) return "rearm";
+  return orch.zeroProgressStreak + 1 === 1 ? "rearm-zero" : "adjudicate";
 }
 function applySettle(orch, action, detail, now) {
   orch.lastSettleFingerprint = fingerprintOf(detail);
@@ -702,25 +671,14 @@ function applySettle(orch, action, detail, now) {
       orch.state = "queued";
       orch.zeroProgressStreak = 0;
       orch.progressStreak += 1;
-      orch.r2Due = false;
-      orch.multiSpawn = 0;
       break;
-    case "rearm-all-in":
+    case "rearm-zero":
       orch.state = "queued";
       orch.zeroProgressStreak = 1;
       orch.progressStreak = 0;
-      orch.r2Due = true;
-      orch.multiSpawn = 3;
       break;
     case "adjudicate":
       orch.state = "pending-adjudication";
-      orch.multiSpawn = 0;
-      break;
-    case "verify-blocker":
-      orch.state = "queued";
-      orch.blockerCheck = "in-flight";
-      orch.r2Due = false;
-      orch.multiSpawn = 1;
       break;
   }
   return orch;
@@ -728,7 +686,6 @@ function applySettle(orch, action, detail, now) {
 function rearmByTimebox(orch) {
   orch.state = "queued";
   orch.grantedUntil = void 0;
-  orch.multiSpawn = 0;
   return orch;
 }
 function adjudicate(orch, verdict) {
@@ -738,8 +695,6 @@ function adjudicate(orch, verdict) {
       orch.state = "queued";
       orch.zeroProgressStreak = 0;
       orch.progressStreak = 0;
-      orch.r2Due = false;
-      orch.blockerCheck = "none";
       orch.grantedUntil = void 0;
       orch.lastSettleFingerprint = void 0;
       break;
@@ -761,7 +716,6 @@ function grant(orch, snapshot, now, timeboxMs = TIMEBOX_MS) {
   orch.grantedUntil = now + timeboxMs;
   orch.neverDispatched = false;
   orch.snapshot = snapshot;
-  orch.r2Due = false;
   return orch;
 }
 function timeboxExpired(orch, now) {
@@ -816,10 +770,7 @@ function newOrch(code, now) {
     progressStreak: 0,
     neverDispatched: true,
     directives: [],
-    r2Due: false,
-    multiSpawn: 0,
     settleNoFlag: 0,
-    blockerCheck: "none",
     cluster: [],
     createdAt: now
   };
@@ -1373,24 +1324,6 @@ function apply(ctx) {
     if (mix.length === 0) return s.executorPolicy.defaultModel;
     return mix[idx % mix.length];
   }
-  async function issueR2(code) {
-    const s = requireState();
-    if (jisi?.fanoutNotify === void 0 || parentAgent === void 0) return;
-    const ch = s.challenges.get(code);
-    if (ch === void 0) return;
-    const vq = ensureVq(code);
-    try {
-      const prompt = buildRefanoutPrompt(code);
-      const models = await pickRefanoutModels(vq);
-      const ticket = jisi.fanoutNotify(parentAgent, { prompt }, models);
-      vq.ideaRound += 1;
-      vq.triedModels.push(...models.filter((m) => !vq.triedModels.includes(m)));
-      s.v2[code] = vq;
-      persistV2(s);
-      audit(s.auditPath, { type: "v8-r2", code, models, ticket: ticket.id });
-    } catch {
-    }
-  }
   const VERIFIER_DIRECTIVE = '[\u9A8C\u8BC1\u5175] \u72EC\u7ACB\u590D\u9A8C\u8D26\u672C\u91CC\u7684 blocker \u7ED3\u8BBA("\u65E0\u653B\u51FB\u9762/\u73AF\u5883\u7F3A\u5931/\u672A\u53D1\u5E03"\u7C7B): \u4E0D\u8981\u4FE1\u4EFB\u524D\u5E8F\u5224\u5B9A, \u91CD\u8DD1\u63A2\u6D4B\u786E\u8BA4\u3002\u8F93\u51FA\u5F00\u5934\u4E00\u884C "\u590D\u9A8C: \u786E\u8BA4" \u6216 "\u590D\u9A8C: \u63A8\u7FFB", \u9644\u8BC1\u636E; \u82E5\u63A8\u7FFB, \u7ACB\u5373\u7EE7\u7EED\u89E3\u9898(\u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1)\u3002';
   const spawnQueue = [];
   let spawning = false;
@@ -1553,39 +1486,19 @@ function apply(ctx) {
     }
     o.cluster = siblings;
     grant(o, snapshot, Date.now(), s.timeboxMs);
-    const nSpawn = Math.max(1, o.spawnRequest ?? o.multiSpawn);
-    o.multiSpawn = 0;
-    o.spawnRequest = void 0;
-    if (o.r2Due) {
-      o.r2Due = false;
-      void issueR2(code);
-    }
     const vq = ensureVq(code);
-    const picks = [];
-    if (o.blockerCheck === "in-flight") {
-      picks.push({ text: VERIFIER_DIRECTIVE });
-    } else {
-      const memberCodes = [code, ...o.cluster];
-      const untried = memberCodes.flatMap((c2) => {
-        const oo = s.orch.get(c2);
-        return (oo?.directives ?? []).filter((d) => !d.tried);
-      });
-      for (let i = 0; i < nSpawn; i++) {
-        const d = untried.shift();
-        if (d !== void 0) picks.push(d);
-        else picks.push({ text: "\u6309\u8D26\u672C+\u753B\u50CF\u81EA\u7531\u7A81\u7834: \u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1, \u4E0D\u6253\u6B7B\u8DEF" });
-      }
-      for (const d of picks) {
-        for (const c2 of memberCodes) {
-          const orig = s.orch.get(c2)?.directives.find((x) => x.text === d.text);
-          if (orig !== void 0) orig.tried = true;
-        }
-      }
+    const memberCodes = [code, ...o.cluster];
+    const untried = memberCodes.flatMap((c2) => {
+      const oo = s.orch.get(c2);
+      return (oo?.directives ?? []).filter((d2) => !d2.tried);
+    });
+    const d = untried.shift() ?? { text: "\u6309\u8D26\u672C+\u753B\u50CF\u81EA\u7531\u7A81\u7834: \u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1, \u4E0D\u6253\u6B7B\u8DEF" };
+    for (const c2 of memberCodes) {
+      const orig = s.orch.get(c2)?.directives.find((x) => x.text === d.text);
+      if (orig !== void 0) orig.tried = true;
     }
-    for (let i = 0; i < picks.length; i++) {
-      await spawnExecutor(code, o, picks[i], i, prio, cls, vq);
-    }
-    audit(s.auditPath, { type: "v8-grant", code, spawn: picks.length });
+    await spawnExecutor(code, o, d, 0, prio, cls, vq);
+    audit(s.auditPath, { type: "v8-grant", code, spawn: 1 });
     bumpOrch(s);
     persistOrch(s);
     persistProgress(s);
@@ -1652,7 +1565,6 @@ function apply(ctx) {
       findingsDelta: sn !== void 0 ? Math.max(0, findingsLines(code) - sn.findingsLines) : 0,
       forkDelta: sn !== void 0 ? Math.max(0, knowledgeOfCode(code).length - sn.forkCount) : 0,
       artifactsDelta: sn !== void 0 ? Math.max(0, artifactCount(code) - sn.artifactCount) : 0,
-      blockerConcluded: blockerConcluded(detail) || knowledgeOfCode(code).some((k) => k.kind === "dead-end" && blockerConcluded(`${k.path} ${k.conclusion ?? ""}`)),
       detail
     };
     const handoff = parseHandoffForks(detail);
@@ -1664,40 +1576,33 @@ function apply(ctx) {
       } catch {
       }
     }
-    const maybeAutoVerifier = () => {
-      const sealed = sealedClustersOf(knowledgeOfCode(code).filter((k) => k.kind === "dead-end"));
-      if (sealed.length > 0 && o.state !== "dead" && o.state !== "solved" && o.blockerCheck !== "in-flight") {
-        const dispatched = s.verifierDispatched.get(code) ?? 0;
-        if (dispatched < 1) {
-          s.verifierDispatched.set(code, dispatched + 1);
-          o.blockerCheck = "in-flight";
-          o.state = "queued";
-          o.multiSpawn = 1;
-          addPending(s, makePending(code, "needs-verdict", `${code} \u6B7B\u8DEF\u5C01\u5370\u7C07 ${sealed.map((x) => `${x.direction}\xD7${x.count}`).join("|")} \u2192 \u9A8C\u8BC1\u5175\u5DF2\u81EA\u52A8\u89E6\u53D1(\u7FFB\u6848\u56DE\u5408)`, c().boardPath(code), now));
-          audit(s.auditPath, { type: "v8-verifier-auto", code, sealed: sealed.map((x) => x.direction) });
-        }
+    const maybeSuggestVerifier = () => {
+      const sealed2 = sealedClustersOf(knowledgeOfCode(code).filter((k) => k.kind === "dead-end"));
+      if (sealed2.length > 0 && o.state !== "dead" && o.state !== "solved") {
+        const summary = `\u9A8C\u8BC1\u5EFA\u8BAE: ${code} \u6B7B\u8DEF\u5C01\u5370\u7C07 ${sealed2.map((x) => `${x.direction}\xD7${x.count}`).join("|")} \u2014 \u5EFA\u8BAE\u6D3E\u9A8C\u8BC1\u5175\u7FFB\u6848(\u53EF\u6284\u4EE4\u6587: ${VERIFIER_DIRECTIVE})`;
+        addPending(s, makePending(code, "needs-verdict", summary, c().boardPath(code), now));
+        audit(s.auditPath, { type: "v8-verifier-suggest", code, sealed: sealed2.map((x) => `${x.direction}\xD7${x.count}`) });
       }
     };
     if (o.state !== "granted") {
       if (!p.flagCandidate) o.settleNoFlag += 1;
-      maybeAutoVerifier();
+      maybeSuggestVerifier();
       refreshHintGate(s, code);
       bumpOrch(s);
       persistOrch(s);
       audit(s.auditPath, { type: "v8-settle-late", itemId, code, state: o.state, settleNoFlag: o.settleNoFlag });
       return;
     }
-    if (o.blockerCheck === "in-flight") applyVerifierResult(o, verifierVerdict(detail));
     const action = settleAction(o, p);
     applySettle(o, action, detail, now);
     if (!p.flagCandidate) o.settleNoFlag += 1;
     const board = c().boardPath(code);
+    const sealed = sealedClustersOf(knowledgeOfCode(code).filter((k) => k.kind === "dead-end"));
     if (action === "pending-flag") {
       addPending(s, makePending(code, "flag-candidate", `${code} \u6709\u65D7\u5F85\u63D0\u4EA4: \u5C3D\u5FEB xiaochang_submit(\u5BB9\u5668\u5728\u7EBF\u5BBD\u9650 15min, \u8D85\u65F6\u5BB9\u5668\u5173/\u65D7\u503C\u53EF\u80FD\u8F6E\u6362)`, board, now));
     } else if (action === "adjudicate") {
-      const kind = o.blockerCheck === "confirmed" ? "blocker-verified" : "needs-verdict";
-      const summary = kind === "blocker-verified" ? `${code} blocker \u5DF2\u88AB\u9A8C\u8BC1\u5175\u786E\u8BA4: \u4E3B agent \u88C1\u51B3 \u5224\u6B7B/\u7EED\u6253` : `${code} \u96F6\u8FDB\u5C55\xD7${o.zeroProgressStreak} \u6302\u88C1\u51B3: \u4E3B agent \u88C1\u51B3 \u5224\u6B7B/\u7EED\u6253/\u62C9hint(\u95F8\u5DF2\u5F00)`;
-      addPending(s, makePending(code, kind, summary, board, now));
+      const sealTxt = sealed.length > 0 ? ` \u6B7B\u8DEF\u5C01\u5370\u7C07 ${sealed.map((x) => `${x.direction}\xD7${x.count}`).join("|")} \u2014 \u5EFA\u8BAE\u6D3E\u9A8C\u8BC1\u5175\u7FFB\u6848` : "";
+      addPending(s, makePending(code, "needs-verdict", `${code} \u96F6\u8FDB\u5C55\xD7${o.zeroProgressStreak} \u6302\u88C1\u51B3: \u4E3B agent \u88C1\u51B3 \u5224\u6B7B/\u7EED\u6253/\u62C9hint(\u95F8\u5DF2\u5F00)${sealTxt}`, board, now));
     }
     const hasOthers = c().ledger.views().some((x) => x.item.id !== itemId && codeOf(x.item.id) === code && (x.state === "dispatched" || x.state === "help" || x.state === "stalled"));
     if (action !== "pending-flag" && !hasOthers) {
@@ -1721,7 +1626,7 @@ function apply(ctx) {
         audit(s.auditPath, { type: "v8-settle-cluster", itemId, code, sibling: sb, action: action2 });
       }
     }
-    if (action !== "verify-blocker") maybeAutoVerifier();
+    if (action !== "adjudicate") maybeSuggestVerifier();
     audit(s.auditPath, { type: "v8-settle", itemId, code, action, flagCandidate: p.flagCandidate, settleNoFlag: o.settleNoFlag });
     refreshHintGate(s, code);
     for (const sb of o.cluster) refreshHintGate(s, sb);
@@ -1738,8 +1643,7 @@ function apply(ctx) {
     const vq = s.v2[code];
     const gate = hintGateV2({
       ideaRound: vq?.ideaRound ?? 1,
-      settleNoFlag: o.settleNoFlag ?? 0,
-      blockerConfirmed: o.blockerCheck === "confirmed"
+      settleNoFlag: o.settleNoFlag ?? 0
     });
     if (gate.allowed) {
       if (!s.hintGateOpen.has(code)) {
@@ -1906,7 +1810,6 @@ ${tpl}
         tickCount: 0,
         scoreTable: {},
         hintGateOpen: /* @__PURE__ */ new Set(),
-        verifierDispatched: /* @__PURE__ */ new Map(),
         manualInterrupted: /* @__PURE__ */ new Set()
       };
       try {
@@ -2330,7 +2233,7 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
   }));
   register(defineTool({
     name: "xiaochang_hint",
-    description: "Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only \u2014 settleNoFlag \u22652 (\u4E24\u8F6E\u771F\u5B9E\u8D25\u7EE9, \u65E0\u65D7 settle \u81EA\u52A8\u8BA1) \u6216 (ideaRound\u22652 \u4E14 settleNoFlag\u22651) \u6216 blocker \u5DF2\u88AB\u9A8C\u8BC1\u5175\u786E\u8BA4\u3002\u95F8\u5F00\u65F6 xiaochang_wait \u4F1A\u4E3B\u52A8\u63A8\u9001 hint-gate-open \u4E8B\u4EF6(\u4E0D\u5FC5\u53CD\u590D\u8BD5). The deduction is reported loudly.",
+    description: "Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only \u2014 settleNoFlag \u22652 (\u4E24\u8F6E\u771F\u5B9E\u8D25\u7EE9, \u65E0\u65D7 settle \u81EA\u52A8\u8BA1) \u6216 (ideaRound\u22652 \u4E14 settleNoFlag\u22651)\u3002\u95F8\u5F00\u65F6 xiaochang_wait \u4F1A\u4E3B\u52A8\u63A8\u9001 hint-gate-open \u4E8B\u4EF6(\u4E0D\u5FC5\u53CD\u590D\u8BD5). The deduction is reported loudly.",
     parameters: { code: { type: "string", required: true } },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
@@ -2345,8 +2248,7 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
       const o = s.orch.get(args.code);
       const gate = hintGateV2({
         ideaRound: vq?.ideaRound ?? 1,
-        settleNoFlag: o?.settleNoFlag ?? 0,
-        blockerConfirmed: o?.blockerCheck === "confirmed"
+        settleNoFlag: o?.settleNoFlag ?? 0
       });
       if (!gate.allowed) {
         s.hintGateOpen.delete(args.code);
@@ -2375,8 +2277,7 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
       pacing: { type: "array", description: 'v8.4: \u76EE\u6807\u4FA7\u8282\u594F\u7EA6\u675F(\u9650\u901F/\u5C01\u7981\u7C7B, \u6CE8\u5165\u4EE4\u6587\u786C\u7EA6\u675F), \u5982 ["ssh \u22642 \u6B21/10min(\u5931\u8D25\u5373\u5C01\u7981)"]\u3002' },
       ideaIds: { type: "array", description: "v8.4: \u672C directive \u5F15\u7528\u7684\u91C7\u7EB3\u601D\u8DEF id \u5217\u8868(\u4ECE enqueue \u56DE\u663E/status \u7684\u672A\u6D88\u8D39\u601D\u8DEF\u6E05\u5355\u53D6); \u6D3E\u5175\u5373\u6807\u8BB0\u8BE5\u601D\u8DEF\u5DF2\u6D88\u8D39\u3002" },
       persona: { type: "string", description: "v8.4: \u6267\u884C\u8005 persona \u5185\u8054\u8986\u76D6(\u7F3A\u7701\u7EE7\u627F\u90E8\u7F72\u7EA7; \u53EF\u7ED9\u6E17\u900F/\u9006\u5411\u4E13\u5BB6\u7C7B persona)\u3002" },
-      dispatchNow: { type: "boolean", description: "v8.5: \u8BE5\u9898\u5DF2\u6301\u69FD(granted)\u65F6, \u7ACB\u5373\u7528\u672C\u6761 directive \u6D3E\u4E00\u4E2A\u65B0\u6267\u884C\u8005\u6302\u5230\u5F53\u524D\u5BB9\u5668(\u4E0E\u5728\u9014\u6267\u884C\u8005\u5E76\u884C; \u5171\u4EAB\u5BB9\u5668\u5269\u4F59\u65F6\u95F4\u76D2)\u3002\u601D\u8DEF\u4E00\u56DE\u6765\u5F53\u573A\u4E0A\u8F66, \u4E0D\u7B49\u4E0B\u4E00\u8F6E\u3002" },
-      spawn: { type: "number", description: "v8.5: \u6307\u5B9A\u4E0B\u6B21\u6388\u4E88\u7684\u6267\u884C\u8005\u8DEF\u6570(\u65E0\u786C\u4E0A\u9650\u2014\u2014\u8D44\u6E90\u4E8B\u5B9E\u5728 status, \u51B3\u7B56\u5F52\u4F60; \u7F3A\u7701\u8D70\u5347\u7EA7\u68AF multiSpawn)\u3002" },
+      dispatchNow: { type: "boolean", description: "v8.5: \u8BE5\u9898\u5DF2\u6301\u69FD(granted)\u65F6, \u7ACB\u5373\u7528\u672C\u6761 directive \u6D3E\u4E00\u4E2A\u65B0\u6267\u884C\u8005\u6302\u5230\u5F53\u524D\u5BB9\u5668(\u4E0E\u5728\u9014\u6267\u884C\u8005\u5E76\u884C; \u5171\u4EAB\u5BB9\u5668\u5269\u4F59\u65F6\u95F4\u76D2)\u3002\u52A0\u5175\u65E0\u4E0A\u9650: \u591A\u6B21\u8C03\u7528\u5373\u591A\u8DEF\u5E76\u884C, \u5175\u6570\u4E0D\u8BBE\u5F00\u9898\u4E0A\u9650, \u6309 status \u5728\u9014\u6E05\u5355\u4E0E\u8D44\u6E90\u8BFB\u6570\u52A8\u6001\u52A0\u3002" },
       round: { type: "number", description: "v8: ignored (kept for compatibility) \u2014 rounds are managed by the mechanism." },
       dependsOn: { type: "array", description: "v8: ignored (kept for compatibility)." },
       resourceClass: { type: "string", description: "v8: ignored (kept for compatibility) \u2014 class is auto by challenge type." }
@@ -2415,7 +2316,6 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
       const priorityChanged = args.priority !== void 0 && o.priorityOverride !== args.priority;
       if (args.priority !== void 0) o.priorityOverride = args.priority;
       if (args.family !== void 0 && args.family !== "") o.family = args.family;
-      if (args.spawn !== void 0 && args.spawn > 0) o.spawnRequest = args.spawn;
       if ((args.pacing?.length ?? 0) > 0) o.pacing = [...o.pacing ?? [], ...args.pacing];
       let consumedNote = "";
       if ((args.ideaIds?.length ?? 0) > 0) {
@@ -2480,7 +2380,7 @@ ${ideas.map((i) => `  #${i.id} ${i.text.slice(0, 90)}`).join("\n")}` : "\n\u672A
       const deads = knowledgeOfCode(args.code).filter((k) => k.kind === "dead-end");
       const sealed = sealedClustersOf(deads);
       const sealedTxt = sealed.length > 0 ? `
-\u26A0\uFE0F \u6B7B\u8DEF\u5C01\u5370\u7C07 ${sealed.length} \u4E2A(\u22653 \u6761\u540C\u5411, \u9A8C\u8BC1\u5175\u5DF2\u81EA\u52A8\u89E6\u53D1): ${sealed.map((x) => `${x.direction}\xD7${x.count}`).join(" | ")}` : "";
+\u26A0\uFE0F \u6B7B\u8DEF\u5C01\u5370\u7C07 ${sealed.length} \u4E2A(\u22653 \u6761\u540C\u5411, \u5DF2\u8FDB\u5F85\u88C1\u51B3\u5EFA\u8BAE\u6D3E\u9A8C\u8BC1\u5175\u7FFB\u6848): ${sealed.map((x) => `${x.direction}\xD7${x.count}`).join(" | ")}` : "";
       return `enqueued ${args.code} (directives=${o.directives.length}, \u961F\u5217\u4F18\u5148\u7EA7=${priorityOf(o, ch.total_score, Date.now())}, \u72B6\u6001=${o.state}; \u6388\u4E88\u7531\u673A\u5236 tick \u6B66\u88C5, \u65E0\u9700\u624B\u52A8 dispatch)${dispatchNowNote}
 \u5BB6\u65CF\u6A21\u677F\u5DF2\u6302: ${tplName}${ideaMenu}${sealedTxt}${consumedNote}${truncNotice}`;
     }
@@ -3126,7 +3026,7 @@ ${inflightSummary()}`,
           }
           return rows.length > 0 ? rows.join(" ") : "\u65E0";
         })()}`,
-        `\u6B7B\u8DEF\u5C01\u5370\u7C07(\u22653 \u540C\u5411, \u9A8C\u8BC1\u5175\u81EA\u52A8\u89E6\u53D1): ${(() => {
+        `\u6B7B\u8DEF\u5C01\u5370\u7C07(\u22653 \u540C\u5411, \u5F85\u88C1\u51B3\u5EFA\u8BAE\u9A8C\u8BC1): ${(() => {
           const rows = [];
           for (const code of s.orch.keys()) {
             const sealed = sealedClustersOf(knowledgeOfCode(code).filter((k) => k.kind === "dead-end"));

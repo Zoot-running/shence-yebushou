@@ -488,9 +488,8 @@ export function templateOf(family?: string): FamilyTemplate | undefined {
  *  - 或者 blocker 已被验证兵确认(题侧问题坐实, 直接放行);
  *  - 或者 settleNoFlag ≥ 2(两轮真实败绩, 不再等 R2——防 R2 管道自身卡死)。
  */
-export function hintGateV2(input: { ideaRound: number; settleNoFlag: number; blockerConfirmed: boolean }): { allowed: boolean; missing: string[] } {
+export function hintGateV2(input: { ideaRound: number; settleNoFlag: number }): { allowed: boolean; missing: string[] } {
   const missing: string[] = []
-  if (input.blockerConfirmed) return { allowed: true, missing: [] }
   if (input.settleNoFlag >= 2) return { allowed: true, missing: [] }
   if (input.ideaRound < 2) missing.push(`R2 二次征集未走(当前第 ${input.ideaRound} 轮)——先 xiaochang_refanout 加模型再打一轮`)
   if (input.settleNoFlag < 1) missing.push('该题尚无真实败绩(无旗 settle ≥1 自动计)——先派执行者打一轮')

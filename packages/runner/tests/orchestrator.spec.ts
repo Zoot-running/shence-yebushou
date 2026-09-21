@@ -298,16 +298,17 @@ describe('v8.4 familyOf 家族判定', () => {
 
 describe('v8.4 hintGateV2 客观判死闸', () => {
   it('settleNoFlag≥2 → 直接放行(不等 R2)', () => {
-    expect(hintGateV2({ ideaRound: 1, settleNoFlag: 2, blockerConfirmed: false }).allowed).toBe(true)
+    expect(hintGateV2({ ideaRound: 1, settleNoFlag: 2 }).allowed).toBe(true)
   })
   it('ideaRound≥2 且 settleNoFlag≥1 → 放行', () => {
-    expect(hintGateV2({ ideaRound: 2, settleNoFlag: 1, blockerConfirmed: false }).allowed).toBe(true)
+    expect(hintGateV2({ ideaRound: 2, settleNoFlag: 1 }).allowed).toBe(true)
   })
   it('blocker 被验证兵确认 → 放行', () => {
-    expect(hintGateV2({ ideaRound: 1, settleNoFlag: 0, blockerConfirmed: true }).allowed).toBe(true)
+    // v8.5.1: blockerConfirmed 提前开门条件随验证兵机制一并删除——闸 = 纯败绩计数事实。
+    expect(hintGateV2({ ideaRound: 1, settleNoFlag: 0 }).allowed).toBe(false)
   })
   it('零败绩 → 拒绝并给出缺项', () => {
-    const g = hintGateV2({ ideaRound: 1, settleNoFlag: 0, blockerConfirmed: false })
+    const g = hintGateV2({ ideaRound: 1, settleNoFlag: 0 })
     expect(g.allowed).toBe(false)
     expect(g.missing.length).toBe(2)
   })

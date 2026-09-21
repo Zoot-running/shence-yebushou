@@ -12,7 +12,6 @@ export type PendingKind =
   | 'needs-rotate'
   | 'needs-verdict'
   | 'hint-candidate'
-  | 'blocker-verified'
   | 'flag-candidate'
 
 export interface PendingAdjudication {
@@ -58,20 +57,12 @@ export interface ChallengeOrch {
   /** 主 agent 显式优先级（缺省 = 分值密度 + 从未开工提权）。 */
   priorityOverride?: number
   directives: Directive[]
-  /** 回队后应发 R2（零进展×1 全开标记）。 */
-  r2Due: boolean
-  /** 下次授予要生成的执行者路数（零进展×1 全开 = 3 路; 授予时消费归零）。 */
-  multiSpawn: number
   /** settle 无旗累计次数（hint 闸把"打过但未破"计入 filtered-failed）。 */
   settleNoFlag: number
-  /** blocker 类结论（无攻击面/环境缺失…）核验状态。 */
-  blockerCheck: 'none' | 'in-flight' | 'confirmed' | 'refuted'
   /** v8.3c 同靶场簇: 与本码共享容器实例的兄弟题码(不含自身); 簇内同态结算。 */
   cluster: string[]
   /** v8.4 战术家族(模板帧注入用): 主 agent enqueue 可显式指定, 缺省由题面自动判定。 */
   family?: string
-  /** v8.5: 主 agent 指定的下次授予路数(无硬上限, 授予时消费)。 */
-  spawnRequest?: number
   /** v8.4 目标侧节奏约束(限速/封禁类, 注入令文): 如 "ssh ≤2 次/10min"。 */
   pacing?: string[]
   /** 上次 settle 结论指纹（同结论检测）。 */
@@ -90,17 +81,14 @@ export interface SettleProgress {
   forkDelta: number
   /** /opt/work/{code}/ 新增工件文件数。 */
   artifactsDelta: number
-  /** 终态/fork 含 blocker 结论（无攻击面/环境缺失…）。 */
-  blockerConcluded: boolean
   detail: string
 }
 
 export type SettleAction =
   | 'pending-flag'   // 有 FLAG_CANDIDATE: 等主 agent 提交
-  | 'rearm'          // 有进展: 回队不加路（继承账本）
-  | 'rearm-all-in'   // 零进展×1: 全开（未试思路全派 + R2 全模型 + 多模型混打）
-  | 'adjudicate'     // 零进展×2 / blocker 已确认: 挂主 agent 裁决（离开自动轮转）
-  | 'verify-blocker' // blocker 结论×1: 派验证兵（独立复验, 推翻即续打）
+  | 'rearm'          // 有进展: 回队(授予恒 1 路, 加码由主 agent dispatchNow)
+  | 'rearm-zero'     // 零进展×1: 回队(只记账事实; 加兵/集思建议走 settle 唤醒+status, 决策归主 agent)
+  | 'adjudicate'     // 零进展×2: 挂主 agent 裁决（离开自动轮转）
 
 export type AdjudicationVerdict = 'continue' | 'rotate' | 'dead' | 'solved'
 
@@ -111,24 +99,6 @@ export const SUBMIT_GRACE_MS = 15 * 60_000
 /** 从未开工提权步长/上限（每 30min +1 档, 上限 3 档）。 */
 export const NEVER_DISPATCHED_BOOST_STEP_MS = 30 * 60_000
 export const NEVER_DISPATCHED_BOOST_MAX = 3
-
-/** blocker 类结论词表（命中 → 该题触发验证兵; 仅按结论措辞, 不按"题难"措辞）。 */
-const BLOCKER_RE = /(攻击面\s*缺失|无攻击面|攻击面.*(?:不存在|缺失)|环境缺失|未随容器|平台.*未(?:发布|暴露)|未暴露|not exposed|no attack surface|unreachable|不可达|服务未启动|仅.*静态)/i
-
-export function blockerConcluded(text: string): boolean {
-  return BLOCKER_RE.test(text)
-}
-
-/** 验证兵结论解析（机制读 settle 终态文本, 不靠模型调用新工具）。 */
-export function verifierVerdict(text: string): 'confirm' | 'refute' | 'unclear' {
-  const confirm = /(blocker\s*成立|确认|confirmed|攻击面\s*确实|确无|verify\s*ok)/i
-  const refute = /(推翻|不成立|refut|攻击面\s*存在|有攻击面|误判)/i
-  const c = confirm.test(text)
-  const r = refute.test(text)
-  if (c && !r) return 'confirm'
-  if (r && !c) return 'refute'
-  return 'unclear'
-}
 
 /** v8.3 进展定义(用户定稿): 新 fork 或新工件文件才算进展; 战报文字行数不算。
  *  零进展 = 无旗 AND 无新 fork AND 无新工件。 */
@@ -145,35 +115,13 @@ export function fingerprintOf(detail: string): string {
 }
 
 /**
- * settle 结算分类（升级梯核心）。
- * 调用约定（宿主）: 若 orch.blockerCheck === 'in-flight'（本次 settle 是验证兵）,
- * 先 applyVerifierResult(orch, verifierVerdict(detail)) 再调本函数。
+ * settle 结算分类（v8.5.1 扁平化: 计数层+护栏层保留, 自动升级层拆除）。
+ * 机制只出"事实"与"交还裁决"; 加码/集思/验证兵全由主 agent 决策(dispatchNow/refanout)。
  */
 export function settleAction(orch: ChallengeOrch, p: SettleProgress): SettleAction {
   if (p.flagCandidate) return 'pending-flag'
-  if (p.blockerConcluded) {
-    if (orch.blockerCheck === 'confirmed') return 'adjudicate'
-    if (orch.blockerCheck === 'in-flight' || orch.blockerCheck === 'refuted') {
-      // 验证兵本次/此前已推翻 → 落回普通规则（blocker 结论不再拦截）。
-    } else {
-      return 'verify-blocker'
-    }
-  }
-  if (realProgress(p)) {
-    // 有进展: 回队不加路; 但连续 2 次"有进展未出旗" = 进展是死路归档噪音 → 全开升级。
-    if (orch.progressStreak + 1 >= 2) return 'rearm-all-in'
-    return 'rearm'
-  }
-  const streak = orch.zeroProgressStreak + 1
-  if (streak === 1) return 'rearm-all-in'
-  return 'adjudicate'
-}
-
-/** 验证兵结论回写（在 settleAction 之前调用）。 */
-export function applyVerifierResult(orch: ChallengeOrch, verdict: 'confirm' | 'refute' | 'unclear'): void {
-  if (verdict === 'confirm') orch.blockerCheck = 'confirmed'
-  else if (verdict === 'refute') orch.blockerCheck = 'refuted'
-  else orch.blockerCheck = 'none'
+  if (realProgress(p)) return 'rearm'
+  return orch.zeroProgressStreak + 1 === 1 ? 'rearm-zero' : 'adjudicate'
 }
 
 /** settle 动作落地（原地改写, 返回 orch 便于链式）。 */
@@ -191,26 +139,15 @@ export function applySettle(orch: ChallengeOrch, action: SettleAction, detail: s
       orch.state = 'queued'
       orch.zeroProgressStreak = 0
       orch.progressStreak += 1
-      orch.r2Due = false
-      orch.multiSpawn = 0
       break
-    case 'rearm-all-in':
-      // 全开(零进展×1 或 有进展×2): 两类连击清零重计。
+    case 'rearm-zero':
+      // 零进展×1: 回队只记账(事实); 加兵/集思决策归主 agent(settle 唤醒+status 提示)。
       orch.state = 'queued'
       orch.zeroProgressStreak = 1
       orch.progressStreak = 0
-      orch.r2Due = true
-      orch.multiSpawn = 3
       break
     case 'adjudicate':
       orch.state = 'pending-adjudication'
-      orch.multiSpawn = 0
-      break
-    case 'verify-blocker':
-      orch.state = 'queued'
-      orch.blockerCheck = 'in-flight'
-      orch.r2Due = false
-      orch.multiSpawn = 1
       break
   }
   return orch
@@ -220,7 +157,6 @@ export function applySettle(orch: ChallengeOrch, action: SettleAction, detail: s
 export function rearmByTimebox(orch: ChallengeOrch): ChallengeOrch {
   orch.state = 'queued'
   orch.grantedUntil = undefined
-  orch.multiSpawn = 0
   return orch
 }
 
@@ -233,8 +169,6 @@ export function adjudicate(orch: ChallengeOrch, verdict: AdjudicationVerdict): C
       orch.state = 'queued'
       orch.zeroProgressStreak = 0
       orch.progressStreak = 0
-      orch.r2Due = false
-      orch.blockerCheck = 'none'
       orch.grantedUntil = undefined
       orch.lastSettleFingerprint = undefined
       break
@@ -258,7 +192,6 @@ export function grant(orch: ChallengeOrch, snapshot: ProgressSnapshot, now: numb
   orch.grantedUntil = now + timeboxMs
   orch.neverDispatched = false
   orch.snapshot = snapshot
-  orch.r2Due = false
   return orch
 }
 
@@ -336,10 +269,7 @@ export function newOrch(code: string, now: number): ChallengeOrch {
     progressStreak: 0,
     neverDispatched: true,
     directives: [],
-    r2Due: false,
-    multiSpawn: 0,
     settleNoFlag: 0,
-    blockerCheck: 'none',
     cluster: [],
     createdAt: now,
   }

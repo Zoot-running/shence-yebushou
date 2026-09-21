@@ -48,9 +48,7 @@ import {
 } from './orchestrator.ts'
 import {
   applySettle,
-  applyVerifierResult,
   adjudicate,
-  blockerConcluded,
   clusterMapOf,
   compareRisk,
   flagLine,
@@ -66,7 +64,6 @@ import {
   serializeOrchState,
   settleAction,
   timeboxExpired,
-  verifierVerdict,
   type ChallengeOrch,
   type FlagEntry,
   type FlagStatus,
@@ -295,8 +292,6 @@ interface CampaignState {
   scoreTable: Record<string, number>
   /** v8.4: hint 闸已开待取的题码(wait 主动推送; 主 agent 取 hint 后移除)。 */
   hintGateOpen: Set<string>
-  /** v8.4: 验证兵自动触发去重(题码 → 已触发次数)。 */
-  verifierDispatched: Map<string, number>
   /** v8.5: 主 agent 人工收兵的执行者 item id(settle 不计败绩, 只审计)。 */
   manualInterrupted: Set<string>
 }
@@ -763,24 +758,6 @@ export function apply(ctx: Context): void {
     if (mix.length === 0) return s.executorPolicy.defaultModel
     return mix[idx % mix.length]!
   }
-  /** 零进展×1 全开的 R2 二次征集(授予时发, 结果异步落账本)。 */
-  async function issueR2(code: string): Promise<void> {
-    const s = requireState()
-    if (jisi?.fanoutNotify === undefined || parentAgent === undefined) return
-    const ch = s.challenges.get(code)
-    if (ch === undefined) return
-    const vq = ensureVq(code)
-    try {
-      const prompt = buildRefanoutPrompt(code)
-      const models = await pickRefanoutModels(vq)
-      const ticket = jisi.fanoutNotify(parentAgent as unknown as object, { prompt }, models)
-      vq.ideaRound += 1
-      vq.triedModels.push(...models.filter(m => !vq.triedModels.includes(m)))
-      s.v2[code] = vq
-      persistV2(s)
-      audit(s.auditPath, { type: 'v8-r2', code, models, ticket: ticket.id })
-    } catch { /* R2 失败不阻断派兵 */ }
-  }
   const VERIFIER_DIRECTIVE = '[验证兵] 独立复验账本里的 blocker 结论("无攻击面/环境缺失/未发布"类): 不要信任前序判定, 重跑探测确认。输出开头一行 "复验: 确认" 或 "复验: 推翻", 附证据; 若推翻, 立即继续解题(先读知识账本, 从已知边界出发)。'
   /** v8: 串行 spawn 泵——v7 的派单是单工具串行(回合上下文); v8 挪进分离链后必须恢复串行不变量。 */
   const spawnQueue: string[] = []
@@ -947,39 +924,21 @@ export function apply(ctx: Context): void {
     }
     o.cluster = siblings
     grant(o, snapshot, Date.now(), s.timeboxMs)
-    // v8.5: 路数由主 agent 指定(spawn)或升级梯建议(multiSpawn), 无硬上限——
-    // 资源事实在 status 里, 用满是目标, 决策归主 agent。
-    const nSpawn = Math.max(1, o.spawnRequest ?? o.multiSpawn)
-    o.multiSpawn = 0
-    o.spawnRequest = undefined
-    if (o.r2Due) { o.r2Due = false; void issueR2(code) }
+    // v8.5.1 扁平化: 授予恒 1 路(机制底线); 加码全走 dispatchNow(主 agent 按事实决策)。
     const vq = ensureVq(code)
-    const picks: Array<{ text: string; model?: string; effort?: string; persona?: string }> = []
-    if (o.blockerCheck === 'in-flight') {
-      picks.push({ text: VERIFIER_DIRECTIVE })
-    } else {
-      // v8.3c 簇调度: 思路取簇内全体成员未试思路的并集(对任一成员投的思路都生效)。
-      const memberCodes = [code, ...o.cluster]
-      const untried = memberCodes.flatMap(c2 => {
-        const oo = s.orch.get(c2)
-        return (oo?.directives ?? []).filter(d => !d.tried)
-      })
-      for (let i = 0; i < nSpawn; i++) {
-        const d = untried.shift()
-        if (d !== undefined) picks.push(d)
-        else picks.push({ text: '按账本+画像自由突破: 先读知识账本, 从已知边界出发, 不打死路' })
-      }
-      for (const d of picks) {
-        for (const c2 of memberCodes) {
-          const orig = s.orch.get(c2)?.directives.find(x => x.text === d.text)
-          if (orig !== undefined) orig.tried = true
-        }
-      }
+    const memberCodes = [code, ...o.cluster]
+    // v8.3c 簇调度: 思路取簇内全体成员未试思路的并集(对任一成员投的思路都生效)。
+    const untried = memberCodes.flatMap(c2 => {
+      const oo = s.orch.get(c2)
+      return (oo?.directives ?? []).filter(d => !d.tried)
+    })
+    const d = untried.shift() ?? { text: '按账本+画像自由突破: 先读知识账本, 从已知边界出发, 不打死路' }
+    for (const c2 of memberCodes) {
+      const orig = s.orch.get(c2)?.directives.find(x => x.text === d.text)
+      if (orig !== undefined) orig.tried = true
     }
-    for (let i = 0; i < picks.length; i++) {
-      await spawnExecutor(code, o, picks[i]!, i, prio, cls, vq)
-    }
-    audit(s.auditPath, { type: 'v8-grant', code, spawn: picks.length })
+    await spawnExecutor(code, o, d, 0, prio, cls, vq)
+    audit(s.auditPath, { type: 'v8-grant', code, spawn: 1 })
     bumpOrch(s)
     persistOrch(s)
     persistProgress(s)
@@ -1050,8 +1009,6 @@ export function apply(ctx: Context): void {
       findingsDelta: sn !== undefined ? Math.max(0, findingsLines(code) - sn.findingsLines) : 0,
       forkDelta: sn !== undefined ? Math.max(0, knowledgeOfCode(code).length - sn.forkCount) : 0,
       artifactsDelta: sn !== undefined ? Math.max(0, artifactCount(code) - sn.artifactCount) : 0,
-      blockerConcluded: blockerConcluded(detail)
-        || knowledgeOfCode(code).some(k => k.kind === 'dead-end' && blockerConcluded(`${k.path} ${k.conclusion ?? ''}`)),
       detail,
     }
     // v8.4 交接未竟动作: settle 文本里的"未竟/下一步"行转未走分叉(换人/换实例不丢临门一脚)。
@@ -1063,46 +1020,39 @@ export function apply(ctx: Context): void {
         appendKnowledgeFile(code, 'forks', handoff.map(h => `${h.path} → ${h.conclusion}`))
       } catch { /* 交接转分叉失败不阻断 */ }
     }
-    // v8.4 验证兵自动触发(不靠主 agent 记得派): 死路封印簇 ≥3 同向 → 机制强制翻案回合。
-    // 与判死计数同规: 不因 settle 时机(granted/late)而跳过——封印检测是客观信号。
-    const maybeAutoVerifier = (): void => {
+    // v8.5.1 验证兵降级: 封印簇只算事实 → 写待裁决建议(按簇分类+计数), 不自动派兵
+    // (用户裁定: 机制已不知道运行情况, 盲目派兵可能卡死; 派不派、怎么派归主 agent)。
+    const maybeSuggestVerifier = (): void => {
       const sealed = sealedClustersOf(knowledgeOfCode(code).filter(k => k.kind === 'dead-end'))
-      if (sealed.length > 0 && o.state !== 'dead' && o.state !== 'solved' && o.blockerCheck !== 'in-flight') {
-        const dispatched = s.verifierDispatched.get(code) ?? 0
-        if (dispatched < 1) {
-          s.verifierDispatched.set(code, dispatched + 1)
-          o.blockerCheck = 'in-flight'
-          o.state = 'queued'
-          o.multiSpawn = 1
-          addPending(s, makePending(code, 'needs-verdict', `${code} 死路封印簇 ${sealed.map(x => `${x.direction}×${x.count}`).join('|')} → 验证兵已自动触发(翻案回合)`, c().boardPath(code), now))
-          audit(s.auditPath, { type: 'v8-verifier-auto', code, sealed: sealed.map(x => x.direction) })
-        }
+      if (sealed.length > 0 && o.state !== 'dead' && o.state !== 'solved') {
+        const summary = `验证建议: ${code} 死路封印簇 ${sealed.map(x => `${x.direction}×${x.count}`).join('|')} — 建议派验证兵翻案(可抄令文: ${VERIFIER_DIRECTIVE})`
+        addPending(s, makePending(code, 'needs-verdict', summary, c().boardPath(code), now))
+        audit(s.auditPath, { type: 'v8-verifier-suggest', code, sealed: sealed.map(x => `${x.direction}×${x.count}`) })
       }
     }
     // v8.4 判死修复: 时间盒已把题回队(状态≠granted)时, 迟到的 settle 依然计真实败绩——
     // 20390 hint 闸饿死 2.5h 的直接病灶(执行者跑满时间盒 → 时间盒先回队 → settle 被跳过)。
     if (o.state !== 'granted') {
       if (!p.flagCandidate) o.settleNoFlag += 1
-      maybeAutoVerifier()
+      maybeSuggestVerifier()
       refreshHintGate(s, code)
       bumpOrch(s)
       persistOrch(s)
       audit(s.auditPath, { type: 'v8-settle-late', itemId, code, state: o.state, settleNoFlag: o.settleNoFlag })
       return
     }
-    if (o.blockerCheck === 'in-flight') applyVerifierResult(o, verifierVerdict(detail))
     const action = settleAction(o, p)
     applySettle(o, action, detail, now)
     if (!p.flagCandidate) o.settleNoFlag += 1
     const board = c().boardPath(code)
+    const sealed = sealedClustersOf(knowledgeOfCode(code).filter(k => k.kind === 'dead-end'))
     if (action === 'pending-flag') {
       addPending(s, makePending(code, 'flag-candidate', `${code} 有旗待提交: 尽快 xiaochang_submit(容器在线宽限 15min, 超时容器关/旗值可能轮换)`, board, now))
     } else if (action === 'adjudicate') {
-      const kind = o.blockerCheck === 'confirmed' ? 'blocker-verified' as const : 'needs-verdict' as const
-      const summary = kind === 'blocker-verified'
-        ? `${code} blocker 已被验证兵确认: 主 agent 裁决 判死/续打`
-        : `${code} 零进展×${o.zeroProgressStreak} 挂裁决: 主 agent 裁决 判死/续打/拉hint(闸已开)`
-      addPending(s, makePending(code, kind, summary, board, now))
+      const sealTxt = sealed.length > 0
+        ? ` 死路封印簇 ${sealed.map(x => `${x.direction}×${x.count}`).join('|')} — 建议派验证兵翻案`
+        : ''
+      addPending(s, makePending(code, 'needs-verdict', `${code} 零进展×${o.zeroProgressStreak} 挂裁决: 主 agent 裁决 判死/续打/拉hint(闸已开)${sealTxt}`, board, now))
     }
     // 关容器+释放槽(有旗待提交不关; 同题仍有在途不关)。
     const hasOthers = c().ledger.views().some(x => x.item.id !== itemId && codeOf(x.item.id) === code
@@ -1126,7 +1076,7 @@ export function apply(ctx: Context): void {
         audit(s.auditPath, { type: 'v8-settle-cluster', itemId, code, sibling: sb, action: action2 })
       }
     }
-    if (action !== 'verify-blocker') maybeAutoVerifier()
+    if (action !== 'adjudicate') maybeSuggestVerifier()
     audit(s.auditPath, { type: 'v8-settle', itemId, code, action, flagCandidate: p.flagCandidate, settleNoFlag: o.settleNoFlag })
     refreshHintGate(s, code)
     for (const sb of o.cluster) refreshHintGate(s, sb)
@@ -1145,7 +1095,6 @@ export function apply(ctx: Context): void {
     const gate = hintGateV2({
       ideaRound: vq?.ideaRound ?? 1,
       settleNoFlag: o.settleNoFlag ?? 0,
-      blockerConfirmed: o.blockerCheck === 'confirmed',
     })
     if (gate.allowed) {
       if (!s.hintGateOpen.has(code)) {
@@ -1325,8 +1274,7 @@ export function apply(ctx: Context): void {
         tickCount: 0,
         scoreTable: {},
         hintGateOpen: new Set(),
-        verifierDispatched: new Map(),
-        manualInterrupted: new Set(),
+              manualInterrupted: new Set(),
       }
       try {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
@@ -1763,7 +1711,7 @@ export function apply(ctx: Context): void {
   register(defineTool({
     name: 'xiaochang_hint',
     description:
-      'Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only — settleNoFlag ≥2 (两轮真实败绩, 无旗 settle 自动计) 或 (ideaRound≥2 且 settleNoFlag≥1) 或 blocker 已被验证兵确认。闸开时 xiaochang_wait 会主动推送 hint-gate-open 事件(不必反复试). The deduction is reported loudly.',
+      'Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only — settleNoFlag ≥2 (两轮真实败绩, 无旗 settle 自动计) 或 (ideaRound≥2 且 settleNoFlag≥1)。闸开时 xiaochang_wait 会主动推送 hint-gate-open 事件(不必反复试). The deduction is reported loudly.',
     parameters: { code: { type: 'string', required: true } },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
@@ -1781,7 +1729,6 @@ export function apply(ctx: Context): void {
       const gate = hintGateV2({
         ideaRound: vq?.ideaRound ?? 1,
         settleNoFlag: o?.settleNoFlag ?? 0,
-        blockerConfirmed: o?.blockerCheck === 'confirmed',
       })
       if (!gate.allowed) {
         s.hintGateOpen.delete(args.code)
@@ -1812,15 +1759,14 @@ export function apply(ctx: Context): void {
       pacing: { type: 'array', description: 'v8.4: 目标侧节奏约束(限速/封禁类, 注入令文硬约束), 如 ["ssh ≤2 次/10min(失败即封禁)"]。' },
       ideaIds: { type: 'array', description: 'v8.4: 本 directive 引用的采纳思路 id 列表(从 enqueue 回显/status 的未消费思路清单取); 派兵即标记该思路已消费。' },
       persona: { type: 'string', description: 'v8.4: 执行者 persona 内联覆盖(缺省继承部署级; 可给渗透/逆向专家类 persona)。' },
-      dispatchNow: { type: 'boolean', description: 'v8.5: 该题已持槽(granted)时, 立即用本条 directive 派一个新执行者挂到当前容器(与在途执行者并行; 共享容器剩余时间盒)。思路一回来当场上车, 不等下一轮。' },
-      spawn: { type: 'number', description: 'v8.5: 指定下次授予的执行者路数(无硬上限——资源事实在 status, 决策归你; 缺省走升级梯 multiSpawn)。' },
+      dispatchNow: { type: 'boolean', description: 'v8.5: 该题已持槽(granted)时, 立即用本条 directive 派一个新执行者挂到当前容器(与在途执行者并行; 共享容器剩余时间盒)。加兵无上限: 多次调用即多路并行, 兵数不设开题上限, 按 status 在途清单与资源读数动态加。' },
       round: { type: 'number', description: 'v8: ignored (kept for compatibility) — rounds are managed by the mechanism.' },
       dependsOn: { type: 'array', description: 'v8: ignored (kept for compatibility).' },
       resourceClass: { type: 'string', description: 'v8: ignored (kept for compatibility) — class is auto by challenge type.' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args: { code: string; prompt: string; priority?: number; model?: string; effort?: string; family?: string; pacing?: string[]; ideaIds?: string[]; persona?: string; dispatchNow?: boolean; spawn?: number; round?: number; dependsOn?: string[]; resourceClass?: string }, exec) {
+    async execute(args: { code: string; prompt: string; priority?: number; model?: string; effort?: string; family?: string; pacing?: string[]; ideaIds?: string[]; persona?: string; dispatchNow?: boolean; round?: number; dependsOn?: string[]; resourceClass?: string }, exec) {
       // v7.6: 调度权单点——只有主 agent 可入题队列(单调度器架构; 执行者无权改写战役)。
       if (parentAgent !== undefined && exec.agent !== parentAgent) {
         return 'xiaochang_enqueue: 拒绝——入题队列是主 agent 专属(单调度器); 执行者只解自己的题, 有发现用 xiaochang_fork 上报'
@@ -1848,7 +1794,6 @@ export function apply(ctx: Context): void {
       if (args.priority !== undefined) o.priorityOverride = args.priority
       // v8.4: 家族/pacing 元数据(可覆盖, 可累积)。
       if (args.family !== undefined && args.family !== '') o.family = args.family
-      if (args.spawn !== undefined && args.spawn > 0) o.spawnRequest = args.spawn
       if ((args.pacing?.length ?? 0) > 0) o.pacing = [...(o.pacing ?? []), ...args.pacing!]
       // v8.4: 派兵即消费——本 directive 引用的采纳思路标记 consumed。
       let consumedNote = ''
@@ -1915,7 +1860,7 @@ export function apply(ctx: Context): void {
       const deads = knowledgeOfCode(args.code).filter(k => k.kind === 'dead-end')
       const sealed = sealedClustersOf(deads)
       const sealedTxt = sealed.length > 0
-        ? `\n⚠️ 死路封印簇 ${sealed.length} 个(≥3 条同向, 验证兵已自动触发): ${sealed.map(x => `${x.direction}×${x.count}`).join(' | ')}`
+        ? `\n⚠️ 死路封印簇 ${sealed.length} 个(≥3 条同向, 已进待裁决建议派验证兵翻案): ${sealed.map(x => `${x.direction}×${x.count}`).join(' | ')}`
         : ''
       return `enqueued ${args.code} (directives=${o.directives.length}, 队列优先级=${priorityOf(o, ch.total_score, Date.now())}, 状态=${o.state}; 授予由机制 tick 武装, 无需手动 dispatch)${dispatchNowNote}\n家族模板已挂: ${tplName}${ideaMenu}${sealedTxt}${consumedNote}${truncNotice}`
     },
@@ -2545,7 +2490,7 @@ ${gaps}
           }
           return rows.length > 0 ? rows.join(' ') : '无'
         })()}`,
-        `死路封印簇(≥3 同向, 验证兵自动触发): ${(() => {
+        `死路封印簇(≥3 同向, 待裁决建议验证): ${(() => {
           const rows: string[] = []
           for (const code of s.orch.keys()) {
             const sealed = sealedClustersOf(knowledgeOfCode(code).filter(k => k.kind === 'dead-end'))
