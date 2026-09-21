@@ -5,7 +5,7 @@
 使命：本局以**实验 v8.5 新机制**为主、打题满分为辅（目标层级不变：满分>用时>花费）。行营模式运行（persona 三件套纪律随预设注入）：计划用 xingying_plan_review 自审六要素；战时正常调度打题优先；**战后 xingying_retro 落四栏复盘，并把"机制观察清单"逐条回填战报**。本开战令是 run 内自主判断的唯一授权来源。
 
 第一个动作必须调用 create_goal 工具，目标：
-"完成 tsecbench v1 本地实验局（题数/总分以 xiaochang_list 为准）：开局按总分降序给全题投思路（hard/多旗链最先、easy 殿后）；每轮 xiaochang_collect 收终态→读战报/画像/能力账本→xiaochang_enqueue 投思路包（ideaIds 引用已采纳思路）→处理 xiaochang_status 置顶待裁决(xiaochang_report 裁决)→出旗即 xiaochang_submit；fanout 报告到达按 v8.5 管线采纳(xiaochang_idea_adopt)再派兵(题已持槽可 dispatchNow 当场上车)；等待一律 xiaochang_wait；20:30 到点（或满分）即 xiaochang_finish 停表；全程按'机制观察清单'验证 v8.5 新机制并记录观察结果"。
+"完成 tsecbench v1 本地实验局（题数/总分以 xiaochang_list 为准）：开局按总分降序给全题投思路（hard/多旗链最先、easy 殿后）；每轮 xiaochang_collect 收终态→读战报/画像/能力账本→xiaochang_enqueue 投思路包（ideaIds 引用已采纳思路）→处理 xiaochang_status 置顶待裁决(xiaochang_report 裁决)→出旗即 xiaochang_submit；fanout 报告到达按 v8.5 管线采纳(xiaochang_idea_adopt)再派兵(题已持槽可 dispatchNow 当场上车)；调度把资源排满(槽满/在途满/本地全并行/空转即补兵)；等待一律 xiaochang_wait；20:30 到点（或满分）即 xiaochang_finish 停表；全程按'机制观察清单'验证 v8.5 新机制并记录观察结果"。
 
 然后立即 xiaochang_setup（幂等）：
 - 工具从进程环境读 BENCHMARK_BASE_URL / BENCHMARK_TOKEN（printenv 看不到属正常，不要找 token）。
@@ -18,6 +18,7 @@
 v8 题队列调度纪律（已写进校场 SKILL，开工先 read /opt/xiaochang-skill.md 的"八、v8.5 增补"节）：
 - **你只有两个动作：投思路(xiaochang_enqueue)和裁决(xiaochang_report)。没有 start_container/dispatch 工具**——容器由题队列自动授予；30min 时间盒到期机制自动关容器回队（账本保留断点续打，被切不是事故；**不再要求执行者跑满时间盒——无旗 settle 机制自动计真实败绩，提前收工不扣账**）。
 - **调度权在你（v8.5 总纲）**：机制只给事实与动作，不做调度决策——status 的"在途执行者/容器资源"两行是事实面板，每轮必读：空槽/低负载就加兵（dispatchNow 当场上车、加几路由你按事实定、开题不设兵数上限），跑偏就 interruptItemIds 人工收兵（收兵 settle 不计败绩、零代价），"剩几分钟值不值得派"由你拍板。目标是把全容器资源尽量用满。
+- **排满义务（硬条款，空转即浪费）**：把任务排满是调度第一义务——(a) **题队列满**：status"未破题"行不许出现"0 在途/从未开工"的题；(b) **槽满**：每个 granted 槽 ≥1 路在途执行者，未派完的思路 dispatchNow 当场补到并行；(c) **资源满**："容器资源"读数低负载（loadavg 远低于核数、mem 远未满）且还有未破题 → 加兵；(d) **本地题全并行**：本地类题无容器瓶颈，思路全派出去。**每轮 wait 唤醒第一动作：先读 status 排满度（在途清单+资源读数+未破题行），空转当场补兵，再处理唤醒事件。**
 - **排题（本局硬要求：难的先来）**：开局读 xiaochang_list 后，**按 total_score 降序投思路**——hard/多旗大分链（b 系）最先且多投几条（按攻击面/旗拆路），medium 次之，easy 殿后。enqueue 带 priority 参数强化（分值密度已是机制缺省，你不必全传）。**排队顺序影响早期容器轮换次序，hard 题必须在 easy 题之前入队**。
 - **每题至少投 1 条思路**；enqueue 的 prompt 只写方向段（打哪/为什么/验证点），题面/入口/账本/纪律/家族模板由机制框架注入。投完就不用管——机制自动授予/回队/升级梯。
 - **待裁决是必须处理的活**：status 置顶"待裁决(N)"，每条用 xiaochang_report 裁决；判死前核对 graph 兵力。**v8.5.1: 机制不再自动派验证兵**——死路封印簇(≥3 同向)会以"验证建议"进待裁决清单（按簇分类+计数+附可抄验证兵令文），你据此决定派验证兵(enqueue)复核或直接裁决。
