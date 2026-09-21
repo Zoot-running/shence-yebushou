@@ -1709,7 +1709,9 @@ ${tpl}
       templateTxt.trim() !== "" ? `\u5BB6\u65CF: ${family}(\u80CC\u666F\u901F\u67E5, \u4E0E\u4EFB\u52A1\u51B2\u7A81\u4EE5\u4EFB\u52A1\u4E3A\u51C6)${templateTxt}` : "",
       "\u7EAA\u5F8B: \u2460\u5148\u8BFB\u77E5\u8BC6\u8D26\u672C, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1, \u4E0D\u91CD\u590D\u6B7B\u8DEF, \u4F18\u5148\u7528\u56DE\u6536\u5DE5\u4EF6;",
       "      \u2461\u627E\u5230 flag \u7ACB\u5373\u8C03 xiaochang_flag_report(code, flag) \u4E0A\u62A5\u5165\u65D7\u4ED3(\u4E3B agent \u8D1F\u8D23\u63D0\u4EA4);",
-      "      \u2462\u6B7B\u8DEF/\u65B0\u5206\u53C9\u8C03 xiaochang_fork \u4E0A\u62A5; \u7EC8\u6001\u524D\u628A\u6B7B\u8DEF\u539F\u56E0\u5199\u6E05(\u9644\u5B9E\u6D4B\u53D8\u4F53\u6E05\u5355)\u3002"
+      "      \u2462\u6B7B\u8DEF/\u65B0\u5206\u53C9\u8C03 xiaochang_fork \u4E0A\u62A5; \u7EC8\u6001\u524D\u628A\u6B7B\u8DEF\u539F\u56E0\u5199\u6E05(\u9644\u5B9E\u6D4B\u53D8\u4F53\u6E05\u5355)\u3002",
+      "      \u2463\u5F00\u5DE5\u5148\u505A\u6734\u7D20 5 \u5206\u949F\u68C0\u67E5(\u5148\u4E8E CVE \u94FE): \u767B\u5F55\u9875/\u524D\u7AEF JS \u5199\u6B7B\u7684\u6D4B\u8BD5\u8D26\u53F7\u5F31\u53E3\u4EE4\u3001\u9759\u6001\u6587\u4EF6\u4E0E\u6570\u636E\u5E93\u6587\u4EF6\u53EF\u76F4\u63A5\u4E0B\u8F7D\u3001\u7EDD\u5BF9\u8DEF\u5F84\u7A7F\u8D8A(WAF \u53EA\u6EE4\u5B57\u9762\u91CF ../ \u65F6\u7528\u7EDD\u5BF9\u8DEF\u5F84)\u3001mass assignment \u6539\u5B57\u6BB5\u3001/proc/self/environ \u6CC4\u6F0F\u3001\u7EAF\u8BFB\u578B\u8D8A\u754C\u3001\u9898\u9762\u5DF2\u7ED9\u94FE\u8DEF\u7684\u76F4\u63A5\u590D\u73B0\u3002",
+      "      \u2464\u6279\u91CF\u4EFB\u52A1\u5148\u4F30\u91CF: \u8FDB\u7A0B\u542F\u52A8\u8981\u51E0\u5341\u6BEB\u79D2\u2014\u2014\u5355\u4E2A\u4EFB\u52A1\u6BD4\u8FDB\u7A0B\u542F\u52A8\u8FD8\u8F7B(\u6BCF\u884C\u4E00\u6B21 urlencode\u3001\u6BCF\u8BCD\u4E00\u6B21\u67E5\u8BE2\u3001\u6BCF\u6587\u4EF6\u4E00\u6B21 grep)\u65F6, \u7981\u6B62\u6BCF\u9879\u8D77\u4E00\u4E2A\u65B0\u8FDB\u7A0B; \u5408\u5E76\u6210\u5355\u8FDB\u7A0B\u6D41\u5F0F(\u8D77\u4E00\u6B21 python/awk \u5FAA\u73AF\u8BFB stdin), \u6216 xargs -P \u9650\u5E76\u53D1; \u540C\u7C7B\u5C0F\u4EFB\u52A1 >50 \u9879\u5373\u9002\u7528; \u6587\u4EF6\u626B\u63CF\u9650\u5B9A\u76EE\u6807\u76EE\u5F55, \u7981\u6B62 find / \u5168\u76D8\u3002"
     ].filter((l) => l !== "").join("\n");
   }
   const register = (tool) => ctx.tools.register(tool);
@@ -2224,7 +2226,8 @@ ${manifest.join("\n")}`;
           if (e.status === "pending") pending += 1;
           else if (e.status === "accepted") accepted += 1;
           else rejected += 1;
-          lines.push(`  ${code} [${e.status}] ${flag.slice(0, 40)}${e.verdict !== void 0 ? " \u2014 " + e.verdict.slice(0, 60) : ""}${e.by !== "" ? " (by " + e.by + ")" : ""}`);
+          const flagTxt = flag.length > 200 ? `${flag.slice(0, 200)}\u2026(\u5171${flag.length}\u5B57\u7B26, \u663E\u793A\u5DF2\u622A\u65AD\u2014\u2014\u539F\u6587\u8BFB storages/xiaochang-flags.jsonl)` : flag;
+          lines.push(`  ${code} [${e.status}] ${flagTxt}${e.verdict !== void 0 ? " \u2014 " + e.verdict.slice(0, 60) : ""}${e.by !== "" ? " (by " + e.by + ")" : ""}`);
         }
       }
       return `\u65D7\u4ED3: pending=${pending} accepted=${accepted} rejected=${rejected}
@@ -2334,7 +2337,7 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
           adjudicate(mo, "continue");
           removePending(s, c2);
         }
-        if (c2 === args.code && wasGranted && args.dispatchNow === true) continue;
+        if (mo.state === "granted") continue;
         if (mo.state !== "solved" && mo.state !== "dead") mo.state = "queued";
       }
       let dispatchNowNote = "";
@@ -2354,8 +2357,6 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
           dispatchNowNote = `
 dispatchNow \u6D3E\u53D1\u5931\u8D25: ${String(error)}`;
         }
-      } else {
-        o.state = "queued";
       }
       if (priorityChanged && s.containerQueue !== void 0) {
         for (const c2 of s.armed) {

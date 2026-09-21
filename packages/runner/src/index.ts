@@ -1167,6 +1167,8 @@ export function apply(ctx: Context): void {
       '纪律: ①先读知识账本, 从已知边界出发, 不重复死路, 优先用回收工件;',
       '      ②找到 flag 立即调 xiaochang_flag_report(code, flag) 上报入旗仓(主 agent 负责提交);',
       '      ③死路/新分叉调 xiaochang_fork 上报; 终态前把死路原因写清(附实测变体清单)。',
+      '      ④开工先做朴素 5 分钟检查(先于 CVE 链): 登录页/前端 JS 写死的测试账号弱口令、静态文件与数据库文件可直接下载、绝对路径穿越(WAF 只滤字面量 ../ 时用绝对路径)、mass assignment 改字段、/proc/self/environ 泄漏、纯读型越界、题面已给链路的直接复现。',
+      '      ⑤批量任务先估量: 进程启动要几十毫秒——单个任务比进程启动还轻(每行一次 urlencode、每词一次查询、每文件一次 grep)时, 禁止每项起一个新进程; 合并成单进程流式(起一次 python/awk 循环读 stdin), 或 xargs -P 限并发; 同类小任务 >50 项即适用; 文件扫描限定目标目录, 禁止 find / 全盘。',
     ].filter(l => l !== '').join('\n')
   }
 
@@ -1700,7 +1702,12 @@ export function apply(ctx: Context): void {
           if (e.status === 'pending') pending += 1
           else if (e.status === 'accepted') accepted += 1
           else rejected += 1
-          lines.push(`  ${code} [${e.status}] ${flag.slice(0, 40)}${e.verdict !== undefined ? ' — ' + e.verdict.slice(0, 60) : ''}${e.by !== '' ? ' (by ' + e.by + ')' : ''}`)
+          // v8.5.2: flag 值全文显示(20911 实锤: 40 字符截断导致按截断值提交被平台拒,
+          // b-03 首旗差点丢); 仅 >200 字符才截断且响亮标注原文出处。
+          const flagTxt = flag.length > 200
+            ? `${flag.slice(0, 200)}…(共${flag.length}字符, 显示已截断——原文读 storages/xiaochang-flags.jsonl)`
+            : flag
+          lines.push(`  ${code} [${e.status}] ${flagTxt}${e.verdict !== undefined ? ' — ' + e.verdict.slice(0, 60) : ''}${e.by !== '' ? ' (by ' + e.by + ')' : ''}`)
         }
       }
       return `旗仓: pending=${pending} accepted=${accepted} rejected=${rejected}\n${lines.join('\n') || '  (空)'}`
@@ -1803,7 +1810,10 @@ export function apply(ctx: Context): void {
           ? `\n已标记 ${n} 条采纳思路为已消费(本 directive 引用)。当前未消费: ${open || '无'}`
           : `\n⚠️ ideaIds 未命中任何未消费思路(传了 ${args.ideaIds!.join(',')}): 已消费/不存在/拼写? 当前未消费: ${open || '无'}`
       }
-      // v8.5: dispatchNow 判定在成员回路之前捕获(回路会把 granted 打回 queued)。
+      // v8.5.2 状态门修复(20911 实锤): enqueue 永不把 granted 打回 queued——
+      // 授予是已持有的资源, 投思路不能撤销它; 否则首轮授予的题 dispatchNow 静默失效
+      // (b-02/b-01/b-03 全程只有 1 路兵)。granted 保持不动: 没派完的思路要么
+      // dispatchNow 当场派, 要么等 settle 回队后的下一轮授予。
       const wasGranted = o.state === 'granted'
       // v8.3c 簇调度: 入队/续打对簇内全体成员生效(簇=单调度单元)。
       const memberCodes = [args.code, ...o.cluster]
@@ -1814,8 +1824,7 @@ export function apply(ctx: Context): void {
           adjudicate(mo, 'continue')
           removePending(s, c2)
         }
-        // v8.5: dispatchNow 的主码保持 granted(当场上车), 不回队不重授。
-        if (c2 === args.code && wasGranted && args.dispatchNow === true) continue
+        if (mo.state === 'granted') continue
         if (mo.state !== 'solved' && mo.state !== 'dead') mo.state = 'queued'
       }
       let dispatchNowNote = ''
@@ -1833,8 +1842,6 @@ export function apply(ctx: Context): void {
         } catch (error) {
           dispatchNowNote = `\ndispatchNow 派发失败: ${String(error)}`
         }
-      } else {
-        o.state = 'queued'
       }
       // v8.4.1: 显式 priority 变更 → 已武装容器题全量重排(20633 实锤: 武装时 FIFO 固化,
       // enqueue 的 priority 只写账本不重排——b-02 高优排到末位)。

@@ -407,11 +407,12 @@ describe('v8.5 调度权回归主 agent', () => {
   it('人工收兵 interruptItemIds: 中断+取消+审计, settle 不计败绩(决策①)', async () => {
     // 标签选新鲜 item: 前序测试 settle 过的 item 已进 settleProcessed 去重, 会假阴性。
     const code = 'g-m1'
-    // 不按 label 选: 该题思路池里有前序测试留下的旧未试 directive, 新授予可能先消费旧的——
-    // 按"新出现的 itemId"选(新 item 必未 settle), 与具体 directive 无关。
+    // v8.5.2 后普通 enqueue 不再把 granted 打回 queued(无重授), 新鲜 item 走 dispatchNow 当场上车。
+    await waitFor(() => orchOf(code).state === 'granted', 60_000, 'g-m1 granted')
     const beforeIds = new Set(itemsFor(code).map(i => i.id))
-    await tool('xiaochang_enqueue').execute({ code, prompt: 't4: 收兵测试用思路' }, parent)
-    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched' && !beforeIds.has(i.id)), 60_000, 'fresh item')
+    const enqRes = await tool('xiaochang_enqueue').execute({ code, prompt: 't4: 收兵测试用思路', dispatchNow: true }, parent)
+    expect(String(enqRes)).toContain('已 dispatchNow 立即派发')
+    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched' && !beforeIds.has(i.id)), 30_000, 'fresh item')
     const it = itemsFor(code).find(i => i.state === 'dispatched' && !beforeIds.has(i.id))!
     const settleBefore = orchOf(code).settleNoFlag
     const res = await tool('xiaochang_report').execute({ code, verdict: 'continue', interruptItemIds: [it.id], reason: '思路已废, 人工收兵' }, parent)
@@ -431,4 +432,24 @@ describe('v8.5 调度权回归主 agent', () => {
       return st.includes('在途执行者:') && st.includes('容器资源(全容器') && /盒剩\d+m/.test(st)
     }, 90_000, 'status facts')
   }, 120_000)
+
+  it('v8.5.2 状态门修复: 普通 enqueue 不把 granted 打回 queued(20911 首轮 3 题单兵根因)', async () => {
+    const code = 'g-m1'
+    await tool('xiaochang_enqueue').execute({ code, prompt: 't5: 持槽续投思路' }, parent)
+    await waitFor(() => orchOf(code).state === 'granted', 60_000, 'g-m1 granted')
+    // 持槽期间普通 enqueue(不带 dispatchNow): 状态必须保持 granted, 不撤销授予。
+    const res = await tool('xiaochang_enqueue').execute({ code, prompt: 't5b: 追加思路不触发重授' }, parent)
+    expect(String(res)).toContain('状态=granted')
+    expect(orchOf(code).state).toBe('granted')
+  }, 120_000)
+
+  it('v8.5.2 flag 全文显示: 长 flag 不在面板截断(20911 b-03 首旗被截断教训)', async () => {
+    const code = 'g-m1'
+    const longFlag = 'flag{' + 'a'.repeat(50) + '}'
+    const out = await tool('xiaochang_flag_report').execute({ code, flag: longFlag }, parent)
+    expect(String(out)).not.toContain('拒绝')
+    const st = String(await tool('xiaochang_flag_status').execute({}, parent))
+    expect(st).toContain(longFlag) // ≤200 字符全文显示
+    expect(st).not.toContain('显示已截断')
+  }, 30_000)
 })
