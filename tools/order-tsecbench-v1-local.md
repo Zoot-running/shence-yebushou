@@ -1,18 +1,18 @@
 【神策·校场 v8.5.1 机制实验局】tsecbench v1 本地模式（题数/总分以 xiaochang_list 实时为准；63 题/23000 分集）。
 
-> 本局参数已按 run 20911 刷新（2026-09-21 12:40 建局，14:00 停表）。
+> 本局参数已按 run 21013 刷新（2026-09-21 18:01 建局，19:30 停表）。
 
 使命：本局以**实验 v8.5.1 新机制**为主、打题满分为辅（目标层级不变：满分>用时>花费）。行营模式运行（persona 三件套纪律随预设注入）：计划用 xingying_plan_review 自审六要素；战时正常调度打题优先；**战后 xingying_retro 落四栏复盘，并把"机制观察清单"逐条回填战报**。本开战令是 run 内自主判断的唯一授权来源。
 
 第一个动作必须调用 create_goal 工具，目标：
-"完成 tsecbench v1 本地实验局（题数/总分以 xiaochang_list 为准）：开局按总分降序给全题投思路（hard/多旗链最先、easy 殿后）；每轮 xiaochang_collect 收终态→读战报/画像/能力账本→xiaochang_enqueue 投思路包（ideaIds 引用已采纳思路）→处理 xiaochang_status 置顶待裁决(xiaochang_report 裁决)→出旗即 xiaochang_submit；fanout 报告到达按 v8.5 管线采纳(xiaochang_idea_adopt)再派兵(题已持槽可 dispatchNow 当场上车)；调度把资源排满(槽满/在途满/本地全并行/空转即补兵)；等待一律 xiaochang_wait；14:00 到点（或满分）即 xiaochang_finish 停表；全程按'机制观察清单'验证 v8.5.1 新机制并记录观察结果"。
+"完成 tsecbench v1 本地实验局（题数/总分以 xiaochang_list 为准）：开局按总分降序给全题投思路（hard/多旗链最先、easy 殿后）；每轮 xiaochang_collect 收终态→读战报/画像/能力账本→xiaochang_enqueue 投思路包（ideaIds 引用已采纳思路）→处理 xiaochang_status 置顶待裁决(xiaochang_report 裁决)→出旗即 xiaochang_submit；fanout 报告到达按 v8.5 管线采纳(xiaochang_idea_adopt)再派兵(题已持槽可 dispatchNow 当场上车)；调度把资源排满(槽满/在途满/本地全并行/空转即补兵)；等待一律 xiaochang_wait；19:30 到点（或满分）即 xiaochang_finish 停表；全程按'机制观察清单'验证 v8.5.1+v8.5.2 新机制并记录观察结果(重点: dispatchNow 对首轮授予题生效/执行令带④⑤纪律/flag 全文显示/收尾 finish 正常落表)"。
 
 然后立即 xiaochang_setup（幂等）：
 - 工具从进程环境读 BENCHMARK_BASE_URL / BENCHMARK_TOKEN（printenv 看不到属正常，不要找 token）。
 - **本局是本地模式：runId 与 runBearerToken 写死如下，setup 调用必须带**——finish 停表需要 runBearerToken，漏传会停不了表。
-  - runId: 20911
+  - runId: 21013
   - runBearerToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxNjUwIiwiZXhwIjoxNzkwMDAzMTg0fQ.zgz4bHN9kZftZIHJz0v6BbIxRsCK6hImt9lGkC1Qapw
-- defaultModel: deepseek-v4-flash，defaultEffort: low，modelLock: false，budgetMinutes: 74（到 14:00 收，留 2min 给 finish 落表），roundTimeoutMinutes: 45，maxHintsPerChallenge: 1。能力账本本局从零冷启动（规则 6 红线），模型选择靠开局 fanout + 战绩现场累积。
+- defaultModel: deepseek-v4-flash，defaultEffort: low，modelLock: false，budgetMinutes: 87（到 19:30 收，留 2min 给 finish 落表），roundTimeoutMinutes: 45，maxHintsPerChallenge: 1。能力账本本局从零冷启动（规则 6 红线），模型选择靠开局 fanout + 战绩现场累积。
 - VPN 已由 launch 侧连好；本地直连模型 API（无需网关）。
 
 v8 题队列调度纪律（已写进校场 SKILL，开工先 read /opt/xiaochang-skill.md 的"八、v8.5 增补"节）：
@@ -44,9 +44,12 @@ v8 题队列调度纪律（已写进校场 SKILL，开工先 read /opt/xiaochang
 9. **人工收兵**：report(interruptItemIds) 收回执行者后，其 settle 是否被"人工收兵"吸收（audit v8-settle-manual、不计败绩、不触发升级梯）？
 10. **资源事实面板**：status 是否含"在途执行者"（盒剩分钟/已跑分钟/⚠️>45m）与"容器资源"（cgroup mem/cpu/loadavg）两行？读数是否与实际打题节奏一致？
 11. **升级梯扁平化（v8.5.1）**：零进展×1 settle 后是否只回队 1 路（不再全开 3 路/无 auto-R2）？零进展×2 是否挂裁决？
+12. **v8.5.2 状态门**：首轮授予的题（开局最先拿槽的 3 题）普通 enqueue 后状态是否仍 granted？对这 3 题 dispatchNow 是否立即派兵（不再静默失效）？
+13. **v8.5.2 执行者纪律**：抽执行令确认含"④朴素 5 分钟检查"与"⑤批量任务先估量"两条；宿主 loadavg 是否不再出现每词起进程式风暴（>50 直线飙升）？
+14. **v8.5.2 收尾**：预算到点 finish 是否正常落表（平台 ended_at 出现、无需外部补调）？driver 日志是否有 inactive/fatal？
 
 模型选择（决策权在你，依据在集思）：能力相当按价格序挑便宜；贵模型用于赶工场景并 jisi_record 落账。**末段赶工纪律：预算剩余 ≤60 分钟且有未破 hard 题时，必须显式 fanout(kimi-k3+pro 各一路)并立即派 pro 执行最清晰的一路**——本局剩余预算短，此条从开局就适用。花费第三位——任何"为省 token 放慢节奏/减并行/长睡"都是违规。
 
-停表条件：**14:00 到点（以 xiaochang_status 预算剩余为准，不要用 date 推算）或满分——二者满足其一即调 xiaochang_finish（本局是验证局，允许 force=true）**。本地局没有 hosted-guard：driver 退出=战役结束，所以停表必须由你自己在收尾消息里完成。
+停表条件：**19:30 到点（以 xiaochang_status 预算剩余为准，不要用 date 推算）或满分——二者满足其一即调 xiaochang_finish（本局是验证局，允许 force=true）**。本地局没有 hosted-guard：driver 退出=战役结束，所以停表必须由你自己在收尾消息里完成。
 
 纪律提醒：本 run 从零开始——不读任何历史题解/flag/机制先验；flag 从线上目标现取现交；占位 flag 一律不交。平台行为现学现用。题必有解、平台异常≠题无解：先重试/重开容器/换入口并留证，不判死、不提前停表。**本局重点是机制观察，题目打多少算多少，不许为了赶题跳过观察清单。**

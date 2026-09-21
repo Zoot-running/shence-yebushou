@@ -2118,20 +2118,24 @@ ${manifest.join("\n")}`;
             }
             audit(s.auditPath, { type: "v8-submit-solved", code: args.code });
           } else {
-            adjudicate(o, "continue");
-            armQueue();
+            keepGrantAfterSubmit(o);
             audit(s.auditPath, { type: "v8-submit-partial", code: args.code });
           }
           bumpOrch(s);
           persistOrch(s);
           persistProgress(s);
         } else {
-          adjudicate(o, "continue");
           removePending(s, args.code, "flag-candidate");
+          keepGrantAfterSubmit(o);
           bumpOrch(s);
           persistOrch(s);
-          armQueue();
           audit(s.auditPath, { type: "v8-submit-reject", code: args.code });
+        }
+      };
+      const keepGrantAfterSubmit = (o) => {
+        if (o.state === "pending-adjudication") {
+          o.state = "granted";
+          o.grantedUntil = Date.now() + s.timeboxMs;
         }
       };
       try {

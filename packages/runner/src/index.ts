@@ -1588,21 +1588,32 @@ export function apply(ctx: Context): void {
             audit(s.auditPath, { type: 'v8-submit-solved', code: args.code })
           } else {
             // 多旗题: 已吃一旗, 续打下一旗(容器保留, 账本已有旗值)。
-            adjudicate(o, 'continue')
-            armQueue()
+            // v8.5.2 同族修复(21013 实锤 b-01/b-03): 提交不撤销授予——pending-adjudication
+            // (旗待提交宽限态)回 granted 换新时间盒, granted 原地不动; 不 armQueue(否则
+            // granted 题产生重授等待位, 且 dispatchNow 静默失效)。
+            keepGrantAfterSubmit(o)
             audit(s.auditPath, { type: 'v8-submit-partial', code: args.code })
           }
           bumpOrch(s)
           persistOrch(s)
           persistProgress(s)
         } else {
-          adjudicate(o, 'continue')
           removePending(s, args.code, 'flag-candidate')
+          // v8.5.2: 被拒提交同样不撤销授予(候选值本身是进展, 授予是已持有资源);
+          // 续打走 dispatchNow 或在途 settle, 回队时机归机制/主 agent。
+          keepGrantAfterSubmit(o)
           bumpOrch(s)
           persistOrch(s)
-          armQueue()
           audit(s.auditPath, { type: 'v8-submit-reject', code: args.code })
         }
+      }
+      /** v8.5.2: 非裁决事件不撤销授予——pending-adjudication 回 granted 换新时间盒; granted 原地不动。 */
+      const keepGrantAfterSubmit = (o: ChallengeOrch): void => {
+        if (o.state === 'pending-adjudication') {
+          o.state = 'granted'
+          o.grantedUntil = Date.now() + s.timeboxMs
+        }
+        // granted: 不动; queued 等其他状态: 不动(等机制正常授予)。
       }
       try {
         const recordWin = (flag: string): void => {

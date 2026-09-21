@@ -443,6 +443,17 @@ describe('v8.5 调度权回归主 agent', () => {
     expect(orchOf(code).state).toBe('granted')
   }, 120_000)
 
+  it('v8.5.2 提交不撤销授予: 被拒提交后 granted 保持(21013 b-01/b-03 实锤同族病灶)', async () => {
+    const code = 'b-02'
+    await waitFor(() => orchOf(code).state === 'granted', 90_000, 'b-02 granted')
+    const res = await tool('xiaochang_submit').execute({ code, flag: 'mock{definitely-wrong}' }, parent)
+    expect(String(res)).not.toContain('flag 已存在')
+    // 被拒路径: 旧实现 adjudicate(continue) 把 granted 打回 queued + armQueue 重授等待位;
+    // v8.5.2: 授予是已持有资源, 提交(无论成败)不撤销它。
+    await waitFor(() => auditLines().some(l => l.includes('"v8-submit-reject"') && l.includes(code)), 10_000, 'submit reject audit')
+    expect(orchOf(code).state).toBe('granted')
+  }, 120_000)
+
   it('v8.5.2 flag 全文显示: 长 flag 不在面板截断(20911 b-03 首旗被截断教训)', async () => {
     const code = 'g-m1'
     const longFlag = 'flag{' + 'a'.repeat(50) + '}'
