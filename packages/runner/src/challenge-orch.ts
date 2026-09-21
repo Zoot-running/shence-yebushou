@@ -70,6 +70,8 @@ export interface ChallengeOrch {
   cluster: string[]
   /** v8.4 战术家族(模板帧注入用): 主 agent enqueue 可显式指定, 缺省由题面自动判定。 */
   family?: string
+  /** v8.5: 主 agent 指定的下次授予路数(无硬上限, 授予时消费)。 */
+  spawnRequest?: number
   /** v8.4 目标侧节奏约束(限速/封禁类, 注入令文): 如 "ssh ≤2 次/10min"。 */
   pacing?: string[]
   /** 上次 settle 结论指纹（同结论检测）。 */

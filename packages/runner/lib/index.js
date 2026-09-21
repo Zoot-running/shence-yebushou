@@ -1,5 +1,6 @@
 // src/index.ts
 import { existsSync, mkdirSync as mkdirSync2, readFileSync, readdirSync as readdirSync2, renameSync as renameSync2, statSync as statSync2, writeFileSync, appendFileSync } from "node:fs";
+import { loadavg } from "node:os";
 import { dirname, join as join2 } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 
@@ -1413,6 +1414,101 @@ function apply(ctx) {
     spawnQueue.push(code);
     void pumpSpawns();
   }
+  const inflightSummary = () => {
+    const s = requireState();
+    const now = Date.now();
+    const lines = [];
+    for (const [code, o] of s.orch) {
+      if (o.state !== "granted") continue;
+      const items = c().ledger.views().filter((v) => codeOf(v.item.id) === code && (v.state === "dispatched" || v.state === "help" || v.state === "stalled"));
+      const boxLeft = o.grantedUntil !== void 0 ? Math.max(0, Math.round((o.grantedUntil - now) / 6e4)) : "?";
+      const itemTxt = items.length === 0 ? "\u5728\u90140(\u69FD\u7A7A\u8F6C\u2014\u2014\u53EF enqueue \u8BE5\u9898\u52A0 dispatchNow \u5F53\u573A\u8865\u5175)" : items.map((v) => {
+        const w = v.item.id.split("#")[2] ?? v.item.id;
+        const at = v.dispatchedAt ?? now;
+        const mins = Math.round((now - at) / 6e4);
+        const stale = now - at > 45 * 6e4 ? "\u26A0\uFE0F>45m" : "";
+        return `${w}@${v.item.model ?? "?"}\u5DF2${mins}m${stale}`;
+      }).join(" ");
+      lines.push(`  ${code}[\u76D2\u5269${boxLeft}m\xB7\u5728\u9014${items.length}] ${itemTxt}`);
+    }
+    return lines.length > 0 ? lines.join("\n") : "(\u65E0\u6388\u4E88\u69FD/\u5728\u9014\u6267\u884C\u8005)";
+  };
+  const containerResources = () => {
+    const parts = [];
+    try {
+      if (existsSync("/sys/fs/cgroup/memory.max")) {
+        const maxS = readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim();
+        const curS = readFileSync("/sys/fs/cgroup/memory.current", "utf8").trim();
+        const maxN = Number(maxS);
+        const curMB = Math.round(Number(curS) / 1048576);
+        parts.push(maxN > 0 && maxN < 9e15 ? `mem=${curMB}/${Math.round(maxN / 1048576)}MB` : `mem=${curMB}MB(\u65E0\u4E0A\u9650)`);
+      } else {
+        const m = readFileSync("/proc/meminfo", "utf8");
+        const tot = Number(/MemTotal:\s*(\d+)/.exec(m)?.[1] ?? 0);
+        const avl = Number(/MemAvailable:\s*(\d+)/.exec(m)?.[1] ?? 0);
+        if (tot > 0) parts.push(`mem=${Math.round((tot - avl) / 1024)}/${Math.round(tot / 1024)}MB(\u5BBF\u4E3B)`);
+      }
+    } catch {
+    }
+    try {
+      if (existsSync("/sys/fs/cgroup/cpu.stat")) {
+        const cs = readFileSync("/sys/fs/cgroup/cpu.stat", "utf8");
+        const u = Number(/usage_usec\s+(\d+)/.exec(cs)?.[1] ?? 0);
+        parts.push(`cpuUsed=${Math.round(u / 1e6)}s`);
+      }
+      if (existsSync("/sys/fs/cgroup/cpu.max")) {
+        const q = readFileSync("/sys/fs/cgroup/cpu.max", "utf8").trim();
+        parts.push(q.startsWith("max") ? "cpuQuota=\u65E0\u4E0A\u9650" : `cpuQuota=${q}`);
+      }
+    } catch {
+    }
+    try {
+      parts.push(`loadavg=${loadavg().map((x) => x.toFixed(2)).join("/")}`);
+    } catch {
+    }
+    return parts.join(" ");
+  };
+  async function spawnExecutor(code, o, d, idx, prio, cls, vq) {
+    const s = requireState();
+    const ch = s.challenges.get(code);
+    if (ch === void 0) return;
+    const workNo = (s.enqCounters.get(code) ?? 0) + 1;
+    s.enqCounters.set(code, workNo);
+    const itemId = `${code}#s${o.attempts}-w${workNo}`;
+    const executor = resolveExecutor({ model: d.model ?? pickSpawnModel(code, idx), effort: d.effort }, s.executorPolicy);
+    const err = await validateExecutorModel(executor.model);
+    const model = err === null ? executor.model : s.executorPolicy.defaultModel;
+    const clusterTxt = o.cluster.length > 0 ? `
+
+\u3010\u540C\u9776\u573A\u5144\u5F1F\u9898(\u5171\u4EAB\u6B64\u5BB9\u5668, \u4E00\u5E76\u6536\u65D7)\u3011${o.cluster.map((c2) => {
+      const ch2 = s.challenges.get(c2);
+      return `${c2}(${ch2?.total_score ?? "?"}pts): \u9898\u9762 ${(ch2?.description ?? "").slice(0, 80)}; \u6218\u62A5 ${c().boardPath(c2)}; \u62FF\u5230\u8BE5\u9898\u65D7\u540C\u6837\u8C03 xiaochang_flag_report('${c2}', flag)`;
+    }).join("\n")}` : "";
+    const label = buildExecFrame(code, d.text) + clusterTxt + gapsTxtOf(code);
+    c().add({
+      id: itemId,
+      label,
+      model,
+      reasoningEffort: executor.effort,
+      board: code,
+      resourceClass: cls,
+      priority: { tier: tierOf(ch.difficulty), score: prio },
+      ...d.persona !== void 0 && d.persona !== "" ? { persona: d.persona } : {}
+    });
+    if (!vq.triedModels.includes(model)) vq.triedModels.push(model);
+    persistV2(s);
+    audit(s.auditPath, { type: "v8-spawn", id: itemId, code, attempts: o.attempts, model, class: cls });
+    let n = 0;
+    try {
+      while (n < 8) {
+        const d2 = await c().dispatchNext();
+        if (d2 === void 0) break;
+        n += 1;
+      }
+    } catch (error) {
+      audit(s.auditPath, { type: "v8-dispatch-error", code, error: String(error) });
+    }
+  }
   async function grantAndSpawn(code) {
     const s = requireState();
     s.armed.delete(code);
@@ -1457,8 +1553,9 @@ function apply(ctx) {
     }
     o.cluster = siblings;
     grant(o, snapshot, Date.now(), s.timeboxMs);
-    const nSpawn = Math.max(1, Math.min(o.multiSpawn, 3));
+    const nSpawn = Math.max(1, o.spawnRequest ?? o.multiSpawn);
     o.multiSpawn = 0;
+    o.spawnRequest = void 0;
     if (o.r2Due) {
       o.r2Due = false;
       void issueR2(code);
@@ -1486,45 +1583,9 @@ function apply(ctx) {
       }
     }
     for (let i = 0; i < picks.length; i++) {
-      const d = picks[i];
-      const workNo = (s.enqCounters.get(code) ?? 0) + 1;
-      s.enqCounters.set(code, workNo);
-      const itemId = `${code}#s${o.attempts}-w${workNo}`;
-      const executor = resolveExecutor({ model: d.model ?? pickSpawnModel(code, i), effort: d.effort }, s.executorPolicy);
-      const err = await validateExecutorModel(executor.model);
-      const model = err === null ? executor.model : s.executorPolicy.defaultModel;
-      const clusterTxt = o.cluster.length > 0 ? `
-
-\u3010\u540C\u9776\u573A\u5144\u5F1F\u9898(\u5171\u4EAB\u6B64\u5BB9\u5668, \u4E00\u5E76\u6536\u65D7)\u3011${o.cluster.map((c2) => {
-        const ch2 = s.challenges.get(c2);
-        return `${c2}(${ch2?.total_score ?? "?"}pts): \u9898\u9762 ${(ch2?.description ?? "").slice(0, 80)}; \u6218\u62A5 ${c().boardPath(c2)}; \u62FF\u5230\u8BE5\u9898\u65D7\u540C\u6837\u8C03 xiaochang_flag_report('${c2}', flag)`;
-      }).join("\n")}` : "";
-      const label = buildExecFrame(code, d.text) + clusterTxt + gapsTxtOf(code);
-      c().add({
-        id: itemId,
-        label,
-        model,
-        reasoningEffort: executor.effort,
-        board: code,
-        resourceClass: cls,
-        priority: { tier: tierOf(ch.difficulty), score: prio },
-        ...d.persona !== void 0 && d.persona !== "" ? { persona: d.persona } : {}
-      });
-      if (!vq.triedModels.includes(model)) vq.triedModels.push(model);
-      persistV2(s);
-      audit(s.auditPath, { type: "v8-spawn", id: itemId, code, attempts: o.attempts, model, class: cls });
+      await spawnExecutor(code, o, picks[i], i, prio, cls, vq);
     }
-    let count = 0;
-    try {
-      while (count < 8) {
-        const d2 = await c().dispatchNext();
-        if (d2 === void 0) break;
-        count += 1;
-      }
-    } catch (error) {
-      audit(s.auditPath, { type: "v8-dispatch-error", code, error: String(error) });
-    }
-    audit(s.auditPath, { type: "v8-grant", code, spawn: picks.length, dispatched: count });
+    audit(s.auditPath, { type: "v8-grant", code, spawn: picks.length });
     bumpOrch(s);
     persistOrch(s);
     persistProgress(s);
@@ -1580,6 +1641,10 @@ function apply(ctx) {
     if (s.settleProcessed.has(itemId)) return;
     s.settleProcessed.add(itemId);
     const now = Date.now();
+    if (s.manualInterrupted.has(itemId)) {
+      audit(s.auditPath, { type: "v8-settle-manual", itemId, code });
+      return;
+    }
     const sn = o.snapshot;
     const pendingFlags = pendingFlagsOf(readFlagEntries(), code);
     const p = {
@@ -1841,7 +1906,8 @@ ${tpl}
         tickCount: 0,
         scoreTable: {},
         hintGateOpen: /* @__PURE__ */ new Set(),
-        verifierDispatched: /* @__PURE__ */ new Map()
+        verifierDispatched: /* @__PURE__ */ new Map(),
+        manualInterrupted: /* @__PURE__ */ new Set()
       };
       try {
         if (existsSync(s.profilePath)) s.profile = parse(readFileSync(s.profilePath, "utf8"));
@@ -2309,6 +2375,8 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
       pacing: { type: "array", description: 'v8.4: \u76EE\u6807\u4FA7\u8282\u594F\u7EA6\u675F(\u9650\u901F/\u5C01\u7981\u7C7B, \u6CE8\u5165\u4EE4\u6587\u786C\u7EA6\u675F), \u5982 ["ssh \u22642 \u6B21/10min(\u5931\u8D25\u5373\u5C01\u7981)"]\u3002' },
       ideaIds: { type: "array", description: "v8.4: \u672C directive \u5F15\u7528\u7684\u91C7\u7EB3\u601D\u8DEF id \u5217\u8868(\u4ECE enqueue \u56DE\u663E/status \u7684\u672A\u6D88\u8D39\u601D\u8DEF\u6E05\u5355\u53D6); \u6D3E\u5175\u5373\u6807\u8BB0\u8BE5\u601D\u8DEF\u5DF2\u6D88\u8D39\u3002" },
       persona: { type: "string", description: "v8.4: \u6267\u884C\u8005 persona \u5185\u8054\u8986\u76D6(\u7F3A\u7701\u7EE7\u627F\u90E8\u7F72\u7EA7; \u53EF\u7ED9\u6E17\u900F/\u9006\u5411\u4E13\u5BB6\u7C7B persona)\u3002" },
+      dispatchNow: { type: "boolean", description: "v8.5: \u8BE5\u9898\u5DF2\u6301\u69FD(granted)\u65F6, \u7ACB\u5373\u7528\u672C\u6761 directive \u6D3E\u4E00\u4E2A\u65B0\u6267\u884C\u8005\u6302\u5230\u5F53\u524D\u5BB9\u5668(\u4E0E\u5728\u9014\u6267\u884C\u8005\u5E76\u884C; \u5171\u4EAB\u5BB9\u5668\u5269\u4F59\u65F6\u95F4\u76D2)\u3002\u601D\u8DEF\u4E00\u56DE\u6765\u5F53\u573A\u4E0A\u8F66, \u4E0D\u7B49\u4E0B\u4E00\u8F6E\u3002" },
+      spawn: { type: "number", description: "v8.5: \u6307\u5B9A\u4E0B\u6B21\u6388\u4E88\u7684\u6267\u884C\u8005\u8DEF\u6570(\u65E0\u786C\u4E0A\u9650\u2014\u2014\u8D44\u6E90\u4E8B\u5B9E\u5728 status, \u51B3\u7B56\u5F52\u4F60; \u7F3A\u7701\u8D70\u5347\u7EA7\u68AF multiSpawn)\u3002" },
       round: { type: "number", description: "v8: ignored (kept for compatibility) \u2014 rounds are managed by the mechanism." },
       dependsOn: { type: "array", description: "v8: ignored (kept for compatibility)." },
       resourceClass: { type: "string", description: "v8: ignored (kept for compatibility) \u2014 class is auto by challenge type." }
@@ -2347,6 +2415,7 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
       const priorityChanged = args.priority !== void 0 && o.priorityOverride !== args.priority;
       if (args.priority !== void 0) o.priorityOverride = args.priority;
       if (args.family !== void 0 && args.family !== "") o.family = args.family;
+      if (args.spawn !== void 0 && args.spawn > 0) o.spawnRequest = args.spawn;
       if ((args.pacing?.length ?? 0) > 0) o.pacing = [...o.pacing ?? [], ...args.pacing];
       let consumedNote = "";
       if ((args.ideaIds?.length ?? 0) > 0) {
@@ -2356,6 +2425,7 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
 \u5DF2\u6807\u8BB0 ${n} \u6761\u91C7\u7EB3\u601D\u8DEF\u4E3A\u5DF2\u6D88\u8D39(\u672C directive \u5F15\u7528)\u3002\u5F53\u524D\u672A\u6D88\u8D39: ${open || "\u65E0"}` : `
 \u26A0\uFE0F ideaIds \u672A\u547D\u4E2D\u4EFB\u4F55\u672A\u6D88\u8D39\u601D\u8DEF(\u4F20\u4E86 ${args.ideaIds.join(",")}): \u5DF2\u6D88\u8D39/\u4E0D\u5B58\u5728/\u62FC\u5199? \u5F53\u524D\u672A\u6D88\u8D39: ${open || "\u65E0"}`;
       }
+      const wasGranted = o.state === "granted";
       const memberCodes = [args.code, ...o.cluster];
       for (const c2 of memberCodes) {
         const mo = s.orch.get(c2);
@@ -2364,9 +2434,29 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
           adjudicate(mo, "continue");
           removePending(s, c2);
         }
+        if (c2 === args.code && wasGranted && args.dispatchNow === true) continue;
         if (mo.state !== "solved" && mo.state !== "dead") mo.state = "queued";
       }
-      o.state = "queued";
+      let dispatchNowNote = "";
+      if (wasGranted && args.dispatchNow === true) {
+        const d0 = { text: trunc.text, model: args.model, effort: args.effort, persona: args.persona, tried: true };
+        const chNow = s.challenges.get(args.code);
+        const clsNow = chNow !== void 0 ? resourceClassOf(chNow) : "container";
+        const vqNow = ensureVq(args.code);
+        try {
+          await spawnExecutor(args.code, o, d0, 0, priorityOf(o, chNow?.total_score ?? 300, Date.now()), clsNow, vqNow);
+          for (const d of o.directives) {
+            if (!d.tried && d.text === trunc.text) d.tried = true;
+          }
+          dispatchNowNote = `
+\u5DF2 dispatchNow \u7ACB\u5373\u6D3E\u53D1 1 \u4E2A\u6267\u884C\u8005\u6302\u5F53\u524D\u5BB9\u5668(\u4E0E\u5728\u9014\u5E76\u884C, \u5171\u4EAB\u5269\u4F59\u65F6\u95F4\u76D2 ${Math.round(((o.grantedUntil ?? Date.now()) - Date.now()) / 6e4)}min)\u3002`;
+        } catch (error) {
+          dispatchNowNote = `
+dispatchNow \u6D3E\u53D1\u5931\u8D25: ${String(error)}`;
+        }
+      } else {
+        o.state = "queued";
+      }
       if (priorityChanged && s.containerQueue !== void 0) {
         for (const c2 of s.armed) {
           try {
@@ -2391,7 +2481,7 @@ ${ideas.map((i) => `  #${i.id} ${i.text.slice(0, 90)}`).join("\n")}` : "\n\u672A
       const sealed = sealedClustersOf(deads);
       const sealedTxt = sealed.length > 0 ? `
 \u26A0\uFE0F \u6B7B\u8DEF\u5C01\u5370\u7C07 ${sealed.length} \u4E2A(\u22653 \u6761\u540C\u5411, \u9A8C\u8BC1\u5175\u5DF2\u81EA\u52A8\u89E6\u53D1): ${sealed.map((x) => `${x.direction}\xD7${x.count}`).join(" | ")}` : "";
-      return `enqueued ${args.code} (directives=${o.directives.length}, \u961F\u5217\u4F18\u5148\u7EA7=${priorityOf(o, ch.total_score, Date.now())}, \u72B6\u6001=${o.state}; \u6388\u4E88\u7531\u673A\u5236 tick \u6B66\u88C5, \u65E0\u9700\u624B\u52A8 dispatch)
+      return `enqueued ${args.code} (directives=${o.directives.length}, \u961F\u5217\u4F18\u5148\u7EA7=${priorityOf(o, ch.total_score, Date.now())}, \u72B6\u6001=${o.state}; \u6388\u4E88\u7531\u673A\u5236 tick \u6B66\u88C5, \u65E0\u9700\u624B\u52A8 dispatch)${dispatchNowNote}
 \u5BB6\u65CF\u6A21\u677F\u5DF2\u6302: ${tplName}${ideaMenu}${sealedTxt}${consumedNote}${truncNotice}`;
     }
   }));
@@ -2514,7 +2604,8 @@ ${detail.slice(0, 6e3)}`);
       forks: { type: "array", description: "[{path, conclusion, evidence}] untaken branches worth dispatching." },
       observations: { type: "array", description: "[{path, conclusion}] facts learned." },
       why: { type: "string", description: "v2 \u5F52\u56E0(failed \u65F6\u5FC5\u586B): model-weak | approach-dead-end | context-insufficient | platform-issue. \u4E24\u7EA7\u5224\u5B9A: \u6267\u884C\u8005\u62A5\u544A\u63D0\u8BAE, \u4F60\u7EC8\u88C1." },
-      gaps: { type: "array", description: "v2 \u4E0A\u4E0B\u6587\u7F3A\u53E3(context-insufficient \u65F6): [\u7F3A\u4EC0\u4E48\u4FE1\u606F]. \u8FDB\u753B\u50CF contextGaps, \u4E0B\u6B21\u6D3E\u5355/\u4E8C\u6B21\u5F81\u96C6\u81EA\u52A8\u9644\u5E26." }
+      gaps: { type: "array", description: "v2 \u4E0A\u4E0B\u6587\u7F3A\u53E3(context-insufficient \u65F6): [\u7F3A\u4EC0\u4E48\u4FE1\u606F]. \u8FDB\u753B\u50CF contextGaps, \u4E0B\u6B21\u6D3E\u5355/\u4E8C\u6B21\u5F81\u96C6\u81EA\u52A8\u9644\u5E26." },
+      interruptItemIds: { type: "array", description: "v8.5: \u4EBA\u5DE5\u6536\u5175\u2014\u2014\u70B9\u540D\u6536\u56DE\u5728\u9014\u6267\u884C\u8005(itemId \u7CBE\u786E\u6216\u8BE5\u9898\u524D\u7F00, status \u5728\u9014\u6E05\u5355\u53EF\u89C1)\u3002\u4E2D\u65AD+\u53D6\u6D88+\u5BA1\u8BA1\u4EBA\u5DE5\u6536\u5175; \u8BE5 settle \u4E0D\u8BA1\u65E0\u65D7\u8D25\u7EE9\u3001\u4E0D\u89E6\u53D1\u5347\u7EA7\u68AF\u3002\u53EF\u914D verdict continue/rotate \u53EA\u6536\u5175\u4E0D\u5224\u6B7B\u3002" }
     },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
@@ -2541,6 +2632,20 @@ ${detail.slice(0, 6e3)}`);
       persistV2(s);
       if (jisi !== void 0 && terminal) {
         jisi.settleAdoptions?.(args.code, win, why);
+      }
+      if (args.interruptItemIds !== void 0) {
+        for (const id of args.interruptItemIds) {
+          s.manualInterrupted.add(id);
+          try {
+            await c().interruptItem?.(id);
+          } catch {
+          }
+          try {
+            c().cancel(id, `\u4EBA\u5DE5\u6536\u5175: ${args.reason ?? "\u4E3B agent \u4E3B\u52A8\u6536\u56DE"}`);
+          } catch {
+          }
+          audit(s.auditPath, { type: "v8-interrupt-manual", id, code: codeOf(id), reason: args.reason });
+        }
       }
       const entries = [
         ...(args.deadEnds ?? []).map((e) => ({ kind: "dead-end", path: e.path, conclusion: e.conclusion, evidence: e.evidence, testedVariants: e.testedVariants, by: "main-agent", at: Date.now() })),
@@ -2981,6 +3086,9 @@ ${escLines.join("\n")}` : "";
         `orch: queued=${orchCount("queued")} granted=${orchCount("granted")} pending-adjudication=${orchCount("pending-adjudication")} solved=${orchCount("solved")} dead=${orchCount("dead")}`,
         `v8\u5FC3\u8DF3: tick=${s.tickCount} armed=${s.armed.size} grantedCodes=${s.grantedCodes.size} spawnQueue=${spawnQueue.length} spawning=${spawning}`,
         qLine,
+        `\u5728\u9014\u6267\u884C\u8005:
+${inflightSummary()}`,
+        `\u5BB9\u5668\u8D44\u6E90(\u5168\u5BB9\u5668, cgroup \u4F18\u5148): ${containerResources()}`,
         `budgetRemainingMin=${Math.round(remaining / 6e4)}`,
         `runScore(\u8BA1\u5206\u8868)=${runScoreOf(s)}${s.hintLedger.totalHints() > 0 ? `(hint \u5DF2\u6263\u7EA6 ${s.hintLedger.totalDeducted()} \u5206, \u5DF2\u542B)` : ""}`,
         `${(() => {
@@ -3164,7 +3272,9 @@ ${pendingTxt}`,
           const nowSnap = fanInboxSnap();
           if (nowSnap !== fanBefore) {
             fanBefore = nowSnap;
-            done("xiaochang_wait: \u601D\u8DEF\u5DF2\u56DE(fanout \u62A5\u544A\u5230\u8FBE)\u2014\u2014\u8BFB xiaochang_collect \u88C1\u51B3\u91C7\u7EB3; \u91C7\u7EB3\u5373\u81EA\u52A8\u843D\u76D8\u8D26\u672C\u2460(\u672A\u6D88\u8D39), enqueue \u4F20 ideaIds \u6D3E\u5175\u5373\u6D88\u8D39");
+            done(`xiaochang_wait: \u601D\u8DEF\u5DF2\u56DE(fanout \u62A5\u544A\u5230\u8FBE)\u2014\u2014\u8BFB xiaochang_collect \u88C1\u51B3\u91C7\u7EB3; \u91C7\u7EB3\u5373\u81EA\u52A8\u843D\u76D8\u8D26\u672C\u2460(\u672A\u6D88\u8D39), enqueue \u4F20 ideaIds \u6D3E\u5175\u5373\u6D88\u8D39(\u9898\u5DF2\u6301\u69FD\u53EF\u52A0 dispatchNow \u5F53\u573A\u4E0A\u8F66)
+\u5728\u9014\u6267\u884C\u8005:
+${inflightSummary()}`);
           }
         }, 2e3);
         let gateBefore = [...state?.hintGateOpen ?? []].sort().join(",");

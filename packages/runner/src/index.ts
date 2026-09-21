@@ -8,6 +8,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
+import { loadavg } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -296,6 +297,8 @@ interface CampaignState {
   hintGateOpen: Set<string>
   /** v8.4: 验证兵自动触发去重(题码 → 已触发次数)。 */
   verifierDispatched: Map<string, number>
+  /** v8.5: 主 agent 人工收兵的执行者 item id(settle 不计败绩, 只审计)。 */
+  manualInterrupted: Set<string>
 }
 
 let state: CampaignState | undefined
@@ -802,6 +805,103 @@ export function apply(ctx: Context): void {
     spawnQueue.push(code)
     void pumpSpawns()
   }
+  /** v8.5: 在途执行者清单(授予题: itemId/模型/已跑分钟/槽剩余分钟)——主 agent 调度决策的事实输入。 */
+  const inflightSummary = (): string => {
+    const s = requireState()
+    const now = Date.now()
+    const lines: string[] = []
+    for (const [code, o] of s.orch) {
+      if (o.state !== 'granted') continue
+      const items = c().ledger.views().filter(v => codeOf(v.item.id) === code && (v.state === 'dispatched' || v.state === 'help' || v.state === 'stalled'))
+      const boxLeft = o.grantedUntil !== undefined ? Math.max(0, Math.round((o.grantedUntil - now) / 60000)) : '?'
+      const itemTxt = items.length === 0
+        ? '在途0(槽空转——可 enqueue 该题加 dispatchNow 当场补兵)'
+        : items.map(v => {
+          const w = v.item.id.split('#')[2] ?? v.item.id
+          const at = v.dispatchedAt ?? now
+          const mins = Math.round((now - at) / 60000)
+          const stale = now - at > 45 * 60_000 ? '⚠️>45m' : ''
+          return `${w}@${v.item.model ?? '?'}已${mins}m${stale}`
+        }).join(' ')
+      lines.push(`  ${code}[盒剩${boxLeft}m·在途${items.length}] ${itemTxt}`)
+    }
+    return lines.length > 0 ? lines.join('\n') : '(无授予槽/在途执行者)'
+  }
+  /** v8.5: 全容器资源读数(cgroup v2 优先, 宿主回退)——容器内只有 DSH, 缺省全量可用, 目标是尽量用满。 */
+  const containerResources = (): string => {
+    const parts: string[] = []
+    try {
+      if (existsSync('/sys/fs/cgroup/memory.max')) {
+        const maxS = readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim()
+        const curS = readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim()
+        const maxN = Number(maxS)
+        const curMB = Math.round(Number(curS) / 1048576)
+        parts.push(maxN > 0 && maxN < 9e15 ? `mem=${curMB}/${Math.round(maxN / 1048576)}MB` : `mem=${curMB}MB(无上限)`)
+      } else {
+        const m = readFileSync('/proc/meminfo', 'utf8')
+        const tot = Number(/MemTotal:\s*(\d+)/.exec(m)?.[1] ?? 0)
+        const avl = Number(/MemAvailable:\s*(\d+)/.exec(m)?.[1] ?? 0)
+        if (tot > 0) parts.push(`mem=${Math.round((tot - avl) / 1024)}/${Math.round(tot / 1024)}MB(宿主)`)
+      }
+    } catch { /* 读数失败不阻断 */ }
+    try {
+      if (existsSync('/sys/fs/cgroup/cpu.stat')) {
+        const cs = readFileSync('/sys/fs/cgroup/cpu.stat', 'utf8')
+        const u = Number(/usage_usec\s+(\d+)/.exec(cs)?.[1] ?? 0)
+        parts.push(`cpuUsed=${Math.round(u / 1e6)}s`)
+      }
+      if (existsSync('/sys/fs/cgroup/cpu.max')) {
+        const q = readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim()
+        parts.push(q.startsWith('max') ? 'cpuQuota=无上限' : `cpuQuota=${q}`)
+      }
+    } catch { /* 读数失败不阻断 */ }
+    try {
+      parts.push(`loadavg=${loadavg().map(x => x.toFixed(2)).join('/')}`)
+    } catch { /* 读数失败不阻断 */ }
+    return parts.join(' ')
+  }
+  /** v8.5: 单个执行者生成(授予时与 dispatchNow 共用)。 */
+  async function spawnExecutor(code: string, o: ChallengeOrch, d: { text: string; model?: string; effort?: string; persona?: string }, idx: number, prio: number, cls: 'local' | 'container', vq: { triedModels: string[] }): Promise<void> {
+    const s = requireState()
+    const ch = s.challenges.get(code)
+    if (ch === undefined) return
+    const workNo = (s.enqCounters.get(code) ?? 0) + 1
+    s.enqCounters.set(code, workNo)
+    const itemId = `${code}#s${o.attempts}-w${workNo}`
+    const executor = resolveExecutor({ model: d.model ?? pickSpawnModel(code, idx), effort: d.effort }, s.executorPolicy)
+    const err = await validateExecutorModel(executor.model)
+    const model = err === null ? executor.model : s.executorPolicy.defaultModel
+    const clusterTxt = o.cluster.length > 0
+      ? `\n\n【同靶场兄弟题(共享此容器, 一并收旗)】${o.cluster.map(c2 => {
+        const ch2 = s.challenges.get(c2)
+        return `${c2}(${ch2?.total_score ?? '?'}pts): 题面 ${(ch2?.description ?? '').slice(0, 80)}; 战报 ${c().boardPath(c2)}; 拿到该题旗同样调 xiaochang_flag_report('${c2}', flag)`
+      }).join('\n')}`
+      : ''
+    const label = buildExecFrame(code, d.text) + clusterTxt + gapsTxtOf(code)
+    c().add({
+      id: itemId,
+      label,
+      model,
+      reasoningEffort: executor.effort,
+      board: code,
+      resourceClass: cls,
+      priority: { tier: tierOf(ch.difficulty), score: prio },
+      ...(d.persona !== undefined && d.persona !== '' ? { persona: d.persona } : {}),
+    })
+    if (!vq.triedModels.includes(model)) vq.triedModels.push(model)
+    persistV2(s)
+    audit(s.auditPath, { type: 'v8-spawn', id: itemId, code, attempts: o.attempts, model, class: cls })
+    let n = 0
+    try {
+      while (n < 8) {
+        const d2 = await c().dispatchNext()
+        if (d2 === undefined) break
+        n += 1
+      }
+    } catch (error) {
+      audit(s.auditPath, { type: 'v8-dispatch-error', code, error: String(error) })
+    }
+  }
   /** v8 原子授予: 队列授予 → 快照 → 生成执行者(带 addr) → 派发。 */
   async function grantAndSpawn(code: string): Promise<void> {
     const s = requireState()
@@ -847,8 +947,11 @@ export function apply(ctx: Context): void {
     }
     o.cluster = siblings
     grant(o, snapshot, Date.now(), s.timeboxMs)
-    const nSpawn = Math.max(1, Math.min(o.multiSpawn, 3))
+    // v8.5: 路数由主 agent 指定(spawn)或升级梯建议(multiSpawn), 无硬上限——
+    // 资源事实在 status 里, 用满是目标, 决策归主 agent。
+    const nSpawn = Math.max(1, o.spawnRequest ?? o.multiSpawn)
     o.multiSpawn = 0
+    o.spawnRequest = undefined
     if (o.r2Due) { o.r2Due = false; void issueR2(code) }
     const vq = ensureVq(code)
     const picks: Array<{ text: string; model?: string; effort?: string; persona?: string }> = []
@@ -874,46 +977,9 @@ export function apply(ctx: Context): void {
       }
     }
     for (let i = 0; i < picks.length; i++) {
-      const d = picks[i]!
-      const workNo = (s.enqCounters.get(code) ?? 0) + 1
-      s.enqCounters.set(code, workNo)
-      const itemId = `${code}#s${o.attempts}-w${workNo}`
-      const executor = resolveExecutor({ model: d.model ?? pickSpawnModel(code, i), effort: d.effort }, s.executorPolicy)
-      const err = await validateExecutorModel(executor.model)
-      const model = err === null ? executor.model : s.executorPolicy.defaultModel
-      const clusterTxt = o.cluster.length > 0
-        ? `\n\n【同靶场兄弟题(共享此容器, 一并收旗)】${o.cluster.map(c2 => {
-          const ch2 = s.challenges.get(c2)
-          return `${c2}(${ch2?.total_score ?? '?'}pts): 题面 ${(ch2?.description ?? '').slice(0, 80)}; 战报 ${c().boardPath(c2)}; 拿到该题旗同样调 xiaochang_flag_report('${c2}', flag)`
-        }).join('\n')}`
-        : ''
-      const label = buildExecFrame(code, d.text) + clusterTxt + gapsTxtOf(code)
-      c().add({
-        id: itemId,
-        label,
-        model,
-        reasoningEffort: executor.effort,
-        board: code,
-        resourceClass: cls,
-        priority: { tier: tierOf(ch.difficulty), score: prio },
-        ...(d.persona !== undefined && d.persona !== '' ? { persona: d.persona } : {}),
-      })
-      if (!vq.triedModels.includes(model)) vq.triedModels.push(model)
-      persistV2(s)
-      audit(s.auditPath, { type: 'v8-spawn', id: itemId, code, attempts: o.attempts, model, class: cls })
+      await spawnExecutor(code, o, picks[i]!, i, prio, cls, vq)
     }
-    // 授予即派兵: 立即派发(容器闸已在队列层). 有界循环 + 异常吸收(派单失败不炸宿主).
-    let count = 0
-    try {
-      while (count < 8) {
-        const d2 = await c().dispatchNext()
-        if (d2 === undefined) break
-        count += 1
-      }
-    } catch (error) {
-      audit(s.auditPath, { type: 'v8-dispatch-error', code, error: String(error) })
-    }
-    audit(s.auditPath, { type: 'v8-grant', code, spawn: picks.length, dispatched: count })
+    audit(s.auditPath, { type: 'v8-grant', code, spawn: picks.length })
     bumpOrch(s)
     persistOrch(s)
     persistProgress(s)
@@ -971,6 +1037,12 @@ export function apply(ctx: Context): void {
     if (s.settleProcessed.has(itemId)) return
     s.settleProcessed.add(itemId)
     const now = Date.now()
+    // v8.5: 主 agent 人工收兵的执行者 settle 只审计, 不计无旗败绩、不触发升级梯
+    // (否则主 agent 不敢提前收兵, 又退回"跑满盒"——用户裁定)。
+    if (s.manualInterrupted.has(itemId)) {
+      audit(s.auditPath, { type: 'v8-settle-manual', itemId, code })
+      return
+    }
     const sn = o.snapshot
     const pendingFlags = pendingFlagsOf(readFlagEntries(), code)
     const p: SettleProgress = {
@@ -1254,6 +1326,7 @@ export function apply(ctx: Context): void {
         scoreTable: {},
         hintGateOpen: new Set(),
         verifierDispatched: new Map(),
+        manualInterrupted: new Set(),
       }
       try {
         if (existsSync(s.profilePath)) s.profile = parseProfile(readFileSync(s.profilePath, 'utf8'))
@@ -1739,13 +1812,15 @@ export function apply(ctx: Context): void {
       pacing: { type: 'array', description: 'v8.4: 目标侧节奏约束(限速/封禁类, 注入令文硬约束), 如 ["ssh ≤2 次/10min(失败即封禁)"]。' },
       ideaIds: { type: 'array', description: 'v8.4: 本 directive 引用的采纳思路 id 列表(从 enqueue 回显/status 的未消费思路清单取); 派兵即标记该思路已消费。' },
       persona: { type: 'string', description: 'v8.4: 执行者 persona 内联覆盖(缺省继承部署级; 可给渗透/逆向专家类 persona)。' },
+      dispatchNow: { type: 'boolean', description: 'v8.5: 该题已持槽(granted)时, 立即用本条 directive 派一个新执行者挂到当前容器(与在途执行者并行; 共享容器剩余时间盒)。思路一回来当场上车, 不等下一轮。' },
+      spawn: { type: 'number', description: 'v8.5: 指定下次授予的执行者路数(无硬上限——资源事实在 status, 决策归你; 缺省走升级梯 multiSpawn)。' },
       round: { type: 'number', description: 'v8: ignored (kept for compatibility) — rounds are managed by the mechanism.' },
       dependsOn: { type: 'array', description: 'v8: ignored (kept for compatibility).' },
       resourceClass: { type: 'string', description: 'v8: ignored (kept for compatibility) — class is auto by challenge type.' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args: { code: string; prompt: string; priority?: number; model?: string; effort?: string; family?: string; pacing?: string[]; ideaIds?: string[]; persona?: string; round?: number; dependsOn?: string[]; resourceClass?: string }, exec) {
+    async execute(args: { code: string; prompt: string; priority?: number; model?: string; effort?: string; family?: string; pacing?: string[]; ideaIds?: string[]; persona?: string; dispatchNow?: boolean; spawn?: number; round?: number; dependsOn?: string[]; resourceClass?: string }, exec) {
       // v7.6: 调度权单点——只有主 agent 可入题队列(单调度器架构; 执行者无权改写战役)。
       if (parentAgent !== undefined && exec.agent !== parentAgent) {
         return 'xiaochang_enqueue: 拒绝——入题队列是主 agent 专属(单调度器); 执行者只解自己的题, 有发现用 xiaochang_fork 上报'
@@ -1773,6 +1848,7 @@ export function apply(ctx: Context): void {
       if (args.priority !== undefined) o.priorityOverride = args.priority
       // v8.4: 家族/pacing 元数据(可覆盖, 可累积)。
       if (args.family !== undefined && args.family !== '') o.family = args.family
+      if (args.spawn !== undefined && args.spawn > 0) o.spawnRequest = args.spawn
       if ((args.pacing?.length ?? 0) > 0) o.pacing = [...(o.pacing ?? []), ...args.pacing!]
       // v8.4: 派兵即消费——本 directive 引用的采纳思路标记 consumed。
       let consumedNote = ''
@@ -1783,6 +1859,8 @@ export function apply(ctx: Context): void {
           ? `\n已标记 ${n} 条采纳思路为已消费(本 directive 引用)。当前未消费: ${open || '无'}`
           : `\n⚠️ ideaIds 未命中任何未消费思路(传了 ${args.ideaIds!.join(',')}): 已消费/不存在/拼写? 当前未消费: ${open || '无'}`
       }
+      // v8.5: dispatchNow 判定在成员回路之前捕获(回路会把 granted 打回 queued)。
+      const wasGranted = o.state === 'granted'
       // v8.3c 簇调度: 入队/续打对簇内全体成员生效(簇=单调度单元)。
       const memberCodes = [args.code, ...o.cluster]
       for (const c2 of memberCodes) {
@@ -1792,9 +1870,28 @@ export function apply(ctx: Context): void {
           adjudicate(mo, 'continue')
           removePending(s, c2)
         }
+        // v8.5: dispatchNow 的主码保持 granted(当场上车), 不回队不重授。
+        if (c2 === args.code && wasGranted && args.dispatchNow === true) continue
         if (mo.state !== 'solved' && mo.state !== 'dead') mo.state = 'queued'
       }
-      o.state = 'queued'
+      let dispatchNowNote = ''
+      if (wasGranted && args.dispatchNow === true) {
+        // v8.5: 题已持槽(容器在线) → 立即用本条 directive 派新执行者(与在途并行)。
+        const d0 = { text: trunc.text, model: args.model, effort: args.effort, persona: args.persona, tried: true }
+        const chNow = s.challenges.get(args.code)
+        const clsNow = chNow !== undefined ? resourceClassOf(chNow) : 'container'
+        const vqNow = ensureVq(args.code)
+        try {
+          await spawnExecutor(args.code, o, d0, 0, priorityOf(o, chNow?.total_score ?? 300, Date.now()), clsNow, vqNow)
+          // 成功才标记 tried(失败保留, 下次授予可重试该方向)。
+          for (const d of o.directives) { if (!d.tried && d.text === trunc.text) d.tried = true }
+          dispatchNowNote = `\n已 dispatchNow 立即派发 1 个执行者挂当前容器(与在途并行, 共享剩余时间盒 ${Math.round(((o.grantedUntil ?? Date.now()) - Date.now()) / 60000)}min)。`
+        } catch (error) {
+          dispatchNowNote = `\ndispatchNow 派发失败: ${String(error)}`
+        }
+      } else {
+        o.state = 'queued'
+      }
       // v8.4.1: 显式 priority 变更 → 已武装容器题全量重排(20633 实锤: 武装时 FIFO 固化,
       // enqueue 的 priority 只写账本不重排——b-02 高优排到末位)。
       if (priorityChanged && s.containerQueue !== undefined) {
@@ -1820,7 +1917,7 @@ export function apply(ctx: Context): void {
       const sealedTxt = sealed.length > 0
         ? `\n⚠️ 死路封印簇 ${sealed.length} 个(≥3 条同向, 验证兵已自动触发): ${sealed.map(x => `${x.direction}×${x.count}`).join(' | ')}`
         : ''
-      return `enqueued ${args.code} (directives=${o.directives.length}, 队列优先级=${priorityOf(o, ch.total_score, Date.now())}, 状态=${o.state}; 授予由机制 tick 武装, 无需手动 dispatch)\n家族模板已挂: ${tplName}${ideaMenu}${sealedTxt}${consumedNote}${truncNotice}`
+      return `enqueued ${args.code} (directives=${o.directives.length}, 队列优先级=${priorityOf(o, ch.total_score, Date.now())}, 状态=${o.state}; 授予由机制 tick 武装, 无需手动 dispatch)${dispatchNowNote}\n家族模板已挂: ${tplName}${ideaMenu}${sealedTxt}${consumedNote}${truncNotice}`
     },
   }))
 
@@ -1956,10 +2053,11 @@ export function apply(ctx: Context): void {
       observations: { type: 'array', description: '[{path, conclusion}] facts learned.' },
       why: { type: 'string', description: 'v2 归因(failed 时必填): model-weak | approach-dead-end | context-insufficient | platform-issue. 两级判定: 执行者报告提议, 你终裁.' },
       gaps: { type: 'array', description: 'v2 上下文缺口(context-insufficient 时): [缺什么信息]. 进画像 contextGaps, 下次派单/二次征集自动附带.' },
+      interruptItemIds: { type: 'array', description: 'v8.5: 人工收兵——点名收回在途执行者(itemId 精确或该题前缀, status 在途清单可见)。中断+取消+审计人工收兵; 该 settle 不计无旗败绩、不触发升级梯。可配 verdict continue/rotate 只收兵不判死。' },
     },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
-    async execute(args: { code: string; verdict: string; reason?: string; deadEnds?: Array<{ path: string; conclusion?: string; evidence?: string; testedVariants?: string[] }>; forks?: Array<{ path: string; conclusion?: string; evidence?: string }>; observations?: Array<{ path: string; conclusion?: string }>; why?: string; gaps?: string[] }, exec) {
+    async execute(args: { code: string; verdict: string; reason?: string; deadEnds?: Array<{ path: string; conclusion?: string; evidence?: string; testedVariants?: string[] }>; forks?: Array<{ path: string; conclusion?: string; evidence?: string }>; observations?: Array<{ path: string; conclusion?: string }>; interruptItemIds?: string[]; why?: string; gaps?: string[] }, exec) {
       // v7.6: 调度权单点——裁决/剪枝只有主 agent 可做。
       if (parentAgent !== undefined && exec.agent !== parentAgent) {
         return 'xiaochang_report: 拒绝——裁决是主 agent 专属(单调度器); 执行者只报告结果, 交主 agent 判断'
@@ -1985,6 +2083,15 @@ export function apply(ctx: Context): void {
       if (jisi !== undefined && terminal) {
         // 终局对账: 采纳的思路, 题胜不加; 题败且归因 approach-dead-end → 罚思路模型(第 0 层)。
         jisi.settleAdoptions?.(args.code, win, why)
+      }
+      // v8.5: 人工收兵——点名收回在途执行者(中断+取消+审计; settle 被 manualInterrupted 吸收, 不计败绩)。
+      if (args.interruptItemIds !== undefined) {
+        for (const id of args.interruptItemIds) {
+          s.manualInterrupted.add(id)
+          try { await c().interruptItem?.(id) } catch { /* 中断失败不阻断 */ }
+          try { c().cancel(id, `人工收兵: ${args.reason ?? '主 agent 主动收回'}`) } catch { /* 取消失败不阻断 */ }
+          audit(s.auditPath, { type: 'v8-interrupt-manual', id, code: codeOf(id), reason: args.reason })
+        }
       }
       // F33: 结构化经验落账(全局解题图)——记账失败绝不阻断 verdict 主线(关容器/剪枝/落盘)。
       const entries: KnowledgeIn[] = [
@@ -2401,6 +2508,8 @@ ${gaps}
         `orch: queued=${orchCount('queued')} granted=${orchCount('granted')} pending-adjudication=${orchCount('pending-adjudication')} solved=${orchCount('solved')} dead=${orchCount('dead')}`,
         `v8心跳: tick=${s.tickCount} armed=${s.armed.size} grantedCodes=${s.grantedCodes.size} spawnQueue=${spawnQueue.length} spawning=${spawning}`,
         qLine,
+        `在途执行者:\n${inflightSummary()}`,
+        `容器资源(全容器, cgroup 优先): ${containerResources()}`,
         `budgetRemainingMin=${Math.round(remaining / 60000)}`,
         `runScore(计分表)=${runScoreOf(s)}${s.hintLedger.totalHints() > 0 ? `(hint 已扣约 ${s.hintLedger.totalDeducted()} 分, 已含)` : ''}`,
         `${(() => {
@@ -2575,7 +2684,7 @@ ${gaps}
           const nowSnap = fanInboxSnap()
           if (nowSnap !== fanBefore) {
             fanBefore = nowSnap
-            done('xiaochang_wait: 思路已回(fanout 报告到达)——读 xiaochang_collect 裁决采纳; 采纳即自动落盘账本①(未消费), enqueue 传 ideaIds 派兵即消费')
+            done(`xiaochang_wait: 思路已回(fanout 报告到达)——读 xiaochang_collect 裁决采纳; 采纳即自动落盘账本①(未消费), enqueue 传 ideaIds 派兵即消费(题已持槽可加 dispatchNow 当场上车)\n在途执行者:\n${inflightSummary()}`)
           }
         }, 2000)
         // ⑨ v8.4 hint 闸自动开: 判死条件满足 → 主动推送(治习得性无助, 主 agent 不必反复试)。

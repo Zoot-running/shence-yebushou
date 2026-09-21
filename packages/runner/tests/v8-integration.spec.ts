@@ -363,3 +363,57 @@ describe('v8.4 令文管线/判死/验证兵', () => {
     await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched' && i.label.includes('验证兵')), 15_000, 'verifier spawned')
   }, 60_000)
 })
+
+describe('v8.5 调度权回归主 agent', () => {
+  const orchOf = (code: string): { state: string; settleNoFlag: number; spawnRequest?: number } => {
+    const p = join(HOME, 'storages', 'xiaochang-orch-pending.json')
+    const d = JSON.parse(readFileSync(p, 'utf8')) as { orch: Record<string, { state: string; settleNoFlag: number; spawnRequest?: number }> }
+    return d.orch[code] ?? { state: 'missing', settleNoFlag: 0 }
+  }
+
+  it('dispatchNow 当场上车: 已持槽题立即加派执行者, 状态保持 granted 不回队', async () => {
+    const code = 'xb-088'
+    await tool('xiaochang_enqueue').execute({ code, prompt: 't1: 打 JWT 伪造' }, parent)
+    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched'), 60_000, 'xb-088 dispatched')
+    await waitFor(() => orchOf(code).state === 'granted', 15_000, 'xb-088 granted')
+    const before = itemsFor(code).filter(i => i.state === 'dispatched').length
+    const res = await tool('xiaochang_enqueue').execute({ code, prompt: 't2: 新思路立即上车', dispatchNow: true }, parent)
+    expect(String(res)).toContain('已 dispatchNow 立即派发')
+    await waitFor(() => itemsFor(code).filter(i => i.state === 'dispatched').length >= before + 1, 15_000, 'dispatchNow extra item')
+    // 状态保持 granted(不回队不重授)——决策②: 新执行者共享容器剩余时间盒
+    expect(orchOf(code).state).toBe('granted')
+  }, 90_000)
+
+  it('spawn 路数直通: 无硬上限, 授予时按指定路数生成', async () => {
+    // 本地题授予零等待(不经容器槽轮换), 确定性命中。
+    const code = 'g-m1'
+    await tool('xiaochang_enqueue').execute({ code, prompt: 't3: 指定两路并进', spawn: 2 }, parent)
+    await waitFor(() => auditLines().some(l => l.includes('"v8-grant"') && l.includes(code) && l.includes('"spawn":2')), 60_000, 'grant with spawn:2')
+    expect(orchOf(code).spawnRequest).toBeUndefined() // 授予即消费
+  }, 90_000)
+
+  it('人工收兵 interruptItemIds: 中断+取消+审计, settle 不计败绩(决策①)', async () => {
+    // 标签选新鲜 item: 前序测试 settle 过的 item 已进 settleProcessed 去重, 会假阴性。
+    const code = 'g-m1'
+    await tool('xiaochang_enqueue').execute({ code, prompt: 't4: 收兵测试用思路' }, parent)
+    await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched' && i.label.includes('收兵测试用思路')), 60_000, 'fresh t4 item')
+    const it = itemsFor(code).find(i => i.state === 'dispatched' && i.label.includes('收兵测试用思路'))!
+    const settleBefore = orchOf(code).settleNoFlag
+    const res = await tool('xiaochang_report').execute({ code, verdict: 'continue', interruptItemIds: [it.id], reason: '思路已废, 人工收兵' }, parent)
+    expect(String(res)).toContain('已回队')
+    await waitFor(() => auditLines().some(l => l.includes('"v8-interrupt-manual"') && l.includes(it.id)), 10_000, 'v8-interrupt-manual audit')
+    expect(camp.items.get(it.id)?.state).toBe('superseded') // cancel 已执行
+    // 被收回的执行者 settle → v8-settle-manual 吸收, 不计无旗败绩(主 agent 敢收兵)
+    camp.emitSettle(it.id, '被主 agent 收回, 未出旗')
+    await waitFor(() => auditLines().some(l => l.includes('"v8-settle-manual"') && l.includes(it.id)), 10_000, 'v8-settle-manual audit')
+    expect(orchOf(code).settleNoFlag).toBe(settleBefore)
+  }, 60_000)
+
+  it('status 事实面板: 在途执行者清单(槽剩余分钟) + 全容器资源读数(决策③④)', async () => {
+    // 授予槽轮换中, 等到某题 granted 再看清单(盒剩分钟事实必现)。
+    await waitFor(async () => {
+      const st = String(await tool('xiaochang_status').execute({}, parent))
+      return st.includes('在途执行者:') && st.includes('容器资源(全容器') && /盒剩\d+m/.test(st)
+    }, 90_000, 'status facts')
+  }, 120_000)
+})
