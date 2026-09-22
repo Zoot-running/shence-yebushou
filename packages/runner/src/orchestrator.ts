@@ -434,7 +434,7 @@ export const TEMPLATE_LIBRARY: readonly FamilyTemplate[] = [
   {
     family: 'web-chain',
     name: 'web·多跳AP链(多旗等权)',
-    tactics: '广度优先(等权旗先扫浅层, 每得一旗立即报): ①外网打点 nmap 全端口+指纹+dirsearch 大字典+robots/www.zip/.git/.bak/.sql/前端 JS 注释, 老组件 nday; ②旗1 优先"读文件"类(file/path/id/name 参数、....// 绕过单次 ../ 替换、绝对路径 /challenge/flag*.txt)、备份泄露、弱口令、未授权接口、SQLi; ③shell 后固定侦察: find -iname "*flag*"、grep -rIl "flag{" /var/www /tmp /home /opt、env、/proc/1/environ、/etc/hosts、ip a、ss -lntup; ④内网踩点文件优先: /etc/hosts、~/.ssh/{known_hosts,config}、~/.bash_history、nginx upstream、docker-compose.yml; ⑤建代理(必做): chisel/ligolo-ng/frp/socat 或复用 SSRF/LFI 通道; ⑥内网高频点: Redis 6379 未授权写 authorized_keys/crontab > MySQL 弱口令+secure_file_priv 空写 webshell > Tomcat manager war > SMB/NFS > Jenkins; ⑦核心机密: /data、/opt/secret、DB dump grep flag、跨机分片拼接、响应头/cookie/JWT/log 全查。',
+    tactics: '广度优先(等权旗先扫浅层, 每得一旗立即报): ①外网打点 nmap 全端口+指纹+dirsearch 大字典+robots/www.zip/.git/.bak/.sql/前端 JS 注释, 老组件 nday; ②旗1 优先"读文件"类(file/path/id/name 参数、....// 绕过单次 ../ 替换、绝对路径 /challenge/flag*.txt)、备份泄露、弱口令、未授权接口、SQLi; ③shell 后固定侦察: find -iname "*flag*"、grep -rIl "flag{" /var/www /tmp /home /opt、env、/proc/1/environ、/etc/hosts、ip a、ss -lntup; ④内网踩点文件优先: /etc/hosts、~/.ssh/{known_hosts,config}、~/.bash_history、nginx upstream、docker-compose.yml; ⑤建代理(按需分层): 先壳上 curl/wget 直打邻机 HTTP; 有 socat/nc 做单端口转发; 打不到身份面/要爆破内网才建 chisel/ligolo-ng/frp 反向 SOCKS, 或复用 SSRF/LFI 通道; ⑥内网高频点: Redis 6379 未授权写 authorized_keys/crontab > MySQL 弱口令+secure_file_priv 空写 webshell > Tomcat manager war > SMB/NFS > Jenkins; ⑦核心机密: /data、/opt/secret、DB dump grep flag、跨机分片拼接、响应头/cookie/JWT/log 全查。',
     criteria: '每旗原文+出处双记录; 限速类目标记录封禁行为并遵守节奏约束。',
     traps: '限速/封禁目标的 pacing 是硬约束(看令文节奏约束段), 勿大爆破烧通道; 题面点名的产品名(如泛微OA)要进词表构造。',
   },
