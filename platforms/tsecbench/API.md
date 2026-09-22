@@ -29,7 +29,7 @@
 
 标准流程：`GET /challenges`（列题+进度）→ `POST /challenges/start?unique_code=`（开容器，
 **同时最多 3 个容器**，超限 409 invalid_state）→ `GET /challenges/hint?unique_code=`
-（**查后该题 flag 得分按 hint_cost_radio 扣，本集实测 10%/次**；已通关题不可再查）→
+（**查后该题 flag 得分被扣，本集实测 10%/次；平台不暴露单价字段**——2026-09-22 探测局 21293 实拉：题表 10 字段与 hint 响应 {unique_code,hint} 均无 hint_cost/hint_cost_radio，真实扣分只能事后从 submit 回执 cumulative_score 反推；已通关题不可再查）→
 `POST /challenges/submit`（body `{unique_code, flag}`；重复正确提交返回 409 duplicate，
 幂等；响应 `{correct, awarded, cumulative_score, correct_flag_count, total_flag_count, matched_flag_index}`）→
 `POST /challenges/close?unique_code=`（释放容器，务必关）。

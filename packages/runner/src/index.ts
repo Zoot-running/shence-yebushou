@@ -1804,7 +1804,7 @@ export function apply(ctx: Context): void {
       const hint = raw.hint
       if (hint === null || hint === undefined || hint === '') return 'xiaochang_hint: no hint available'
       const cost = s.hintLedger.record(args.code, ch?.total_score ?? 100, 'main-agent requested')
-      return `hint (${used + 1}/${s.maxHints} used): ${hint}\n⚠️ 本次看提示已扣该题约 ${cost} 分(该题累计已扣 ${s.hintLedger.get(args.code)?.deducted ?? cost}, 全局累计 ${s.hintLedger.totalDeducted()})——满分账里要扣掉; run 总分以 xiaochang_status 的 runScore(计分表)为准。`
+      return `hint (${used + 1}/${s.maxHints} used): ${hint}\n⚠️ 本次看提示估算扣该题 ${cost} 分(题面 10%; 平台不公布真实单价——hint_cost 字段不存在于题表/hint 响应, 实测本集 10%/次)——该题累计估算已扣 ${s.hintLedger.get(args.code)?.deducted ?? cost}, 全局累计 ${s.hintLedger.totalDeducted()}。**实际扣分以后续 submit 回执 cumulative_score 为准**(满分账=计分表, run 总分以 xiaochang_status 的 runScore 为准)。`
     },
   }))
 

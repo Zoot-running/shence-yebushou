@@ -2332,7 +2332,7 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
       if (hint === null || hint === void 0 || hint === "") return "xiaochang_hint: no hint available";
       const cost = s.hintLedger.record(args.code, ch?.total_score ?? 100, "main-agent requested");
       return `hint (${used + 1}/${s.maxHints} used): ${hint}
-\u26A0\uFE0F \u672C\u6B21\u770B\u63D0\u793A\u5DF2\u6263\u8BE5\u9898\u7EA6 ${cost} \u5206(\u8BE5\u9898\u7D2F\u8BA1\u5DF2\u6263 ${s.hintLedger.get(args.code)?.deducted ?? cost}, \u5168\u5C40\u7D2F\u8BA1 ${s.hintLedger.totalDeducted()})\u2014\u2014\u6EE1\u5206\u8D26\u91CC\u8981\u6263\u6389; run \u603B\u5206\u4EE5 xiaochang_status \u7684 runScore(\u8BA1\u5206\u8868)\u4E3A\u51C6\u3002`;
+\u26A0\uFE0F \u672C\u6B21\u770B\u63D0\u793A\u4F30\u7B97\u6263\u8BE5\u9898 ${cost} \u5206(\u9898\u9762 10%; \u5E73\u53F0\u4E0D\u516C\u5E03\u771F\u5B9E\u5355\u4EF7\u2014\u2014hint_cost \u5B57\u6BB5\u4E0D\u5B58\u5728\u4E8E\u9898\u8868/hint \u54CD\u5E94, \u5B9E\u6D4B\u672C\u96C6 10%/\u6B21)\u2014\u2014\u8BE5\u9898\u7D2F\u8BA1\u4F30\u7B97\u5DF2\u6263 ${s.hintLedger.get(args.code)?.deducted ?? cost}, \u5168\u5C40\u7D2F\u8BA1 ${s.hintLedger.totalDeducted()}\u3002**\u5B9E\u9645\u6263\u5206\u4EE5\u540E\u7EED submit \u56DE\u6267 cumulative_score \u4E3A\u51C6**(\u6EE1\u5206\u8D26=\u8BA1\u5206\u8868, run \u603B\u5206\u4EE5 xiaochang_status \u7684 runScore \u4E3A\u51C6)\u3002`;
     }
   }));
   register(defineTool({
