@@ -1192,7 +1192,18 @@ export function apply(ctx: Context): void {
       ...(ideas.length > 0 ? [`未消费采纳思路 ${ideas.length} 条(账本①可见, 可自行拾取): ${ideas.map(i => i.text.slice(0, 80)).join(' | ').slice(0, 400)}`] : []),
       ...(() => {
         const doneIdx = [...new Set(readFlagEntries().filter(e => e.code === code && e.status === 'accepted' && e.flagIndex !== undefined).map(e => e.flagIndex as number))].sort((a, b) => a - b)
-        return doneIdx.length > 0 ? [`已交旗位: ${doneIdx.join(',')}——勿再上报同旗位轮换值(平台 409 duplicate, 不计新分)`] : []
+        const lines: string[] = []
+        if (doneIdx.length > 0) lines.push(`已交旗位: ${doneIdx.join(',')}——勿再上报同旗位轮换值(平台 409 duplicate, 不计新分)`)
+        // v8.5.3 多旗题作战帧: 目标旗位 + 同实例内网依赖 + 情报继承(调度决策归主 agent, 帧只给事实与纪律)。
+        if (ch.flag_count > 1) {
+          const nextIdx = (() => { for (let i = 0; i < ch.flag_count; i++) { if (!doneIdx.includes(i)) return i } return -1 })()
+          lines.push(`多旗题作战(共${ch.flag_count}面): ${nextIdx >= 0 ? `目标=下一未交旗位(索引${nextIdx})` : '已交旗位已满(全部旗位都有 accepted 记录)'}`)
+          lines.push('  ① 深旗依赖同实例内网: 容器内做网段/邻居发现(扫容器网段与内网跳板), rotate/关容器前把内网情报(网段/凭据/跳板/已获文件)写进战报③;')
+          lines.push('  ② 每面旗的路径/凭据/跳板写战报, 下一兵开工先读账本继承, 从已知边界出发。')
+          lines.push('  ③ 内网穿透分层铁律: 壳上先 curl/wget 直打邻机 HTTP; 有 socat/nc 再考虑单端口转发; 只有打不到身份面时才建反向 SOCKS 隧道(chisel/ligolo 拉回内网, 再上 hydra/sshpass/proxychains), 禁止自写中继脚本。')
+          lines.push('  ④ 爆破纪律: 只 -l 单用户 + 产品初始口令小表(≤20 条), 禁止大表扫; 限速类目标严格按节奏约束段。')
+        }
+        return lines
       })(),
       pacingTxt.trim() !== '' ? pacingTxt.trim() : '',
       templateTxt.trim() !== '' ? `家族: ${family}(背景速查, 与任务冲突以任务为准)${templateTxt}` : '',
@@ -1766,7 +1777,7 @@ export function apply(ctx: Context): void {
   register(defineTool({
     name: 'xiaochang_hint',
     description:
-      'Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only — settleNoFlag ≥2 (两轮真实败绩, 无旗 settle 自动计) 或 (ideaRound≥2 且 settleNoFlag≥1)。闸开时 xiaochang_wait 会主动推送 hint-gate-open 事件(不必反复试). The deduction is reported loudly.',
+      'Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only — settleNoFlag ≥2 (两轮真实败绩, 无旗 settle 自动计) 或 (ideaRound≥2 且 settleNoFlag≥1)。闸开时 xiaochang_wait 会主动推送 hint-gate-open 事件(不必反复试). The deduction is reported loudly. v8.5.3: hint 是最后手段——取前走决策树(集思穷尽→预算剩余 ≤25%→剩余可解锁分 > 3× 扣分), 并在 reason 里论证"已还原了什么、只差什么投递方式"; 取后当轮 fanout hint 方向。',
     parameters: { code: { type: 'string', required: true } },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,
@@ -2590,6 +2601,15 @@ ${gaps}
             done('xiaochang_wait: 编排态变化(settle 结算/回队/裁决/时间盒)——读 xiaochang_status')
           }
         }, 2000)
+        // ⑩ v8.5.3 全旗告警: 所有题 solved → 立即唤醒主 agent 停表(排名按 score_elapsed, 别磨)。
+        const allSolved = (): boolean => {
+          if (state === undefined) return false
+          const chs = [...state.challenges.keys()]
+          return chs.length > 0 && state.orch.size >= chs.length && chs.every(c => state.orch.get(c)?.state === 'solved')
+        }
+        const asv = setInterval(() => {
+          if (allSolved()) done('xiaochang_wait: 全旗达成——所有题已 solved, 立即 xiaochang_finish(force=true) 停表(多磨一分钟都是白给)')
+        }, 2000)
         // ⑦ v8.3 旗仓: 执行者 flag_report 跨进程写盘 → 唤醒主 agent 提交
         const flagSnap = (): string => {
           try {
@@ -2684,11 +2704,15 @@ ${gaps}
         }, 2000)
         // ④ 超时
         const to = setTimeout(() => done(`xiaochang_wait: timeout after ${Math.round(timeoutMs / 1000)}s, no event`), timeoutMs)
-        cleanup = () => { unsub(); clearInterval(iv); clearInterval(oiv); clearInterval(fgv); clearInterval(sv); clearInterval(fv); clearInterval(fiv); clearInterval(giv); clearTimeout(to) }
+        cleanup = () => { unsub(); clearInterval(iv); clearInterval(oiv); clearInterval(fgv); clearInterval(sv); clearInterval(fv); clearInterval(fiv); clearInterval(giv); clearInterval(asv); clearTimeout(to) }
         // v7.1 wait 入口评估: 两次 wait 之间写入的 fork 不落盲区——终态题归档(不唤醒), 活跃题立即唤醒。
         if (state !== undefined && evaluateInbox(codeFilter)) {
           inboxBefore = inboxSnap()
           done('xiaochang_wait: fork inbox changed — read xiaochang_graph and dispatch the untaken branches')
+        }
+        // v8.5.3 全旗达成入口检查: 最后一旗恰好落在两次 wait 之间 → 进场即唤醒。
+        if (allSolved()) {
+          done('xiaochang_wait: 全旗达成——所有题已 solved, 立即 xiaochang_finish(force=true) 停表(多磨一分钟都是白给)')
         }
       })
     },

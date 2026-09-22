@@ -118,7 +118,7 @@ const holder = {
 }
 
 let mock: ChildProcess | undefined
-const parent = { agent: {} }
+const parent = { agent: { session: { seq: 0 } } }
 const tool = (name: string) => {
   const t = tools.find(x => x.name === name)
   if (t === undefined) throw new Error(`tool not found: ${name}`)
@@ -487,6 +487,11 @@ describe('v8.5 调度权回归主 agent', () => {
     const r = await tool('xiaochang_enqueue').execute({ code, prompt: 't6b: 已交旗位检查', dispatchNow: true }, parent)
     expect(String(r)).toContain('已 dispatchNow 立即派发')
     await waitFor(() => itemsFor(code).some(i => i.state === 'dispatched' && i.label.includes('已交旗位: 0')), 20_000, 'frame 已交旗位')
+    // v8.5.3 多旗题作战帧: 目标=下一未交旗位(索引1) + 内网依赖 + 情报继承
+    const mf = itemsFor(code).find(i => i.state === 'dispatched' && i.label.includes('已交旗位'))
+    expect(mf?.label).toContain('多旗题作战(共6面)')
+    expect(mf?.label).toContain('目标=下一未交旗位(索引1)')
+    expect(mf?.label).toContain('同实例内网')
   }, 150_000)
 
   it('v8.5.2d 收兵关容器: 收回最后一兵时补关容器(21013 a-02 孤儿容器)', async () => {
@@ -511,4 +516,23 @@ describe('v8.5 调度权回归主 agent', () => {
     const res = await tool('xiaochang_finish').execute({ force: true }, parent)
     expect(String(res)).toContain('平台停表已确认')
   }, 30_000)
+
+  it('v8.5.3 全旗告警: 全部题 solved → wait 立即推"全旗达成"(21154 最后一旗后磨到被切)', async () => {
+    // 清点并提交 mock 全部 13 面旗(已交的会走 409 duplicate 分支, 无副作用)。
+    const allFlags = [
+      ['g-m1', 'mock{loc4l_dryrun_01}'], ['g-m2', 'mock{loc4l_dryrun_02}'],
+      ['g-m3', 'mock{loc4l_dryrun_03}'], ['g-m4', 'mock{loc4l_dryrun_04}'],
+      ['b-02', 'mock{b02_flag1_website_leak}'], ['b-02', 'mock{b02_flag2_oa_login}'],
+      ['b-02', 'mock{b02_flag3_sqli_data}'], ['b-02', 'mock{b02_flag4_ssh_creds}'],
+      ['b-02', 'mock{b02_flag5_core_secret}'], ['b-02', 'mock{b02_flag6_airgap}'],
+      ['xb-088', 'mock{xb088_jwt_forged_admin}'], ['xb-071', 'mock{xb071_header_flag}'],
+      ['xb-056', 'mock{xb056_lsb_stego}'],
+    ]
+    for (const [code, flag] of allFlags) {
+      await tool('xiaochang_submit').execute({ code, flag }, parent)
+    }
+    // 全部题 solved 后, wait 应立刻推全旗达成(而非超时)。
+    const w = String(await tool('xiaochang_wait').execute({ timeoutSeconds: 10 }, parent))
+    expect(w).toContain('全旗达成')
+  }, 120_000)
 })
