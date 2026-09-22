@@ -1200,8 +1200,6 @@ export function apply(ctx: Context): void {
           lines.push(`多旗题作战(共${ch.flag_count}面): ${nextIdx >= 0 ? `目标=下一未交旗位(索引${nextIdx})` : '已交旗位已满(全部旗位都有 accepted 记录)'}`)
           lines.push('  ① 深旗依赖同实例内网: 容器内做网段/邻居发现(扫容器网段与内网跳板), rotate/关容器前把内网情报(网段/凭据/跳板/已获文件)写进战报③;')
           lines.push('  ② 每面旗的路径/凭据/跳板写战报, 下一兵开工先读账本继承, 从已知边界出发。')
-          lines.push('  ③ 内网穿透分层铁律: 壳上先 curl/wget 直打邻机 HTTP; 有 socat/nc 再考虑单端口转发; 只有打不到身份面时才建反向 SOCKS 隧道(chisel/ligolo 拉回内网, 再上 hydra/sshpass/proxychains), 禁止自写中继脚本。')
-          lines.push('  ④ 爆破纪律: 只 -l 单用户 + 产品初始口令小表(≤20 条), 禁止大表扫; 限速类目标严格按节奏约束段。')
         }
         return lines
       })(),
@@ -1777,7 +1775,7 @@ export function apply(ctx: Context): void {
   register(defineTool({
     name: 'xiaochang_hint',
     description:
-      'Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only — settleNoFlag ≥2 (两轮真实败绩, 无旗 settle 自动计) 或 (ideaRound≥2 且 settleNoFlag≥1)。闸开时 xiaochang_wait 会主动推送 hint-gate-open 事件(不必反复试). The deduction is reported loudly. v8.5.3: hint 是最后手段——取前走决策树(集思穷尽→预算剩余 ≤25%→剩余可解锁分 > 3× 扣分), 并在 reason 里论证"已还原了什么、只差什么投递方式"; 取后当轮 fanout hint 方向。',
+      'Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only — settleNoFlag ≥2 (两轮真实败绩, 无旗 settle 自动计) 或 (ideaRound≥2 且 settleNoFlag≥1)。闸开时 xiaochang_wait 会主动推送 hint-gate-open 事件(不必反复试). The deduction is reported loudly.',
     parameters: { code: { type: 'string', required: true } },
     output: { schema: { type: 'string' }, render: (_a, v) => [{ type: 'text', text: v }] },
     isConcurrencySafe: () => false,

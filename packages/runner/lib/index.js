@@ -1762,8 +1762,6 @@ ${tpl}
           lines.push(`\u591A\u65D7\u9898\u4F5C\u6218(\u5171${ch.flag_count}\u9762): ${nextIdx >= 0 ? `\u76EE\u6807=\u4E0B\u4E00\u672A\u4EA4\u65D7\u4F4D(\u7D22\u5F15${nextIdx})` : "\u5DF2\u4EA4\u65D7\u4F4D\u5DF2\u6EE1(\u5168\u90E8\u65D7\u4F4D\u90FD\u6709 accepted \u8BB0\u5F55)"}`);
           lines.push("  \u2460 \u6DF1\u65D7\u4F9D\u8D56\u540C\u5B9E\u4F8B\u5185\u7F51: \u5BB9\u5668\u5185\u505A\u7F51\u6BB5/\u90BB\u5C45\u53D1\u73B0(\u626B\u5BB9\u5668\u7F51\u6BB5\u4E0E\u5185\u7F51\u8DF3\u677F), rotate/\u5173\u5BB9\u5668\u524D\u628A\u5185\u7F51\u60C5\u62A5(\u7F51\u6BB5/\u51ED\u636E/\u8DF3\u677F/\u5DF2\u83B7\u6587\u4EF6)\u5199\u8FDB\u6218\u62A5\u2462;");
           lines.push("  \u2461 \u6BCF\u9762\u65D7\u7684\u8DEF\u5F84/\u51ED\u636E/\u8DF3\u677F\u5199\u6218\u62A5, \u4E0B\u4E00\u5175\u5F00\u5DE5\u5148\u8BFB\u8D26\u672C\u7EE7\u627F, \u4ECE\u5DF2\u77E5\u8FB9\u754C\u51FA\u53D1\u3002");
-          lines.push("  \u2462 \u5185\u7F51\u7A7F\u900F\u5206\u5C42\u94C1\u5F8B: \u58F3\u4E0A\u5148 curl/wget \u76F4\u6253\u90BB\u673A HTTP; \u6709 socat/nc \u518D\u8003\u8651\u5355\u7AEF\u53E3\u8F6C\u53D1; \u53EA\u6709\u6253\u4E0D\u5230\u8EAB\u4EFD\u9762\u65F6\u624D\u5EFA\u53CD\u5411 SOCKS \u96A7\u9053(chisel/ligolo \u62C9\u56DE\u5185\u7F51, \u518D\u4E0A hydra/sshpass/proxychains), \u7981\u6B62\u81EA\u5199\u4E2D\u7EE7\u811A\u672C\u3002");
-          lines.push("  \u2463 \u7206\u7834\u7EAA\u5F8B: \u53EA -l \u5355\u7528\u6237 + \u4EA7\u54C1\u521D\u59CB\u53E3\u4EE4\u5C0F\u8868(\u226420 \u6761), \u7981\u6B62\u5927\u8868\u626B; \u9650\u901F\u7C7B\u76EE\u6807\u4E25\u683C\u6309\u8282\u594F\u7EA6\u675F\u6BB5\u3002");
         }
         return lines;
       })(),
@@ -2306,7 +2304,7 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
   }));
   register(defineTool({
     name: "xiaochang_hint",
-    description: 'Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only \u2014 settleNoFlag \u22652 (\u4E24\u8F6E\u771F\u5B9E\u8D25\u7EE9, \u65E0\u65D7 settle \u81EA\u52A8\u8BA1) \u6216 (ideaRound\u22652 \u4E14 settleNoFlag\u22651)\u3002\u95F8\u5F00\u65F6 xiaochang_wait \u4F1A\u4E3B\u52A8\u63A8\u9001 hint-gate-open \u4E8B\u4EF6(\u4E0D\u5FC5\u53CD\u590D\u8BD5). The deduction is reported loudly. v8.5.3: hint \u662F\u6700\u540E\u624B\u6BB5\u2014\u2014\u53D6\u524D\u8D70\u51B3\u7B56\u6811(\u96C6\u601D\u7A77\u5C3D\u2192\u9884\u7B97\u5269\u4F59 \u226425%\u2192\u5269\u4F59\u53EF\u89E3\u9501\u5206 > 3\xD7 \u6263\u5206), \u5E76\u5728 reason \u91CC\u8BBA\u8BC1"\u5DF2\u8FD8\u539F\u4E86\u4EC0\u4E48\u3001\u53EA\u5DEE\u4EC0\u4E48\u6295\u9012\u65B9\u5F0F"; \u53D6\u540E\u5F53\u8F6E fanout hint \u65B9\u5411\u3002',
+    description: "Fetch the official hint (main agent ONLY; costs part of the challenge score, capped per challenge). v8.4 gate: objective signals only \u2014 settleNoFlag \u22652 (\u4E24\u8F6E\u771F\u5B9E\u8D25\u7EE9, \u65E0\u65D7 settle \u81EA\u52A8\u8BA1) \u6216 (ideaRound\u22652 \u4E14 settleNoFlag\u22651)\u3002\u95F8\u5F00\u65F6 xiaochang_wait \u4F1A\u4E3B\u52A8\u63A8\u9001 hint-gate-open \u4E8B\u4EF6(\u4E0D\u5FC5\u53CD\u590D\u8BD5). The deduction is reported loudly.",
     parameters: { code: { type: "string", required: true } },
     output: { schema: { type: "string" }, render: (_a, v) => [{ type: "text", text: v }] },
     isConcurrencySafe: () => false,
