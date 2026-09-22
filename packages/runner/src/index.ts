@@ -1184,6 +1184,7 @@ export function apply(ctx: Context): void {
       `【校场执行令 · ${code}】(${cls === 'local' ? '附件题·全并行' : '容器题·3槽轮换'}, ${ch.difficulty}, ${ch.total_score}pts, ${ch.flag_count} flags)`,
       `题面: ${(ch.description ?? '').slice(0, 1200)}`,
       `入口: ${addrs}`,
+      ...(/(附件|下载)/.test(ch.description ?? '') ? [`附件获取: 平台把附件放在容器 HTTP 上——先 curl 容器根与常见路径(/att/${code}/、/files/${code}.zip、/download、/)枚举拿回附件再解。`] : []),
       `共享战报: ${c().boardPath(code)}`,
       `知识账本(开工必读): ${kn}`,
       `画像(快速读): ${s.profilePath}`,
@@ -1803,6 +1804,10 @@ export function apply(ctx: Context): void {
       const raw = await s.adapter.hint(args.code) as { hint?: string | null }
       const hint = raw.hint
       if (hint === null || hint === undefined || hint === '') return 'xiaochang_hint: no hint available'
+      // v8.5.3(cybench 实测): 平台明示"无hint信息(也没有hint惩罚)"——不记扣分账, 如实返回。
+      if (/无hint|没有hint|无惩罚/i.test(hint)) {
+        return `hint (${used + 1}/${s.maxHints} used): ${hint}\nℹ️ 该题平台已确认无 hint 且无惩罚——不计扣分账; 卡题转集思/加兵/rotate。`
+      }
       const cost = s.hintLedger.record(args.code, ch?.total_score ?? 100, 'main-agent requested')
       return `hint (${used + 1}/${s.maxHints} used): ${hint}\n⚠️ 本次看提示估算扣该题 ${cost} 分(题面 10%; 平台不公布真实单价——hint_cost 字段不存在于题表/hint 响应, 实测本集 10%/次)——该题累计估算已扣 ${s.hintLedger.get(args.code)?.deducted ?? cost}, 全局累计 ${s.hintLedger.totalDeducted()}。**实际扣分以后续 submit 回执 cumulative_score 为准**(满分账=计分表, run 总分以 xiaochang_status 的 runScore 为准)。`
     },

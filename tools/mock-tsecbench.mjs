@@ -222,6 +222,11 @@ function route(req, res) {
     return json(res, 200, { closed: true })
   }
   if (p === '/openapi/v1/challenges/hint' && req.method === 'GET') {
+    const hc = q.get('unique_code')
+    if (hc !== null && hc.startsWith('g-m')) {
+      // v8.5.3(cybench 对齐): 本地送分题无 hint 无惩罚。
+      return json(res, 200, { hint: '此题无hint信息（也没有hint惩罚）' })
+    }
     return json(res, 200, { hint: '看看响应里藏了什么, 或换个攻击面' })
   }
   // 题级 HTTP 路由(URL 用去连字符的安全名, 如 b-02 → /b02/)

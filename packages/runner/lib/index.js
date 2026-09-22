@@ -426,7 +426,7 @@ var RunProgress = class _RunProgress {
 };
 function resourceClassOf(ch) {
   const t = ch.description ?? "";
-  if (/(无需容器|纯附件|附件题|下载附件|attachment|静态文件|本地分析|离线求解|只用\s*(bash|shell|脚本))/i.test(t)) return "local";
+  if (/(无需容器|本地求解)/i.test(t)) return "local";
   return "container";
 }
 var KNOWLEDGE_SECTION_TITLES = [
@@ -1742,6 +1742,7 @@ ${tpl}
       `\u3010\u6821\u573A\u6267\u884C\u4EE4 \xB7 ${code}\u3011(${cls === "local" ? "\u9644\u4EF6\u9898\xB7\u5168\u5E76\u884C" : "\u5BB9\u5668\u9898\xB73\u69FD\u8F6E\u6362"}, ${ch.difficulty}, ${ch.total_score}pts, ${ch.flag_count} flags)`,
       `\u9898\u9762: ${(ch.description ?? "").slice(0, 1200)}`,
       `\u5165\u53E3: ${addrs}`,
+      .../(附件|下载)/.test(ch.description ?? "") ? [`\u9644\u4EF6\u83B7\u53D6: \u5E73\u53F0\u628A\u9644\u4EF6\u653E\u5728\u5BB9\u5668 HTTP \u4E0A\u2014\u2014\u5148 curl \u5BB9\u5668\u6839\u4E0E\u5E38\u89C1\u8DEF\u5F84(/att/${code}/\u3001/files/${code}.zip\u3001/download\u3001/)\u679A\u4E3E\u62FF\u56DE\u9644\u4EF6\u518D\u89E3\u3002`] : [],
       `\u5171\u4EAB\u6218\u62A5: ${c().boardPath(code)}`,
       `\u77E5\u8BC6\u8D26\u672C(\u5F00\u5DE5\u5FC5\u8BFB): ${kn}`,
       `\u753B\u50CF(\u5FEB\u901F\u8BFB): ${s.profilePath}`,
@@ -2330,6 +2331,10 @@ ${lines.join("\n") || "  (\u7A7A)"}`;
       const raw = await s.adapter.hint(args.code);
       const hint = raw.hint;
       if (hint === null || hint === void 0 || hint === "") return "xiaochang_hint: no hint available";
+      if (/无hint|没有hint|无惩罚/i.test(hint)) {
+        return `hint (${used + 1}/${s.maxHints} used): ${hint}
+\u2139\uFE0F \u8BE5\u9898\u5E73\u53F0\u5DF2\u786E\u8BA4\u65E0 hint \u4E14\u65E0\u60E9\u7F5A\u2014\u2014\u4E0D\u8BA1\u6263\u5206\u8D26; \u5361\u9898\u8F6C\u96C6\u601D/\u52A0\u5175/rotate\u3002`;
+      }
       const cost = s.hintLedger.record(args.code, ch?.total_score ?? 100, "main-agent requested");
       return `hint (${used + 1}/${s.maxHints} used): ${hint}
 \u26A0\uFE0F \u672C\u6B21\u770B\u63D0\u793A\u4F30\u7B97\u6263\u8BE5\u9898 ${cost} \u5206(\u9898\u9762 10%; \u5E73\u53F0\u4E0D\u516C\u5E03\u771F\u5B9E\u5355\u4EF7\u2014\u2014hint_cost \u5B57\u6BB5\u4E0D\u5B58\u5728\u4E8E\u9898\u8868/hint \u54CD\u5E94, \u5B9E\u6D4B\u672C\u96C6 10%/\u6B21)\u2014\u2014\u8BE5\u9898\u7D2F\u8BA1\u4F30\u7B97\u5DF2\u6263 ${s.hintLedger.get(args.code)?.deducted ?? cost}, \u5168\u5C40\u7D2F\u8BA1 ${s.hintLedger.totalDeducted()}\u3002**\u5B9E\u9645\u6263\u5206\u4EE5\u540E\u7EED submit \u56DE\u6267 cumulative_score \u4E3A\u51C6**(\u6EE1\u5206\u8D26=\u8BA1\u5206\u8868, run \u603B\u5206\u4EE5 xiaochang_status \u7684 runScore \u4E3A\u51C6)\u3002`;

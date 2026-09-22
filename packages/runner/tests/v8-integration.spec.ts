@@ -517,6 +517,13 @@ describe('v8.5 调度权回归主 agent', () => {
     expect(String(res)).toContain('平台停表已确认')
   }, 30_000)
 
+  it('v8.5.3 cybench 语义: 平台"无hint无惩罚"题, hint 工具不计扣分账', async () => {
+    // 前置: hint 闸开测试(g-m3 两轮无旗 settle)已在前面跑过, g-m3 闸已开。
+    const res = await tool('xiaochang_hint').execute({ code: 'g-m3' }, parent)
+    expect(String(res)).toContain('无hint信息')
+    expect(String(res)).toContain('不计扣分账')
+  }, 30_000)
+
   it('v8.5.3 全旗告警: 全部题 solved → wait 立即推"全旗达成"(21154 最后一旗后磨到被切)', async () => {
     // 清点并提交 mock 全部 13 面旗(已交的会走 409 duplicate 分支, 无副作用)。
     const allFlags = [

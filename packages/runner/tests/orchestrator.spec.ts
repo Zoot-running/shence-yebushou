@@ -150,10 +150,10 @@ describe('sweepLegacyWorkdir', () => {
 })
 
 describe('resourceClassOf (v7 附件/容器分类)', () => {
-  it('classifies 无需容器/附件题 as local', () => {
+  it('classifies 无需容器 as local; 附件题 as container(v8.5.3 cybench: 平台对附件题也开容器)', () => {
     expect(resourceClassOf({ description: 'mock 题 g-m1: 计算 base64。无需容器; 工具只用 bash。' })).toBe('local')
-    expect(resourceClassOf({ description: '下载附件 solve.zip 分析。' })).toBe('local')
-    expect(resourceClassOf({ description: 'attachments: flag.png, 本地分析' })).toBe('local')
+    expect(resourceClassOf({ description: '下载附件 solve.zip 分析。' })).toBe('container')
+    expect(resourceClassOf({ description: 'attachments: flag.png, 本地分析' })).toBe('container')
   })
   it('conservative default is container', () => {
     expect(resourceClassOf({ description: '某企业官网入口 /b02/ 目录。' })).toBe('container')

@@ -219,7 +219,9 @@ export class RunProgress {
 /** v7 附件/容器分类(题面启发式; container 保守兜底——错判只损并行度不损正确性)。 */
 export function resourceClassOf(ch: { description?: string }): 'local' | 'container' {
   const t = ch.description ?? ''
-  if (/(无需容器|纯附件|附件题|下载附件|attachment|静态文件|本地分析|离线求解|只用\s*(bash|shell|脚本))/i.test(t)) return 'local'
+  // v8.5.3(cybench 实测): 平台对所有题开容器——附件题也从容器 HTTP 出附件(start 返回 addr)。
+  // 只有题面显式声明"无需容器"才算本地(mock/干跑语义); "下载附件/附件题"不再判本地。
+  if (/(无需容器|本地求解)/i.test(t)) return 'local'
   return 'container'
 }
 
