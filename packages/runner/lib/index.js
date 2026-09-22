@@ -1740,7 +1740,7 @@ ${tpl}
     const ideas = unconsumedIdeas(code);
     return [
       `\u3010\u6821\u573A\u6267\u884C\u4EE4 \xB7 ${code}\u3011(${cls === "local" ? "\u9644\u4EF6\u9898\xB7\u5168\u5E76\u884C" : "\u5BB9\u5668\u9898\xB73\u69FD\u8F6E\u6362"}, ${ch.difficulty}, ${ch.total_score}pts, ${ch.flag_count} flags)`,
-      `\u9898\u9762: ${(ch.description ?? "").slice(0, 1200)}`,
+      `\u9898\u9762: ${(ch.description ?? "").slice(0, 1200) || "(\u5E73\u53F0\u672A\u63D0\u4F9B\u9898\u9762\u2014\u2014\u76F2\u6253\u6A21\u5F0F: \u5BB9\u5668 web \u5E94\u7528\u505A\u6307\u7EB9/\u76EE\u5F55/JS/\u529F\u80FD\u70B9\u679A\u4E3E, \u6309\u5E38\u89C1 web \u6F0F\u6D1E\u6E05\u5355(IDOR/\u8D8A\u6743/\u6CE8\u5165/\u4E0A\u4F20/SSRF/\u9274\u6743\u7ED5\u8FC7)\u8D70\u67E5, \u5361\u4F4F\u6309\u9898\u9762\u7EBF\u7D22\u4E0E hint \u5B9A\u4F4D\u6F0F\u6D1E\u7C7B)"}`,
       `\u5165\u53E3: ${addrs}`,
       .../(附件|下载)/.test(ch.description ?? "") ? [`\u9644\u4EF6\u83B7\u53D6: \u5E73\u53F0\u628A\u9644\u4EF6\u653E\u5728\u5BB9\u5668 HTTP \u4E0A\u2014\u2014\u5148 curl \u5BB9\u5668\u6839\u4E0E\u5E38\u89C1\u8DEF\u5F84(/att/${code}/\u3001/files/${code}.zip\u3001/download\u3001/)\u679A\u4E3E\u62FF\u56DE\u9644\u4EF6\u518D\u89E3\u3002`] : [],
       `\u5171\u4EAB\u6218\u62A5: ${c().boardPath(code)}`,

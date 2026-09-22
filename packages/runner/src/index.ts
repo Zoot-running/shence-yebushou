@@ -1182,7 +1182,7 @@ export function apply(ctx: Context): void {
     const ideas = unconsumedIdeas(code)
     return [
       `【校场执行令 · ${code}】(${cls === 'local' ? '附件题·全并行' : '容器题·3槽轮换'}, ${ch.difficulty}, ${ch.total_score}pts, ${ch.flag_count} flags)`,
-      `题面: ${(ch.description ?? '').slice(0, 1200)}`,
+      `题面: ${(ch.description ?? '').slice(0, 1200) || '(平台未提供题面——盲打模式: 容器 web 应用做指纹/目录/JS/功能点枚举, 按常见 web 漏洞清单(IDOR/越权/注入/上传/SSRF/鉴权绕过)走查, 卡住按题面线索与 hint 定位漏洞类)'}`,
       `入口: ${addrs}`,
       ...(/(附件|下载)/.test(ch.description ?? '') ? [`附件获取: 平台把附件放在容器 HTTP 上——先 curl 容器根与常见路径(/att/${code}/、/files/${code}.zip、/download、/)枚举拿回附件再解。`] : []),
       `共享战报: ${c().boardPath(code)}`,
